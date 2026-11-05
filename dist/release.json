@@ -1,23 +1,7 @@
 {
-  "tag_name": "v2.6.2",
-  "name": "Pulse Bot 2.6.2",
-  "versionCode": 29,
-  "versionName": "2.6.2",
-  "published_at": "2026-11-05T13:24:58.114792+08:00",
-  "html_url": "http://216.23.82.196/proactive-agent/",
-  "body": "v2.6.2?Windows 11 ??????? + ???????????? + ?? Chromium ?? 900MB ?? + ?? 1C1G ????????? (sqlite3/clang/cmake/jq/rg) + ??????????????/???? + ????????? + ?????????",
-  "assets": [
-    {
-      "name": "proactive-agent.apk",
-      "size": 20320964,
-      "digest": "sha256:c7bdb9605e683cade10296e1fe31dc6ca5dd94c2ca67d069a832cc03b5cc04a8",
-      "browser_download_url": "http://216.23.82.196/proactive-agent/download/proactive-agent.apk"
-    },
-    {
-      "name": "proactive-agent-2.6.2.apk",
-      "size": 20320964,
-      "digest": "sha256:c7bdb9605e683cade10296e1fe31dc6ca5dd94c2ca67d069a832cc03b5cc04a8",
-      "browser_download_url": "http://216.23.82.196/proactive-agent/download/proactive-agent-2.6.2.apk"
-    }
-  ]
+    "notes":  "v2.8.4: 1) 压缩上下文移入左下角「+」菜单，点击后直接在对话框生成归档卡片（显示从多少K浓缩为多少K、记忆存往何处并可一键查看）；2) 快捷选项点按即刻消失，且仅最后一条消息可显示选项防误触；3) 新增主人立体个人印象档案 (personal_impression.md)，主动了解出生/身份/家庭/喜好。",
+    "tag_name":  "v2.8.4",
+    "versionCode":  36,
+    "versionName":  "2.8.4",
+    "sha256":  "da169063094de8a4de24c0a717f14e0630c27f132f58cc0b0d524133bbd27b34"
 }

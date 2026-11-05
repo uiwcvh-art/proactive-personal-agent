@@ -79,8 +79,9 @@ final class DisplayRuntime {
     private long frameSequence;
     private boolean framePending = false;
     private long lastFrameProcessedAt = 0L;
-    private static final long FRAME_INTERVAL_MS = 68L; // ~15fps coalesced cap (drops intermediate VSYNC frames in hardware)
-    private static final int PREVIEW_SHORT_SIDE = 380;
+    private static final long FRAME_INTERVAL_MS = 28L; // ~36fps low-latency coalesced cap for 1:1 live touch/scroll
+    private volatile int previewShortSide = 540;
+    private volatile long liveTouchDownTime = 0L;
 
     private static final class PreviewSnapshot {
         final long sequence;
@@ -100,7 +101,8 @@ final class DisplayRuntime {
 
     private volatile boolean trustedDisplay = true;
     private RootClipboard clipboard;
-    private volatile int width = 1080, height = 2400, densityDpi = 411;
+    private volatile int width = 720, height = 1600, densityDpi = 320;
+    private volatile String activeTier = "balanced";
 
     // Cached reflection handles for zero-overhead touch injection & keep-awake
     private static Object sInputManager;
@@ -165,7 +167,7 @@ final class DisplayRuntime {
     }
 
     String execute(String command) {
-        // Fast lock-free path for preview and status so frame polling NEVER queues behind tap/swipe/launch
+        // Fast lock-free path for preview, status, and live touch stream so frame polling & dragging NEVER queue behind RPCs
         try {
             JSONObject fastCmd = new JSONObject(command);
             String fastOp = fastCmd.optString("op", "");
@@ -174,6 +176,9 @@ final class DisplayRuntime {
             }
             if ("status".equals(fastOp)) {
                 return state().toString();
+            }
+            if ("touch".equals(fastOp)) {
+                return fastTouch(fastCmd).toString();
             }
         } catch (Throwable ignored) {}
 
@@ -215,6 +220,53 @@ final class DisplayRuntime {
             .put("image", snap.base64);
     }
 
+    private JSONObject fastTouch(JSONObject cmd) throws Exception {
+        VirtualDisplay vd = this.display;
+        if (vd == null || vd.getDisplay() == null || vd.getDisplay().getDisplayId() <= 0) {
+            return state().put("ok", false);
+        }
+        final int displayId = vd.getDisplay().getDisplayId();
+        final String actionStr = cmd.optString("action", "move").trim().toLowerCase();
+        final float x = (float) Math.max(0, Math.min(Math.max(width, height) - 1, cmd.optInt("x", 0)));
+        final float y = (float) Math.max(0, Math.min(Math.max(width, height) - 1, cmd.optInt("y", 0)));
+        inputHandler.post(() -> {
+            try {
+                long now = SystemClock.uptimeMillis();
+                int action;
+                if ("down".equals(actionStr)) {
+                    liveTouchDownTime = now;
+                    action = MotionEvent.ACTION_DOWN;
+                } else if ("up".equals(actionStr)) {
+                    action = MotionEvent.ACTION_UP;
+                } else if ("cancel".equals(actionStr)) {
+                    action = MotionEvent.ACTION_CANCEL;
+                } else {
+                    action = MotionEvent.ACTION_MOVE;
+                }
+                long downT = liveTouchDownTime > 0L ? liveTouchDownTime : now;
+                MotionEvent.PointerProperties[] p = new MotionEvent.PointerProperties[]{new MotionEvent.PointerProperties()};
+                p[0].id = 0;
+                p[0].toolType = MotionEvent.TOOL_TYPE_FINGER;
+                MotionEvent.PointerCoords[] c = new MotionEvent.PointerCoords[]{new MotionEvent.PointerCoords()};
+                c[0].pressure = (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) ? 0f : 1f;
+                c[0].size = 1f;
+                c[0].x = x;
+                c[0].y = y;
+                MotionEvent ev = MotionEvent.obtain(downT, now, action, 1, p, c, 0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0);
+                try {
+                    injectEvent(ev, displayId, INJECT_MODE_ASYNC);
+                } finally {
+                    ev.recycle();
+                }
+                if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                    liveTouchDownTime = 0L;
+                }
+                scheduleFrameProcess();
+            } catch (Throwable ignored) {}
+        });
+        return new JSONObject().put("uid", android.os.Process.myUid()).put("ok", true).put("displayId", displayId);
+    }
+
     private void scheduleFrameProcess() {
         if (framePending || display == null) return;
         framePending = true;
@@ -250,7 +302,8 @@ final class DisplayRuntime {
 
                 int logicalW = rot % 2 == 0 ? bufW : bufH;
                 int logicalH = rot % 2 == 0 ? bufH : bufW;
-                float scale = Math.min(1f, (float) PREVIEW_SHORT_SIDE / Math.min(logicalW, logicalH));
+                int targetShort = Math.max(360, Math.min(logicalW, Math.min(logicalH, previewShortSide)));
+                float scale = Math.min(1f, (float) targetShort / Math.min(logicalW, logicalH));
                 int pw = Math.max(1, Math.round(logicalW * scale));
                 int ph = Math.max(1, Math.round(logicalH * scale));
                 if (previewBuffer == null || previewBuffer.getWidth() != pw || previewBuffer.getHeight() != ph) {
@@ -265,7 +318,7 @@ final class DisplayRuntime {
                 Rect bounds = new Rect(0, 0, bufW, bufH);
                 canvas.drawBitmap(latestFrame, bounds, bounds, bitmapPaint);
                 ByteArrayOutputStream out = new ByteArrayOutputStream(24576);
-                previewBuffer.compress(Bitmap.CompressFormat.JPEG, 80, out);
+                previewBuffer.compress(Bitmap.CompressFormat.JPEG, 76, out);
                 String b64 = Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP);
                 this.latestPreview = new PreviewSnapshot(seq, logicalW, logicalH, rot, b64);
             }
@@ -289,13 +342,81 @@ final class DisplayRuntime {
         return flags;
     }
 
+    private static int roundTo16(float value, int minVal, int maxVal) {
+        int clamped = Math.max(minVal, Math.min(maxVal, Math.round(value)));
+        return ((clamped + 8) / 16) * 16;
+    }
+
+    /**
+     * Multi-tier adaptive virtual display specification algorithm:
+     * Dynamically computes (width, height, densityDpi, previewShortSide) from the host device's
+     * physical DisplayMetrics and the requested size tier ("compact", "balanced", "large").
+     * - Preserves the host screen's true aspect ratio (clamped to [1.55, 2.35]) with 16px GPU stride alignment.
+     * - Computes a comfort-scaled smallestWidthDp (328dp for compact, 354dp for balanced, 384dp for large)
+     *   so apps inside the virtual display render crisp, well-proportioned text and controls at every window size.
+     */
+    private int[] computeAdaptiveDisplaySpec(DisplayManager dm, String tierInput) {
+        String tier = (tierInput == null || tierInput.isEmpty()) ? "balanced" : tierInput.trim().toLowerCase();
+        int rw = 1080, rh = 2400, realDpi = 440;
+        try {
+            Display mainDisp = dm != null ? dm.getDisplay(Display.DEFAULT_DISPLAY) : null;
+            if (mainDisp != null) {
+                android.util.DisplayMetrics realMetrics = new android.util.DisplayMetrics();
+                mainDisp.getRealMetrics(realMetrics);
+                if (realMetrics.widthPixels >= 320 && realMetrics.heightPixels >= 320) {
+                    rw = realMetrics.widthPixels;
+                    rh = realMetrics.heightPixels;
+                    realDpi = realMetrics.densityDpi > 0 ? realMetrics.densityDpi : 440;
+                }
+            }
+        } catch (Throwable ignored) {}
+
+        int shortSide = Math.min(rw, rh);
+        int longSide = Math.max(rw, rh);
+        float aspect = Math.max(1.55f, Math.min(2.35f, (float) longSide / Math.max(1, shortSide)));
+        float hostSwDp = (shortSide * 160f) / Math.max(120, realDpi);
+
+        float resScale;
+        int minShortPx, maxShortPx;
+        float targetSwDp;
+        int targetPreviewShort;
+
+        if ("compact".equals(tier) || "small".equals(tier) || "mini".equals(tier)) {
+            resScale = 0.58f;
+            minShortPx = 544;
+            maxShortPx = 704;
+            targetSwDp = Math.max(320f, Math.min(344f, hostSwDp * 0.86f));
+            targetPreviewShort = 460;
+        } else if ("large".equals(tier) || "hd".equals(tier) || "full".equals(tier)) {
+            resScale = 0.78f;
+            minShortPx = 768;
+            maxShortPx = 1088;
+            targetSwDp = Math.max(368f, Math.min(404f, hostSwDp * 0.98f));
+            targetPreviewShort = 640;
+        } else {
+            // "balanced" (default): 720x1600 on 1080p, 768x1712 on 1.5K, 832x1856 on 2K
+            resScale = 0.667f;
+            minShortPx = 640;
+            maxShortPx = 864;
+            targetSwDp = Math.max(344f, Math.min(368f, hostSwDp * 0.92f));
+            targetPreviewShort = 540;
+        }
+
+        int targetW = shortSide <= minShortPx ? roundTo16(shortSide, 368, minShortPx) : roundTo16(shortSide * resScale, minShortPx, maxShortPx);
+        int targetH = roundTo16(targetW * aspect, 640, 2560);
+        int targetDpi = Math.max(160, Math.min(640, Math.round((targetW * 160f) / targetSwDp)));
+        return new int[]{targetW, targetH, targetDpi, targetPreviewShort};
+    }
+
     @android.annotation.SuppressLint("WrongConstant")
     private JSONObject run(JSONObject cmd) throws Exception {
         String op = cmd.getString("op");
         if (op.equals("create")) {
             int myUid = android.os.Process.myUid();
             if (myUid != 0 && myUid != 2000) throw new Exception("虚拟屏需要 Root (uid 0) 或 Shell 权限");
-            if (display != null && display.getDisplay() != null && display.getDisplay().getDisplayId() > 0) {
+            String requestedTier = cmd.optString("tier", activeTier).trim().toLowerCase();
+            if (requestedTier.isEmpty()) requestedTier = "balanced";
+            if (display != null && display.getDisplay() != null && display.getDisplay().getDisplayId() > 0 && !cmd.optBoolean("recreate", false)) {
                 pokeDisplayAwake(display.getDisplay().getDisplayId());
                 return state();
             }
@@ -304,44 +425,14 @@ final class DisplayRuntime {
             ctor.setAccessible(true);
             DisplayManager dm = ctor.newInstance(context);
 
-            // Match main screen (Display.DEFAULT_DISPLAY) aspect ratio & pixel dimensions (like Mika's AgentDisplay)
-            // so apps using Application context / Resources.getSystem() / AndroidAutoSize render 1:1 with normal font size!
-            int defaultW = 1080, defaultH = 2400, defaultDpi = 411;
-            try {
-                Display mainDisp = dm.getDisplay(Display.DEFAULT_DISPLAY);
-                if (mainDisp != null) {
-                    android.util.DisplayMetrics realMetrics = new android.util.DisplayMetrics();
-                    mainDisp.getRealMetrics(realMetrics);
-                    int rw = realMetrics.widthPixels;
-                    int rh = realMetrics.heightPixels;
-                    if (rw >= 320 && rh >= 320) {
-                        int shortSide = Math.min(rw, rh);
-                        int longSide = Math.max(rw, rh);
-                        // Cap buffer short side at 1080px for ultra-fast ImageReader DMA while keeping exact aspect ratio & dp
-                        if (shortSide > 1080) {
-                            float ratio = 1080f / shortSide;
-                            defaultW = 1080;
-                            defaultH = Math.round(longSide * ratio);
-                            defaultDpi = Math.round(realMetrics.densityDpi * ratio);
-                        } else {
-                            defaultW = shortSide;
-                            defaultH = longSide;
-                            defaultDpi = realMetrics.densityDpi;
-                        }
-                        // Ensure logical smallestWidthDp is at least 420dp so fonts & UI inside virtual display never look oversized
-                        int maxComfortDpi = Math.round(defaultW * 160f / 420f);
-                        if (defaultDpi > maxComfortDpi) {
-                            defaultDpi = maxComfortDpi;
-                        }
-                    }
-                }
-            } catch (Throwable ignored) {}
-
-            width = cmd.optInt("width", defaultW);
-            height = cmd.optInt("height", defaultH);
-            densityDpi = cmd.optInt("dpi", defaultDpi);
+            int[] spec = computeAdaptiveDisplaySpec(dm, requestedTier);
+            activeTier = requestedTier;
+            width = cmd.optInt("width", spec[0]);
+            height = cmd.optInt("height", spec[1]);
+            densityDpi = cmd.optInt("dpi", spec[2]);
+            previewShortSide = cmd.optInt("preview_short_side", spec[3]);
             if (width < 128 || width > 4096 || height < 128 || height > 4096) throw new Exception("虚拟屏尺寸超出范围");
-            if (densityDpi < 120 || densityDpi > 800) densityDpi = 411;
+            if (densityDpi < 120 || densityDpi > 800) densityDpi = spec[2];
 
             reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2);
             Surface surface = reader.getSurface();
@@ -370,6 +461,42 @@ final class DisplayRuntime {
 
             reader.setOnImageAvailableListener(source -> scheduleFrameProcess(), frameHandler);
             frameHandler.post(this::scheduleFrameProcess);
+        } else if (op.equals("resize")) {
+            requireDisplay();
+            Constructor<DisplayManager> ctor = DisplayManager.class.getDeclaredConstructor(Context.class);
+            ctor.setAccessible(true);
+            DisplayManager dm = ctor.newInstance(context);
+            String requestedTier = cmd.optString("tier", activeTier).trim().toLowerCase();
+            if (requestedTier.isEmpty()) requestedTier = "balanced";
+            int[] spec = computeAdaptiveDisplaySpec(dm, requestedTier);
+            activeTier = requestedTier;
+            boolean keepRes = cmd.optBoolean("keep_resolution", true);
+            int newW = keepRes ? width : cmd.optInt("width", spec[0]);
+            int newH = keepRes ? height : cmd.optInt("height", spec[1]);
+            int newDpi = cmd.optInt("dpi", keepRes ? Math.max(160, Math.min(640, Math.round((width * 160f) / ((spec[0] * 160f) / spec[2])))) : spec[2]);
+            previewShortSide = cmd.optInt("preview_short_side", spec[3]);
+
+            synchronized (frameLock) {
+                if (newW != width || newH != height) {
+                    width = newW;
+                    height = newH;
+                    ImageReader oldReader = this.reader;
+                    this.reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2);
+                    this.reader.setOnImageAvailableListener(source -> scheduleFrameProcess(), frameHandler);
+                    display.setSurface(this.reader.getSurface());
+                    if (oldReader != null) {
+                        try { oldReader.setOnImageAvailableListener(null, null); oldReader.close(); } catch (Throwable ignored) {}
+                    }
+                    if (latestFrame != null) {
+                        latestFrame.recycle();
+                        latestFrame = null;
+                    }
+                }
+                densityDpi = newDpi;
+                display.resize(width, height, densityDpi);
+            }
+            scheduleFrameProcess();
+            return state().put("resized", true).put("tier", activeTier);
         } else if (op.equals("release")) {
             release();
         } else if (op.equals("preview")) {
@@ -406,8 +533,11 @@ final class DisplayRuntime {
             }
             if (upright == null) throw new Exception("尚未收到工作区画面，先在虚拟屏打开一个应用");
             try {
+                if (cmd.optBoolean("grid", false)) {
+                    drawAiGridOverlay(upright);
+                }
                 ByteArrayOutputStream out = new ByteArrayOutputStream(65536);
-                upright.compress(Bitmap.CompressFormat.JPEG, 86, out);
+                upright.compress(Bitmap.CompressFormat.JPEG, 84, out);
                 return state().put("width", upright.getWidth()).put("height", upright.getHeight())
                     .put("frameSequence", sequence)
                     .put("image", Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP));
@@ -430,8 +560,8 @@ final class DisplayRuntime {
             int x2 = cmd.getInt("x2"), y2 = cmd.getInt("y2");
             checkPoint(x1, y1);
             checkPoint(x2, y2);
-            int duration = cmd.optInt("duration_ms", 320);
-            if (duration < 50 || duration > 2500) throw new Exception("滑动时长须为 50–2500 ms");
+            int duration = cmd.optInt("duration_ms", 220);
+            if (duration < 40 || duration > 2500) throw new Exception("滑动时长须为 40–2500 ms");
             if (!injectSwipe(id, x1, y1, x2, y2, duration)) {
                 shell("input", "-d", String.valueOf(id), "swipe", String.valueOf(x1), String.valueOf(y1), String.valueOf(x2), String.valueOf(y2), String.valueOf(duration));
             }
@@ -801,6 +931,7 @@ final class DisplayRuntime {
                     } finally {
                         move.recycle();
                     }
+                    if (stepIdx % 2 == 0) scheduleFrameProcess();
                 } else {
                     c[0].x = x2;
                     c[0].y = y2;
@@ -923,12 +1054,16 @@ final class DisplayRuntime {
     private JSONObject state() throws Exception {
         VirtualDisplay vd = this.display;
         int r = (vd == null || vd.getDisplay() == null) ? 0 : vd.getDisplay().getRotation();
+        int lw = r % 2 == 0 ? width : height;
+        int lh = r % 2 == 0 ? height : width;
         return new JSONObject()
             .put("created", vd != null)
             .put("displayId", (vd == null || vd.getDisplay() == null) ? -1 : vd.getDisplay().getDisplayId())
-            .put("width", r % 2 == 0 ? width : height)
-            .put("height", r % 2 == 0 ? height : width)
+            .put("width", lw)
+            .put("height", lh)
             .put("dpi", densityDpi)
+            .put("tier", activeTier)
+            .put("swDp", Math.round((Math.min(lw, lh) * 160f) / Math.max(120, densityDpi)))
             .put("rotation", r)
             .put("uid", android.os.Process.myUid())
             .put("isolatedFocus", vd != null && trustedDisplay);
@@ -1034,5 +1169,40 @@ final class DisplayRuntime {
             }
         } catch (Throwable ignored) {}
         return sys;
+    }
+
+    private static void drawAiGridOverlay(Bitmap bmp) {
+        if (bmp == null) return;
+        int w = bmp.getWidth();
+        int h = bmp.getHeight();
+        Canvas c = new Canvas(bmp);
+        Paint linePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        linePaint.setColor(0x5500E5FF);
+        linePaint.setStrokeWidth(1f);
+        Paint bgPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        bgPaint.setColor(0x77000000);
+        Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        textPaint.setColor(0xDDFFFFFF);
+        textPaint.setTextSize(Math.max(10f, w / 42f));
+        int cols = 6;
+        int rows = 10;
+        for (int col = 1; col < cols; col++) {
+            float x = w * col / (float) cols;
+            c.drawLine(x, 0, x, h, linePaint);
+        }
+        for (int row = 1; row < rows; row++) {
+            float y = h * row / (float) rows;
+            c.drawLine(0, y, w, y, linePaint);
+        }
+        String[] letters = {"A", "B", "C", "D", "E", "F"};
+        for (int r = 0; r < rows; r++) {
+            for (int col = 0; col < cols; col++) {
+                String label = letters[col] + (r + 1);
+                float cx = w * (col + 0.08f) / cols;
+                float cy = h * (r + 0.22f) / rows;
+                c.drawRect(cx - 2f, cy - textPaint.getTextSize(), cx + textPaint.measureText(label) + 2f, cy + 3f, bgPaint);
+                c.drawText(label, cx, cy, textPaint);
+            }
+        }
     }
 }

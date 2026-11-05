@@ -1,31 +1,66 @@
 """A transparent, atomic, path-confined Markdown vault."""
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import os
 import threading
 
-TZ = ZoneInfo('Asia/Shanghai')
+try:
+    TZ = ZoneInfo('Asia/Shanghai')
+except ZoneInfoNotFoundError:
+    TZ = timezone(timedelta(hours=8))
 
 def now_iso():
     return datetime.now(TZ).isoformat(timespec='seconds')
 
 def atomic_write(path: Path, text: str):
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(path.name + '.tmp')
-    with temp.open('w', encoding='utf-8', newline='\n') as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    if os.name != 'nt':
-        temp.chmod(0o600)
-    temp.replace(path)
+    temp = path.with_name(f'.{path.name}.{os.getpid()}.{threading.get_ident()}.tmp')
+    try:
+        with temp.open('w', encoding='utf-8', newline='\n') as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.name != 'nt':
+            temp.chmod(0o600)
+        temp.replace(path)
+    finally:
+        if temp.exists():
+            try:
+                temp.unlink()
+            except Exception:
+                pass
 
 TEMPLATES = {
     'INDEX.md': '# 共生记忆库\n\n所有记忆都可以查看、修改。只记录已知事实；猜测必须标注。\n\n',
     'profile/user_traits.md': '# 用户画像\n\n尚未收集到已确认的偏好。\n',
+    'profile/personal_impression.md': (
+        '# 主人立体个人印象档案 (Personal Impression)\n\n'
+        '> 由助理在日常对话与好奇心互动中循序渐进补全，只记录主人亲口确认的事实。\n\n'
+        '## 1. 出生、成长与故乡\n'
+        '- 出生地 / 家乡：（待了解）\n'
+        '- 生日 / 年代与成长阶段：（待了解）\n'
+        '- 童年或成长中印象最深的事：（待了解）\n\n'
+        '## 2. 身份、学业与事业角色\n'
+        '- 当前核心身份 / 角色：（待了解）\n'
+        '- 专业领域与擅长方向：（待了解）\n'
+        '- 长期人生目标或理想状态：（待了解）\n\n'
+        '## 3. 家庭、羁绊与人际关系\n'
+        '- 家庭结构与家人相处氛围：（待了解）\n'
+        '- 生活中最重要的人或宠物：（待了解）\n'
+        '- 社交习惯与人际边界：（待了解）\n\n'
+        '## 4. 生活方式、审美与精神角落\n'
+        '- 作息规律与日常节奏：（待了解）\n'
+        '- 饮食口味偏好与忌口：（待了解）\n'
+        '- 音乐 / 游戏 / 影视 / 阅读等精神喜好：（待了解）\n\n'
+        '## 5. 性格底色、价值观与相处雷区\n'
+        '- 自我认同的性格特点：（待了解）\n'
+        '- 最看重的品质与价值观：（待了解）\n'
+        '- 讨厌的沟通方式或绝对雷区：（待了解）\n'
+    ),
     'profile/annoyance_valve.md': '# 烦人度阀门\n\n当前：好奇心开启。用户可以随时暂停。\n',
+    'profile/pinned_memories.md': '# 📌 核心钉住记忆 (Pinned Core Memories)\n\n',
     'tasks/sniffed_opportunities.md': '# 可能代劳的机会\n\n先问清卡点，再试做第一步；未经确认不固化职责。\n',
     'tasks/active_deadlines.md': '# 已确认死线\n\n只记录用户明确承诺的时间。\n',
     'playbooks/routines.md': '# 常驻职责\n\n只有点击「以后接着干」的成果会登记在这里。\n',

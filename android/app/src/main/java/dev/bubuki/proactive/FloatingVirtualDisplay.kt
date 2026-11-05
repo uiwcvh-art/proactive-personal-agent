@@ -79,6 +79,7 @@ import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.exp
 import kotlin.math.hypot
+import kotlin.math.pow
 import kotlin.math.roundToInt
 
 /**
@@ -149,9 +150,10 @@ internal class PipVectorIconButton(
     context: Context,
     private val kind: IconKind,
     private val isDanger: Boolean = false,
+    private var badgeText: String = "M",
     onClick: () -> Unit
 ) : View(context) {
-    enum class IconKind { EYE_OFF, APPS_GRID, SHRINK, POWER_CLOSE }
+    enum class IconKind { EYE_OFF, SIZE_TIER, APPS_GRID, SHRINK, POWER_CLOSE }
 
     private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
@@ -169,6 +171,12 @@ internal class PipVectorIconButton(
         strokeWidth = context.resources.displayMetrics.density * 1.5f
         color = if (isDanger) 0xFFFF7A72.toInt() else 0xF2FFFFFF.toInt()
     }
+    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = 0xF2FFFFFF.toInt()
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.DEFAULT_BOLD
+    }
     private val rectF = RectF()
 
     init {
@@ -176,29 +184,48 @@ internal class PipVectorIconButton(
         setOnClickListener { onClick() }
     }
 
+    fun updateBadge(text: String) {
+        if (badgeText != text) {
+            badgeText = text
+            invalidate()
+        }
+    }
+
+    fun setBadgeText(text: String) = updateBadge(text)
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         val w = width.toFloat()
         val h = height.toFloat()
+        val minSide = minOf(w, h)
+        if (minSide <= 2f) return
+        // Proportional unit scaled relative to reference 26dp button size
+        val u = minSide / 26f
+        strokePaint.strokeWidth = (0.85f * u).coerceAtLeast(1f)
+        iconPaint.strokeWidth = (1.55f * u).coerceAtLeast(1.2f)
+
         val cx = w / 2f
         val cy = h / 2f
-        val r = (minOf(w, h) / 2f) - strokePaint.strokeWidth
+        val r = (minSide / 2f) - strokePaint.strokeWidth
         canvas.drawCircle(cx, cy, r, bgPaint)
         canvas.drawCircle(cx, cy, r, strokePaint)
 
-        val d = resources.displayMetrics.density
         when (kind) {
             IconKind.EYE_OFF -> {
-                // Sleek Eye-Off icon (Mika style)
-                rectF.set(cx - 5.5f * d, cy - 3.2f * d, cx + 5.5f * d, cy + 3.2f * d)
+                rectF.set(cx - 5.5f * u, cy - 3.2f * u, cx + 5.5f * u, cy + 3.2f * u)
                 canvas.drawOval(rectF, iconPaint)
-                canvas.drawLine(cx - 5.2f * d, cy + 4.5f * d, cx + 5.2f * d, cy - 4.5f * d, iconPaint)
+                canvas.drawLine(cx - 5.2f * u, cy + 4.5f * u, cx + 5.2f * u, cy - 4.5f * u, iconPaint)
+            }
+            IconKind.SIZE_TIER -> {
+                textPaint.textSize = 10.2f * u
+                val fm = textPaint.fontMetrics
+                val baseline = cy - (fm.ascent + fm.descent) / 2f
+                canvas.drawText(badgeText, cx, baseline, textPaint)
             }
             IconKind.APPS_GRID -> {
-                // 2x2 rounded grid
-                val s = 3.4f * d
-                val gap = 1.2f * d
-                val cr = 0.9f * d
+                val s = 3.4f * u
+                val gap = 1.2f * u
+                val cr = 0.9f * u
                 rectF.set(cx - gap / 2 - s, cy - gap / 2 - s, cx - gap / 2, cy - gap / 2)
                 canvas.drawRoundRect(rectF, cr, cr, iconPaint)
                 rectF.set(cx + gap / 2, cy - gap / 2 - s, cx + gap / 2 + s, cy - gap / 2)
@@ -209,26 +236,69 @@ internal class PipVectorIconButton(
                 canvas.drawRoundRect(rectF, cr, cr, iconPaint)
             }
             IconKind.SHRINK -> {
-                // Minimize / collapse arrows
-                val arm = 3.2f * d
-                // Top-right inward arrow
-                canvas.drawLine(cx + 1.2f * d, cy - 1.2f * d, cx + 4.8f * d, cy - 4.8f * d, iconPaint)
-                canvas.drawLine(cx + 1.2f * d, cy - 1.2f * d, cx + 1.2f * d + arm, cy - 1.2f * d, iconPaint)
-                canvas.drawLine(cx + 1.2f * d, cy - 1.2f * d, cx + 1.2f * d, cy - 1.2f * d - arm, iconPaint)
-                // Bottom-left inward arrow
-                canvas.drawLine(cx - 1.2f * d, cy + 1.2f * d, cx - 4.8f * d, cy + 4.8f * d, iconPaint)
-                canvas.drawLine(cx - 1.2f * d, cy + 1.2f * d, cx - 1.2f * d - arm, cy + 1.2f * d, iconPaint)
-                canvas.drawLine(cx - 1.2f * d, cy + 1.2f * d, cx - 1.2f * d, cy + 1.2f * d + arm, iconPaint)
+                val arm = 3.2f * u
+                canvas.drawLine(cx + 1.2f * u, cy - 1.2f * u, cx + 4.8f * u, cy - 4.8f * u, iconPaint)
+                canvas.drawLine(cx + 1.2f * u, cy - 1.2f * u, cx + 1.2f * u + arm, cy - 1.2f * u, iconPaint)
+                canvas.drawLine(cx + 1.2f * u, cy - 1.2f * u, cx + 1.2f * u, cy - 1.2f * u - arm, iconPaint)
+                canvas.drawLine(cx - 1.2f * u, cy + 1.2f * u, cx - 4.8f * u, cy + 4.8f * u, iconPaint)
+                canvas.drawLine(cx - 1.2f * u, cy + 1.2f * u, cx - 1.2f * u - arm, cy + 1.2f * u, iconPaint)
+                canvas.drawLine(cx - 1.2f * u, cy + 1.2f * u, cx - 1.2f * u, cy + 1.2f * u + arm, iconPaint)
             }
             IconKind.POWER_CLOSE -> {
-                // Crisp X close icon
-                val len = 3.8f * d
+                val len = 3.8f * u
                 canvas.drawLine(cx - len, cy - len, cx + len, cy + len, iconPaint)
                 canvas.drawLine(cx + len, cy - len, cx - len, cy + len, iconPaint)
             }
         }
     }
 }
+
+/**
+ * Subtle bottom-right diagonal resize grip for smooth free-form resizing of the floating display.
+ */
+internal class ResizeGripView(context: Context) : View(context) {
+    private val gripPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        color = 0x80FFFFFF.toInt()
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val u = minOf(w, h) / 22f
+        gripPaint.strokeWidth = (1.4f * u).coerceAtLeast(1f)
+        val pad = 4.2f * u
+        canvas.drawLine(w - pad - 7.5f * u, h - pad, w - pad, h - pad - 7.5f * u, gripPaint)
+        canvas.drawLine(w - pad - 3.8f * u, h - pad, w - pad, h - pad - 3.8f * u, gripPaint)
+    }
+}
+
+/**
+ * Layer 2 Continuous Power-Law Adaptive Layout Metrics for the Floating Virtual Display:
+ * Scales window dimensions, glass bezel, corner radii, button sizes, icon strokes, capsules,
+ * touch dot, and app picker proportionally to sigma = (innerWidthDp / 240f)^0.65.
+ */
+internal data class PipLayoutMetrics(
+    val winW: Int,
+    val winH: Int,
+    val innerW: Int,
+    val innerH: Int,
+    val framePadPx: Int,
+    val outerRadiusPx: Float,
+    val innerRadiusPx: Float,
+    val btnSizePx: Int,
+    val btnMarginPx: Int,
+    val dragZoneHeightPx: Int,
+    val touchDotSizePx: Int,
+    val capsulePadHPx: Int,
+    val capsulePadVPx: Int,
+    val capsuleSp: Float,
+    val hintSp: Float,
+    val pickerItemSp: Float,
+    val sigma: Float
+)
 
 /**
  * Mika-style floating AgentPip window (TYPE_APPLICATION_OVERLAY) on the Android desktop:
@@ -238,6 +308,18 @@ internal class PipVectorIconButton(
  * - Vector Canvas icons for Hide-to-Pill, App Picker, Collapse, and Close Virtual Display (`release`)
  */
 object FloatingVirtualDisplay {
+    enum class SizeTier(val rpcName: String, val badge: String, val portraitFrac: Float, val landscapeFrac: Float) {
+        COMPACT("compact", "S", 0.44f, 0.54f),
+        MEDIUM("balanced", "M", 0.58f, 0.70f),
+        LARGE("large", "L", 0.76f, 0.86f);
+
+        fun next(): SizeTier = when (this) {
+            COMPACT -> MEDIUM
+            MEDIUM -> LARGE
+            LARGE -> COMPACT
+        }
+    }
+
     private val mainHandler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var watchJob: Job? = null
@@ -249,6 +331,8 @@ object FloatingVirtualDisplay {
     private var minimizedToPill = false
     private var pickingApp = false
     private var userDismissed = false
+    private var sizeTier = SizeTier.MEDIUM
+    private var customWidthFraction: Float? = null
     private var snapCorner = PipSpringPhysics.Corner.TopEnd
     private var springAnimator: ValueAnimator? = null
 
@@ -258,10 +342,32 @@ object FloatingVirtualDisplay {
     private var waitingCapsuleView: TextView? = null
     private var appPickerContainer: ScrollView? = null
     private var appPickerList: LinearLayout? = null
+    private var sizeTierButton: PipVectorIconButton? = null
     private var outerBorderDrawable: GradientDrawable? = null
     private var lastBorderColor: Int = 0
     private var lastRenderedAppsKey: Int = -1
     private var lastTouchShownTime: Long = 0L
+
+    @JvmStatic
+    fun currentTier(): SizeTier = sizeTier
+
+    @JvmStatic
+    fun cycleSizeTier(context: Context) {
+        sizeTier = sizeTier.next()
+        customWidthFraction = null
+        mainHandler.post {
+            sizeTierButton?.setBadgeText(sizeTier.badge)
+            transitionSizeAndRebuild(context.applicationContext, RootPhoneHarness.changes.value)
+        }
+        scope.launch(Dispatchers.IO) {
+            runCatching {
+                RootPhoneHarness.command(
+                    context.applicationContext,
+                    JSONObject().put("op", "resize").put("tier", sizeTier.rpcName).put("manual", true)
+                )
+            }
+        }
+    }
 
     // Frame decoding cache
     @Volatile private var lastDecodedB64: String = ""
@@ -424,6 +530,9 @@ object FloatingVirtualDisplay {
         waitingCapsuleView = null
         appPickerContainer = null
         appPickerList = null
+        sizeTierButton = null
+
+        val layout = computeAdaptiveLayout(context, state, expanded, minimizedToPill)
 
         // State 1: Minimized Restore Pill (Mika's RestorePill in bottom-right)
         if (minimizedToPill) {
@@ -468,17 +577,17 @@ object FloatingVirtualDisplay {
             return
         }
 
-        // State 2 & 3: Mika's Sleek Frosted-Glass Frame (Collapsed 104dp or Expanded 226dp)
-        val pad = dp(context, if (expanded) 4f else 3.5f)
-        val outerRadius = dp(context, if (expanded) 20f else 17f).toFloat()
-        val innerRadius = dp(context, if (expanded) 16f else 13.5f).toFloat()
+        // State 2 & 3: Adaptive Frosted-Glass Frame (scales all radii, padding, buttons & font sizes by power-law sigma)
+        val pad = layout.framePadPx
+        val outerRadius = layout.outerRadiusPx
+        val innerRadius = layout.innerRadiusPx
 
         val glassFrame = FrameLayout(context).apply {
             setPadding(pad, pad, pad, pad)
             val bg = GradientDrawable().apply {
                 setColor(0xD918181C.toInt()) // Deep translucent obsidian glass
                 cornerRadius = outerRadius
-                setStroke(dp(context, 1.2f), borderColorFor(state))
+                setStroke(dp(context, 0.7f), borderColorFor(state))
             }
             outerBorderDrawable = bg
             background = bg
@@ -493,7 +602,7 @@ object FloatingVirtualDisplay {
             val innerRim = GradientDrawable().apply {
                 setColor(Color.TRANSPARENT)
                 cornerRadius = innerRadius
-                setStroke(1, 0x28FFFFFF)
+                setStroke(1, 0x22FFFFFF)
             }
             background = LayerDrawable(arrayOf(innerBg, innerRim))
             clipToOutline = true
@@ -511,20 +620,29 @@ object FloatingVirtualDisplay {
         screenImageView = img
         innerBox.addView(img, FrameLayout.LayoutParams(-1, -1))
 
-        val touchDot = View(context).apply {
+        val dotSize = layout.touchDotSizePx
+        val coreSize = (dotSize / 4).coerceAtLeast(dp(context, 3))
+        val touchDot = FrameLayout(context).apply {
             visibility = View.GONE
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
-                setColor(0x4D34C759)
-                setStroke(dp(context, 1.5f), 0xFF34C759.toInt())
+                setColor(0x18FFFFFF)
+                setStroke(dp(context, 0.75f).coerceAtLeast(1), 0xCCFFFFFF.toInt())
             }
+            val centerCore = View(context).apply {
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(0xE6FFFFFF.toInt())
+                }
+            }
+            addView(centerCore, FrameLayout.LayoutParams(coreSize, coreSize, Gravity.CENTER))
         }
         touchIndicatorView = touchDot
-        innerBox.addView(touchDot, FrameLayout.LayoutParams(dp(context, 18), dp(context, 18)))
+        innerBox.addView(touchDot, FrameLayout.LayoutParams(dotSize, dotSize))
 
         val hint = TextView(context).apply {
             text = if (expanded) "点右上角网格图标\n选择应用启动" else "虚拟屏"
-            textSize = if (expanded) 10f else 9f
+            textSize = layout.hintSp
             setTextColor(0x99FFFFFF.toInt())
             gravity = Gravity.CENTER
             setPadding(dp(context, 8), dp(context, 8), dp(context, 8), dp(context, 8))
@@ -535,7 +653,7 @@ object FloatingVirtualDisplay {
         if (!expanded) {
             val waitTag = TextView(context).apply {
                 text = "待你处理"
-                textSize = 9f
+                textSize = layout.capsuleSp
                 setTextColor(Color.BLACK)
                 typeface = Typeface.DEFAULT_BOLD
                 setPadding(dp(context, 6), dp(context, 2), dp(context, 6), dp(context, 2))
@@ -555,7 +673,7 @@ object FloatingVirtualDisplay {
                 transitionSizeAndRebuild(context, RootPhoneHarness.changes.value)
             })
         } else {
-            attachExpandedScreenTouchAndDrag(context, img)
+            attachExpandedScreenTouchAndDrag(context, img, layout.dragZoneHeightPx)
 
             // App Picker overlay inside the screen
             val pickerScroll = ScrollView(context).apply {
@@ -567,14 +685,20 @@ object FloatingVirtualDisplay {
             }
             val pickerLinear = LinearLayout(context).apply {
                 orientation = LinearLayout.VERTICAL
-                setPadding(dp(context, 10), dp(context, 38), dp(context, 10), dp(context, 12))
+                setPadding(
+                    dp(context, 10),
+                    (layout.btnSizePx + layout.btnMarginPx * 2 + dp(context, 4)),
+                    dp(context, 10),
+                    dp(context, 12)
+                )
             }
             appPickerContainer = pickerScroll
             appPickerList = pickerLinear
             pickerScroll.addView(pickerLinear, FrameLayout.LayoutParams(-1, -2))
             innerBox.addView(pickerScroll, FrameLayout.LayoutParams(-1, -1))
 
-            val btnSize = dp(context, 26)
+            val btnSize = layout.btnSizePx
+            val btnGap = (layout.btnMarginPx - dp(context, 1)).coerceAtLeast(dp(context, 4))
             // Top-Start: Minimize to corner pill (Vector EyeOff icon)
             val hidePillBtn = PipVectorIconButton(context, PipVectorIconButton.IconKind.EYE_OFF) {
                 pickingApp = false
@@ -583,11 +707,11 @@ object FloatingVirtualDisplay {
                 transitionSizeAndRebuild(context, RootPhoneHarness.changes.value)
             }
             innerBox.addView(hidePillBtn, FrameLayout.LayoutParams(btnSize, btnSize, Gravity.TOP or Gravity.START).apply {
-                leftMargin = dp(context, 6)
-                topMargin = dp(context, 6)
+                leftMargin = layout.btnMarginPx
+                topMargin = layout.btnMarginPx
             })
 
-            // Top-End group: App launcher (Grid) + Shrink to mini-PiP + Close Virtual Display (Power/X)
+            // Top-End group: App launcher (Grid) + Size Tier (S/M/L) + Shrink to mini-PiP + Close Virtual Display (Power/X)
             val topRightRow = LinearLayout(context).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
@@ -601,14 +725,24 @@ object FloatingVirtualDisplay {
                 }
                 updateWindowContent(context, RootPhoneHarness.changes.value)
             }
-            topRightRow.addView(appBtn, LinearLayout.LayoutParams(btnSize, btnSize).apply { rightMargin = dp(context, 5) })
+            topRightRow.addView(appBtn, LinearLayout.LayoutParams(btnSize, btnSize).apply { rightMargin = btnGap })
+
+            val tierBtn = PipVectorIconButton(
+                context,
+                PipVectorIconButton.IconKind.SIZE_TIER,
+                badgeText = sizeTier.badge
+            ) {
+                cycleSizeTier(context)
+            }
+            sizeTierButton = tierBtn
+            topRightRow.addView(tierBtn, LinearLayout.LayoutParams(btnSize, btnSize).apply { rightMargin = btnGap })
 
             val shrinkBtn = PipVectorIconButton(context, PipVectorIconButton.IconKind.SHRINK) {
                 pickingApp = false
                 expanded = false
                 transitionSizeAndRebuild(context, RootPhoneHarness.changes.value)
             }
-            topRightRow.addView(shrinkBtn, LinearLayout.LayoutParams(btnSize, btnSize).apply { rightMargin = dp(context, 5) })
+            topRightRow.addView(shrinkBtn, LinearLayout.LayoutParams(btnSize, btnSize).apply { rightMargin = btnGap })
 
             val closeDisplayBtn = PipVectorIconButton(context, PipVectorIconButton.IconKind.POWER_CLOSE, isDanger = true) {
                 pickingApp = false
@@ -620,20 +754,20 @@ object FloatingVirtualDisplay {
             topRightRow.addView(closeDisplayBtn, LinearLayout.LayoutParams(btnSize, btnSize))
 
             innerBox.addView(topRightRow, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END).apply {
-                rightMargin = dp(context, 6)
-                topMargin = dp(context, 6)
+                rightMargin = layout.btnMarginPx
+                topMargin = layout.btnMarginPx
             })
 
             // Bottom floating capsule: either "我处理好了，继续" when waiting_user, or subtle Back pill
             val bottomCapsule = TextView(context).apply {
                 text = if (state.phase == "waiting_user") "我处理好了，继续" else "‹ 返回"
-                textSize = if (state.phase == "waiting_user") 10f else 9.5f
+                textSize = if (state.phase == "waiting_user") (layout.capsuleSp + 0.5f) else layout.capsuleSp
                 setTextColor(if (state.phase == "waiting_user") Color.BLACK else 0xE6FFFFFF.toInt())
                 typeface = Typeface.DEFAULT_BOLD
-                setPadding(dp(context, 10), dp(context, 3.5f), dp(context, 10), dp(context, 3.5f))
+                setPadding(layout.capsulePadHPx, layout.capsulePadVPx, layout.capsulePadHPx, layout.capsulePadVPx)
                 background = GradientDrawable().apply {
                     setColor(if (state.phase == "waiting_user") 0xFFFF9F0A.toInt() else 0x99141418.toInt())
-                    cornerRadius = dp(context, 12).toFloat()
+                    cornerRadius = dp(context, 12 * layout.sigma).toFloat()
                     setStroke(1, 0x2EFFFFFF)
                 }
                 setOnClickListener {
@@ -653,8 +787,14 @@ object FloatingVirtualDisplay {
             }
             waitingCapsuleView = bottomCapsule
             innerBox.addView(bottomCapsule, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
-                bottomMargin = dp(context, 6)
+                bottomMargin = layout.btnMarginPx
             })
+
+            // Bottom-End: Free-form corner resize grip (stepless aspect-locked resizing)
+            val resizeGrip = ResizeGripView(context)
+            val gripSize = dp(context, 24 * layout.sigma).coerceIn(dp(context, 20), dp(context, 32))
+            attachCornerResizeTouch(context, resizeGrip)
+            innerBox.addView(resizeGrip, FrameLayout.LayoutParams(gripSize, gripSize, Gravity.BOTTOM or Gravity.END))
         }
 
         lastBorderColor = borderColorFor(state)
@@ -663,29 +803,106 @@ object FloatingVirtualDisplay {
         container.addView(glassFrame, FrameLayout.LayoutParams(-1, -1))
     }
 
+    @SuppressLint("ClickableViewAccessibility")
+    private fun attachCornerResizeTouch(context: Context, gripView: View) {
+        val slop = ViewConfiguration.get(context).scaledTouchSlop
+        var downRawX = 0f
+        var downRawY = 0f
+        var startInnerW = 0
+        var startWinX = 0
+        var startRightEdge = 0
+        var resizing = false
+        gripView.setOnTouchListener { _, event ->
+            runCatching {
+                val lp = params ?: return@setOnTouchListener false
+                val container = rootView ?: return@setOnTouchListener false
+                val wm = windowManager ?: return@setOnTouchListener false
+                val metrics = context.resources.displayMetrics
+                val shortSidePx = minOf(metrics.widthPixels, metrics.heightPixels).coerceAtLeast(1)
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        springAnimator?.cancel()
+                        downRawX = event.rawX
+                        downRawY = event.rawY
+                        val curLayout = computeAdaptiveLayout(context, RootPhoneHarness.changes.value, expanded, minimizedToPill)
+                        startInnerW = curLayout.innerW
+                        startWinX = lp.x
+                        startRightEdge = lp.x + lp.width
+                        resizing = false
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        val dx = event.rawX - downRawX
+                        val dy = event.rawY - downRawY
+                        if (!resizing && hypot(dx, dy) > slop) {
+                            resizing = true
+                        }
+                        if (resizing) {
+                            val state = RootPhoneHarness.changes.value
+                            val bmp = currentBitmap
+                            val rawAspect = if (bmp != null && bmp.width > 0 && bmp.height > 0) {
+                                bmp.height.toFloat() / bmp.width.toFloat()
+                            } else {
+                                mainScreenAspect(context)
+                            }
+                            val aspect = if (rawAspect.isFinite() && rawAspect > 0.2f) rawAspect else 2.15f
+                            val dwFromY = dy / aspect
+                            val deltaW = if (abs(dwFromY) >= abs(dx)) dwFromY else dx
+                            val minInnerW = (shortSidePx * 0.36f).roundToInt().coerceAtLeast(dp(context, 96))
+                            val maxInnerW = (shortSidePx * 0.84f).roundToInt().coerceAtLeast(minInnerW + 1)
+                            val newInnerW = (startInnerW + deltaW.roundToInt()).coerceIn(minInnerW, maxInnerW)
+                            customWidthFraction = (newInnerW.toFloat() / shortSidePx.toFloat()).coerceIn(0.36f, 0.84f)
+                            val (targetW, targetH) = computeWindowSizePx(context, state, expanded, minimizedToPill)
+                            if (abs(lp.width - targetW) > 1 || abs(lp.height - targetH) > 1) {
+                                lp.width = targetW
+                                lp.height = targetH
+                                val desiredX = if (snapCorner.right) (startRightEdge - targetW) else startWinX
+                                val minX = dp(context, 6)
+                                val maxX = (metrics.widthPixels - lp.width - minX).coerceAtLeast(minX)
+                                val minY = dp(context, 36)
+                                val maxY = (metrics.heightPixels - lp.height - minY).coerceAtLeast(minY)
+                                lp.x = desiredX.coerceIn(minX, maxX)
+                                lp.y = lp.y.coerceIn(minY, maxY)
+                                wm.updateViewLayout(container, lp)
+                            }
+                        }
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        resizing = false
+                    }
+                }
+            }
+            true
+        }
+    }
+
     private fun transitionSizeAndRebuild(context: Context, state: RootPhoneState) {
-        val container = rootView ?: return
-        val lp = params ?: return
-        val wm = windowManager ?: return
-        val metrics = context.resources.displayMetrics
-        val (targetW, targetH) = computeWindowSizePx(context, state, expanded, minimizedToPill)
-        val (cornerX, cornerY) = PipSpringPhysics.cornerPosition(
-            if (minimizedToPill) PipSpringPhysics.Corner.BottomEnd else snapCorner,
-            metrics.widthPixels,
-            metrics.heightPixels,
-            targetW,
-            targetH,
-            dp(context, 12),
-            dp(context, 56),
-            dp(context, 92)
-        )
-        lp.width = targetW
-        lp.height = targetH
-        lp.x = cornerX
-        lp.y = cornerY
-        rebuildViewHierarchy(context, container, state)
-        updateWindowContent(context, state)
-        runCatching { wm.updateViewLayout(container, lp) }
+        val appCtx = context.applicationContext
+        mainHandler.post {
+            runCatching {
+                val container = rootView ?: return@post
+                val lp = params ?: return@post
+                val wm = windowManager ?: return@post
+                val metrics = appCtx.resources.displayMetrics
+                val (targetW, targetH) = computeWindowSizePx(appCtx, state, expanded, minimizedToPill)
+                val (cornerX, cornerY) = PipSpringPhysics.cornerPosition(
+                    if (minimizedToPill) PipSpringPhysics.Corner.BottomEnd else snapCorner,
+                    metrics.widthPixels,
+                    metrics.heightPixels,
+                    targetW,
+                    targetH,
+                    dp(appCtx, 12),
+                    dp(appCtx, 56),
+                    dp(appCtx, 92)
+                )
+                lp.width = targetW
+                lp.height = targetH
+                lp.x = cornerX
+                lp.y = cornerY
+                rebuildViewHierarchy(appCtx, container, state)
+                updateWindowContent(appCtx, state)
+                wm.updateViewLayout(container, lp)
+            }
+        }
     }
 
     private fun mainScreenAspect(context: Context): Float {
@@ -695,9 +912,37 @@ object FloatingVirtualDisplay {
         return if (w > 0 && h > 0) h.toFloat() / w.toFloat() else 2.15f
     }
 
-    private fun computeWindowSizePx(context: Context, state: RootPhoneState, isExpanded: Boolean, isPill: Boolean): Pair<Int, Int> {
+    /**
+     * Continuous power-law layout algorithm:
+     * Computes outer window dimensions (preserving exact virtual display aspect ratio) AND
+     * scales all internal UI elements by sigma = (innerWidthDp / 240f)^0.65f.
+     */
+    internal fun computeAdaptiveLayout(
+        context: Context,
+        state: RootPhoneState,
+        isExpanded: Boolean,
+        isPill: Boolean
+    ): PipLayoutMetrics {
         if (isPill) {
-            return dp(context, 124) to dp(context, 38)
+            return PipLayoutMetrics(
+                winW = dp(context, 124),
+                winH = dp(context, 38),
+                innerW = dp(context, 118),
+                innerH = dp(context, 32),
+                framePadPx = dp(context, 3),
+                outerRadiusPx = dp(context, 22).toFloat(),
+                innerRadiusPx = dp(context, 18).toFloat(),
+                btnSizePx = dp(context, 20),
+                btnMarginPx = dp(context, 6),
+                dragZoneHeightPx = dp(context, 28),
+                touchDotSizePx = dp(context, 10),
+                capsulePadHPx = dp(context, 8),
+                capsulePadVPx = dp(context, 3),
+                capsuleSp = 9.5f,
+                hintSp = 9f,
+                pickerItemSp = 11f,
+                sigma = 0.8f
+            )
         }
         val bmp = currentBitmap
         val aspect = if (bmp != null && bmp.width > 0 && bmp.height > 0) {
@@ -708,27 +953,61 @@ object FloatingVirtualDisplay {
             val vh = info.optInt("height", 0)
             if (vw > 0 && vh > 0) vh.toFloat() / vw.toFloat() else mainScreenAspect(context)
         }
-        // Strict aspect-ratio preserving formula (modeled after Mika's AgentPip.kt):
-        // Never clamps height independently of width so text is NEVER squished or stretched!
         val metrics = context.resources.displayMetrics
-        val pad = dp(context, if (isExpanded) 4f else 3.5f)
-        val availW = (metrics.widthPixels - dp(context, 24) - pad * 2).coerceAtLeast(dp(context, 80))
-        val availH = (metrics.heightPixels - dp(context, 160) - pad * 2).coerceAtLeast(dp(context, 120))
+        val shortSidePx = minOf(metrics.widthPixels, metrics.heightPixels).coerceAtLeast(dp(context, 280))
         val isLandscape = aspect < 1f
-        val baseInnerW = dp(
-            context,
-            when {
-                isLandscape -> if (isExpanded) 310 else 176
-                else -> if (isExpanded) 216 else 96
-            }
-        )
+        val frac = when {
+            !isExpanded -> if (isLandscape) 0.44f else 0.27f
+            customWidthFraction != null -> customWidthFraction!!
+            else -> if (isLandscape) sizeTier.landscapeFrac else sizeTier.portraitFrac
+        }
+        val prelimInnerW = (shortSidePx * frac).roundToInt()
+        val prelimInnerDp = prelimInnerW / metrics.density.coerceAtLeast(1f)
+        val prelimSigma = (prelimInnerDp / 240f).pow(0.65f).coerceIn(0.66f, 1.35f)
+        val pad = dp(context, 4f * prelimSigma).coerceIn(dp(context, 3), dp(context, 6))
+
+        val availW = (metrics.widthPixels - dp(context, 20) - pad * 2).coerceAtLeast(dp(context, 80))
+        val availH = (metrics.heightPixels - dp(context, 136) - pad * 2).coerceAtLeast(dp(context, 120))
         val innerW = minOf(
-            baseInnerW,
+            prelimInnerW,
             availW,
-            (availH / aspect).roundToInt().coerceAtLeast(dp(context, 60))
-        ).coerceAtLeast(dp(context, 60))
-        val innerH = (innerW * aspect).roundToInt().coerceAtLeast(dp(context, 60))
-        return (innerW + pad * 2) to (innerH + pad * 2)
+            (availH / aspect).roundToInt().coerceAtLeast(dp(context, 68))
+        ).coerceAtLeast(dp(context, 68))
+        val innerH = (innerW * aspect).roundToInt().coerceAtLeast(dp(context, 68))
+
+        val innerDp = innerW / metrics.density.coerceAtLeast(1f)
+        val sigma = (innerDp / 240f).pow(0.65f).coerceIn(0.66f, 1.35f)
+        val outerRadius = dp(context, 20f * sigma).coerceIn(dp(context, 14), dp(context, 26)).toFloat()
+        val innerRadius = (outerRadius - pad).coerceAtLeast(dp(context, 10).toFloat())
+        val btnSize = dp(context, 27f * sigma).coerceIn(dp(context, 22), dp(context, 34))
+        val btnMargin = dp(context, 6f * sigma).coerceIn(dp(context, 4), dp(context, 9))
+        val dragZoneH = (btnSize + btnMargin * 2 + dp(context, 4)).coerceIn(dp(context, 32), dp(context, 48))
+        val dotSize = dp(context, 13f * sigma).coerceIn(dp(context, 10), dp(context, 18))
+
+        return PipLayoutMetrics(
+            winW = innerW + pad * 2,
+            winH = innerH + pad * 2,
+            innerW = innerW,
+            innerH = innerH,
+            framePadPx = pad,
+            outerRadiusPx = outerRadius,
+            innerRadiusPx = innerRadius,
+            btnSizePx = btnSize,
+            btnMarginPx = btnMargin,
+            dragZoneHeightPx = dragZoneH,
+            touchDotSizePx = dotSize,
+            capsulePadHPx = dp(context, 10.5f * sigma).coerceIn(dp(context, 7), dp(context, 14)),
+            capsulePadVPx = dp(context, 4f * sigma).coerceIn(dp(context, 2), dp(context, 6)),
+            capsuleSp = (10f * sigma).coerceIn(8.5f, 12.5f),
+            hintSp = (10f * sigma).coerceIn(8.5f, 12f),
+            pickerItemSp = (11.5f * sigma).coerceIn(10f, 14f),
+            sigma = sigma
+        )
+    }
+
+    private fun computeWindowSizePx(context: Context, state: RootPhoneState, isExpanded: Boolean, isPill: Boolean): Pair<Int, Int> {
+        val m = computeAdaptiveLayout(context, state, isExpanded, isPill)
+        return m.winW to m.winH
     }
 
     private fun borderColorFor(state: RootPhoneState): Int = when (state.phase) {
@@ -751,7 +1030,7 @@ object FloatingVirtualDisplay {
         val newBorderColor = borderColorFor(state)
         if (newBorderColor != lastBorderColor) {
             lastBorderColor = newBorderColor
-            outerBorderDrawable?.setStroke(dp(context, 1.2f), newBorderColor)
+            outerBorderDrawable?.setStroke(dp(context, 0.7f), newBorderColor)
         }
 
         if (!minimizedToPill) {
@@ -771,16 +1050,18 @@ object FloatingVirtualDisplay {
         if (dot != null && imgView != null && state.lastTouchX >= 0 && state.lastTouchY >= 0 && state.lastTouchTime != lastTouchShownTime && System.currentTimeMillis() - state.lastTouchTime < 1200L && imgView.width > 0 && imgView.height > 0) {
             lastTouchShownTime = state.lastTouchTime
             val info = runCatching { JSONObject(state.imageInfo.ifBlank { state.display }) }.getOrDefault(JSONObject())
-            val dispW = info.optInt("width", 1080).coerceAtLeast(1)
-            val dispH = info.optInt("height", 2400).coerceAtLeast(1)
-            val dotRadius = dp(context, 9)
+            val dispW = info.optInt("width", 540).coerceAtLeast(1)
+            val dispH = info.optInt("height", 1200).coerceAtLeast(1)
+            val dotRadius = dp(context, 6)
             val px = (state.lastTouchX.toFloat() / dispW * imgView.width).roundToInt() - dotRadius
             val py = (state.lastTouchY.toFloat() / dispH * imgView.height).roundToInt() - dotRadius
             dot.translationX = px.toFloat()
             dot.translationY = py.toFloat()
+            dot.scaleX = 0.85f
+            dot.scaleY = 0.85f
             dot.visibility = View.VISIBLE
-            dot.alpha = 1f
-            dot.animate().alpha(0f).setDuration(550L).withEndAction { dot.visibility = View.GONE }.start()
+            dot.alpha = 0.92f
+            dot.animate().alpha(0f).scaleX(1.18f).scaleY(1.18f).setDuration(360L).withEndAction { dot.visibility = View.GONE }.start()
         }
 
         // Decode frame if changed (with cache hit when unchanged)
@@ -919,7 +1200,7 @@ object FloatingVirtualDisplay {
                     if (dragging) {
                         animateSpringToNearestCorner(context, vx, vy)
                     } else if (event.actionMasked == MotionEvent.ACTION_UP) {
-                        onTap?.invoke()
+                        mainHandler.post { onTap?.invoke() }
                     }
                     dragging = false
                     true
@@ -930,9 +1211,8 @@ object FloatingVirtualDisplay {
     }
 
     @SuppressLint("ClickableViewAccessibility")
-    private fun attachExpandedScreenTouchAndDrag(context: Context, imageView: ImageView) {
+    private fun attachExpandedScreenTouchAndDrag(context: Context, imageView: ImageView, dragZonePx: Int = dp(context, 38)) {
         val slop = ViewConfiguration.get(context).scaledTouchSlop
-        val dragZonePx = dp(context, 38)
         var downX = 0f
         var downY = 0f
         var downRawX = 0f
@@ -941,6 +1221,10 @@ object FloatingVirtualDisplay {
         var startWinY = 0
         var windowDragMode = false
         var draggingWindow = false
+        var liveTouchStarted = false
+        var lastMoveSentAt = 0L
+        var lastSentX = -1
+        var lastSentY = -1
         var tracker: VelocityTracker? = null
 
         imageView.setOnTouchListener { v, event ->
@@ -948,6 +1232,16 @@ object FloatingVirtualDisplay {
             val container = rootView ?: return@setOnTouchListener false
             val wm = windowManager ?: return@setOnTouchListener false
             val state = RootPhoneHarness.changes.value
+
+            val vw = v.width.coerceAtLeast(1)
+            val vh = v.height.coerceAtLeast(1)
+            val info = runCatching { JSONObject(state.imageInfo.ifBlank { state.display }) }.getOrDefault(JSONObject())
+            val dispW = info.optInt("width", 540).coerceAtLeast(1)
+            val dispH = info.optInt("height", 1200).coerceAtLeast(1)
+            val displayId = info.optInt("displayId", runCatching { JSONObject(state.display).optInt("displayId", -1) }.getOrDefault(-1))
+
+            fun mapX(px: Float) = (px / vw * dispW).toInt().coerceIn(0, dispW - 1)
+            fun mapY(py: Float) = (py / vh * dispH).toInt().coerceIn(0, dispH - 1)
 
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
@@ -960,9 +1254,18 @@ object FloatingVirtualDisplay {
                     startWinY = lp.y
                     windowDragMode = (downY <= dragZonePx) || (state.phase == "running")
                     draggingWindow = false
+                    liveTouchStarted = false
                     if (windowDragMode) {
                         tracker?.recycle()
                         tracker = VelocityTracker.obtain().also { it.addMovement(event) }
+                    } else if (displayId > 0) {
+                        val tx = mapX(downX)
+                        val ty = mapY(downY)
+                        liveTouchStarted = true
+                        lastSentX = tx
+                        lastSentY = ty
+                        lastMoveSentAt = android.os.SystemClock.uptimeMillis()
+                        RootPhoneHarness.sendLiveTouch(context, "down", tx, ty)
                     }
                     true
                 }
@@ -986,6 +1289,16 @@ object FloatingVirtualDisplay {
                             )
                             runCatching { wm.updateViewLayout(container, lp) }
                         }
+                    } else if (liveTouchStarted && displayId > 0) {
+                        val now = android.os.SystemClock.uptimeMillis()
+                        val tx = mapX(event.x)
+                        val ty = mapY(event.y)
+                        if (now - lastMoveSentAt >= 10L || abs(tx - lastSentX) + abs(ty - lastSentY) >= 2) {
+                            lastMoveSentAt = now
+                            lastSentX = tx
+                            lastSentY = ty
+                            RootPhoneHarness.sendLiveTouch(context, "move", tx, ty)
+                        }
                     }
                     true
                 }
@@ -1003,36 +1316,12 @@ object FloatingVirtualDisplay {
                         draggingWindow = false
                         return@setOnTouchListener true
                     }
-                    if (event.actionMasked != MotionEvent.ACTION_UP || state.phase == "running") return@setOnTouchListener true
-
-                    val upX = event.x
-                    val upY = event.y
-                    val vw = v.width.coerceAtLeast(1)
-                    val vh = v.height.coerceAtLeast(1)
-                    val info = runCatching { JSONObject(state.imageInfo.ifBlank { state.display }) }.getOrDefault(JSONObject())
-                    val dispW = info.optInt("width", 1080).coerceAtLeast(1)
-                    val dispH = info.optInt("height", 2400).coerceAtLeast(1)
-                    val displayId = info.optInt("displayId", JSONObject(state.display).optInt("displayId", -1))
-                    if (displayId <= 0) return@setOnTouchListener true
-
-                    fun mapX(px: Float) = (px / vw * dispW).toInt().coerceIn(0, dispW - 1)
-                    fun mapY(py: Float) = (py / vh * dispH).toInt().coerceIn(0, dispH - 1)
-
-                    val isTap = abs(upX - downX) + abs(upY - downY) < slop
-                    scope.launch(Dispatchers.IO) {
-                        runCatching {
-                            val cmd = JSONObject().put("display_id", displayId).put("manual", true)
-                            if (info.has("rotation")) cmd.put("expected_rotation", info.optInt("rotation"))
-                            if (isTap) {
-                                cmd.put("op", "tap").put("x", mapX(upX)).put("y", mapY(upY))
-                            } else {
-                                cmd.put("op", "swipe")
-                                    .put("x1", mapX(downX)).put("y1", mapY(downY))
-                                    .put("x2", mapX(upX)).put("y2", mapY(upY))
-                                    .put("duration_ms", 280)
-                            }
-                            RootPhoneHarness.command(context, cmd)
-                        }
+                    if (liveTouchStarted && displayId > 0) {
+                        liveTouchStarted = false
+                        val tx = mapX(event.x)
+                        val ty = mapY(event.y)
+                        val act = if (event.actionMasked == MotionEvent.ACTION_CANCEL) "cancel" else "up"
+                        RootPhoneHarness.sendLiveTouch(context, act, tx, ty)
                     }
                     true
                 }
@@ -1172,16 +1461,20 @@ internal fun InAppFloatingVirtualDisplay() {
                 dispH.toFloat() / dispW.toFloat()
             }
 
+            var tierState by remember { mutableStateOf(FloatingVirtualDisplay.currentTier()) }
             val sizeCurve = remember { CubicBezierEasing(0.2f, 0.8f, 0.2f, 1f) }
             val padDp = if (expanded) 4.dp else 3.5.dp
             val availWDp = (maxWidth - 24.dp - padDp * 2).coerceAtLeast(80.dp)
             val availHDp = (maxHeight - 160.dp - padDp * 2).coerceAtLeast(120.dp)
-            val baseInnerW = when {
-                aspect < 1f -> if (expanded) 310.dp else 176.dp
-                else -> if (expanded) 216.dp else 96.dp
+            val shortSideDp = minOf(maxWidth, maxHeight)
+            val frac = when {
+                !expanded -> if (aspect < 1f) 0.44f else 0.27f
+                aspect < 1f -> tierState.landscapeFrac
+                else -> tierState.portraitFrac
             }
-            val innerW = minOf(baseInnerW, availWDp, availHDp / aspect).coerceAtLeast(60.dp)
-            val innerH = (innerW * aspect).coerceAtLeast(60.dp)
+            val baseInnerW = shortSideDp * frac
+            val innerW = minOf(baseInnerW, availWDp, availHDp / aspect).coerceAtLeast(68.dp)
+            val innerH = (innerW * aspect).coerceAtLeast(68.dp)
             val w by animateDpAsState(innerW + padDp * 2, tween(280, easing = sizeCurve), label = "pipW")
             val h by animateDpAsState(innerH + padDp * 2, tween(280, easing = sizeCurve), label = "pipH")
 
@@ -1290,33 +1583,38 @@ internal fun InAppFloatingVirtualDisplay() {
                                     if (!expanded || state.phase == "running") return@pointerInput
                                     awaitEachGesture {
                                         val down = awaitFirstDown(requireUnconsumed = false)
+                                        val displayId = disp.optInt("displayId", -1)
+                                        fun mx(v: Float) = (v / size.width.coerceAtLeast(1) * dispW).toInt().coerceIn(0, dispW - 1)
+                                        fun my(v: Float) = (v / size.height.coerceAtLeast(1) * dispH).toInt().coerceIn(0, dispH - 1)
+                                        if (displayId > 0) {
+                                            RootPhoneHarness.sendLiveTouch(context, "down", mx(down.position.x), my(down.position.y))
+                                        }
                                         var end = down.position
-                                        var ended = false
+                                        var lastMoveAt = android.os.SystemClock.uptimeMillis()
+                                        var lastX = mx(down.position.x)
+                                        var lastY = my(down.position.y)
                                         do {
                                             val ev = awaitPointerEvent()
                                             val ptr = ev.changes.firstOrNull { it.id == down.id } ?: break
                                             end = ptr.position
                                             ptr.consume()
+                                            if (ptr.pressed && displayId > 0) {
+                                                val now = android.os.SystemClock.uptimeMillis()
+                                                val tx = mx(end.x)
+                                                val ty = my(end.y)
+                                                if (now - lastMoveAt >= 10L || abs(tx - lastX) + abs(ty - lastY) >= 2) {
+                                                    lastMoveAt = now
+                                                    lastX = tx
+                                                    lastY = ty
+                                                    RootPhoneHarness.sendLiveTouch(context, "move", tx, ty)
+                                                }
+                                            }
                                             if (!ptr.pressed) {
-                                                ended = true
                                                 break
                                             }
                                         } while (true)
-                                        if (ended) {
-                                            val displayId = disp.optInt("displayId", -1)
-                                            if (displayId > 0) {
-                                                fun mx(v: Float) = (v / size.width * dispW).toInt().coerceIn(0, dispW - 1)
-                                                fun my(v: Float) = (v / size.height * dispH).toInt().coerceIn(0, dispH - 1)
-                                                val isTap = abs(end.x - down.position.x) + abs(end.y - down.position.y) < viewConfiguration.touchSlop
-                                                scope.launch(Dispatchers.IO) {
-                                                    runCatching {
-                                                        val cmd = JSONObject().put("display_id", displayId).put("manual", true)
-                                                        if (isTap) cmd.put("op", "tap").put("x", mx(end.x)).put("y", my(end.y))
-                                                        else cmd.put("op", "swipe").put("x1", mx(down.position.x)).put("y1", my(down.position.y)).put("x2", mx(end.x)).put("y2", my(end.y))
-                                                        RootPhoneHarness.command(context, cmd)
-                                                    }
-                                                }
-                                            }
+                                        if (displayId > 0) {
+                                            RootPhoneHarness.sendLiveTouch(context, "up", mx(end.x), my(end.y))
                                         }
                                     }
                                 },

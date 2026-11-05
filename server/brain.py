@@ -6,6 +6,12 @@ import httpx
 from vault_manager import TZ, now_iso
 from assistants import ensure_assistants, get_assistant
 from harness import TOOLS
+from storage import compact_trace_list
+from core.llm_client import LLMClient
+from core.memory_engine import MemoryEngine
+from core.vision_engine import VisionEngine
+from core.scheduler_engine import SchedulerEngine
+from core.context_search import ContextSearchEngine
 
 class Brain:
     def __init__(self, store, vault, harness, publish, escalation):
@@ -23,8 +29,11 @@ class Brain:
         self.bot_context = contextvars.ContextVar('assistant', default='companion')
         self.room_context = contextvars.ContextVar('room', default=None)
         self.hop_depth = contextvars.ContextVar('hop_depth', default=0)
+        self.call_chain_var = contextvars.ContextVar('call_chain', default=())
         self.turn_id_var = contextvars.ContextVar('turn_id', default='')
         self.stream_prefix_var = contextvars.ContextVar('stream_prefix', default='')
+        self.choices_var = contextvars.ContextVar('choices', default=None)
+        self.choices_prompt_var = contextvars.ContextVar('choices_prompt', default='')
         self.stream_seq: int = 0
         self.last_completed_stream: dict | None = None
         self.execution = None
@@ -32,14 +41,31 @@ class Brain:
         self.active_task = None
         self.computer = None
         self.bg_tasks: dict[str, dict] = {}
+        self.watchdogs: dict[str, dict] = {}
         self.last_prompt_tokens: dict[str, int] = {}
         self.phone_pending: dict[str, asyncio.Future] = {}
         self._models_cache: tuple[float, str, list[str]] | None = None
         self._used_phone_in_turn: bool = False
         self._last_vision_nodes: list[dict] = []
         self._last_phone_node_count: int = -1
-        self._last_phone_size: tuple[int, int] = (1080, 2400)
+        self._last_phone_size: tuple[int, int] = (720, 1600)
         self._vision_cache: dict[str, str] = {}
+        self._recent_client_msg_ids: dict[str, float] = {}
+        self._stopped_turn_ids: set[str] = set()
+        self._last_scheduled_fire_by_bot: dict[str, float] = {}
+        self._last_emergency_alarm_at: float = 0.0
+
+        # Domain 1 Core Engines
+        self.context_search = ContextSearchEngine(self.harness.root / '.config' / 'context_index.db')
+        try:
+            self.context_search.sync_store_messages(self.store.state.get('messages', []))
+        except Exception:
+            pass
+        self.llm = LLMClient(store, get_assistant, self.last_prompt_tokens)
+        self.memory_engine = MemoryEngine(store, vault, harness, self.last_prompt_tokens, context_search=self.context_search)
+        self.vision_engine = VisionEngine(store, get_assistant, self.llm.fetch_available_models)
+        self.scheduler_engine = SchedulerEngine(store, self.wake)
+
         self.harness.store = store
         self.harness.vault = vault
         self.harness.vision_reader = self.read_image_file_with_vision
@@ -49,10 +75,105 @@ class Brain:
             'list_models': self._tool_list_models,
             'schedule_task': self._tool_schedule_task,
             'bg_task': self._tool_bg_task,
+            'watchdog_task': self._tool_watchdog_task,
+            'conversation_search': self._tool_conversation_search,
+            'ctx_search': self._tool_ctx_search,
+            'present_choices': self._tool_present_choices,
+            'memory_pin': self._tool_memory_pin,
+            'blackboard': self._tool_blackboard,
+            'custom_tool': self._tool_custom_tool,
+            'phone_macro': self._tool_phone_macro,
             'cloud_desktop': self._tool_cloud_desktop,
             'notify_user': self._tool_notify_user,
+            'emergency_alarm': self._tool_emergency_alarm,
             'phone_workspace': self._tool_phone_workspace,
         }
+
+    def _clear_bot_stream(self, bot_id: str | None = None) -> None:
+        if bot_id:
+            self.streams_by_bot.pop(bot_id, None)
+            self.executions_by_bot.pop(bot_id, None)
+            self.active_tasks_by_bot.pop(bot_id, None)
+        else:
+            self.streams_by_bot.clear()
+            self.executions_by_bot.clear()
+            self.active_tasks_by_bot.clear()
+        self.live_stream = next(iter(self.streams_by_bot.values()), None)
+        self.execution = next(iter(self.executions_by_bot.values()), None)
+        self.active_task = next(iter(self.active_tasks_by_bot.values()), None)
+        self.activity = 'thinking' if self.executions_by_bot else self.ready_state()
+
+    async def stop_immediately(self, bot_id: str | None = None) -> dict:
+        """
+        Instant 0ms Stop:
+        1. Captures any partial stream text already generated (`streams_by_bot`) and commits it immediately
+           as a real message so the user's chat window freezes cleanly on the generated content.
+        2. Cancels the running asyncio task(s) and clears `streams_by_bot` / `executions_by_bot`.
+        """
+        target_bots = [bot_id] if bot_id else list(set(list(self.streams_by_bot.keys()) + list(self.active_tasks_by_bot.keys()) + ([self.execution.get('bot_id')] if isinstance(self.execution, dict) and self.execution.get('bot_id') else [])))
+        committed_msg = None
+        for b_id in target_bots:
+            if not b_id:
+                continue
+            cur_stream = self.streams_by_bot.get(b_id) or (self.live_stream if (self.live_stream or {}).get('bot_id') == b_id else None)
+            cur_exec = self.executions_by_bot.get(b_id) or (self.execution if (self.execution or {}).get('bot_id') == b_id else None)
+            partial_text = ''
+            if isinstance(cur_stream, dict):
+                raw_t = str(cur_stream.get('text') or '').strip()
+                if raw_t and not self._is_placeholder_text(raw_t):
+                    partial_text = raw_t
+            trace_list = list(cur_exec.get('trace') or []) if isinstance(cur_exec, dict) else []
+            turn_id = str((cur_stream or {}).get('turn_id') or '')
+            if turn_id:
+                self._stopped_turn_ids.add(turn_id)
+                if len(self._stopped_turn_ids) > 200:
+                    self._stopped_turn_ids.clear()
+                    self._stopped_turn_ids.add(turn_id)
+            if partial_text or trace_list:
+                try:
+                    bot_obj = get_assistant(self.store, b_id)
+                    b_name = bot_obj['name']
+                except Exception:
+                    b_name = b_id
+                final_txt = partial_text or '（已停止执行）'
+                committed_msg = self.store.message(
+                    'assistant',
+                    final_txt,
+                    'chat',
+                    bot_id=b_id,
+                    from_bot_id=b_id,
+                    from_bot_name=b_name,
+                    trace=trace_list,
+                    notify=False,
+                    stopped_early=True,
+                )
+                self.stream_seq += 1
+                committed_msg['seq'] = self.stream_seq
+                committed_msg['turn_id'] = turn_id or committed_msg['id']
+                self.last_completed_stream = {
+                    'seq': self.stream_seq,
+                    'turn_id': committed_msg['turn_id'],
+                    'bot_id': b_id,
+                    'speaker_id': b_id,
+                    'speaker_name': b_name,
+                    'text': final_txt,
+                    'final_message_id': committed_msg['id'],
+                    'done': True,
+                    'completed_at': time.time(),
+                }
+                self.store.save()
+                await self.publish({'type': 'message', 'message': committed_msg, 'seq': self.stream_seq})
+            self._clear_bot_stream(b_id)
+            t = self.active_tasks_by_bot.get(b_id)
+            if t and not t.done():
+                t.cancel()
+
+        if self.active_task and not self.active_task.done():
+            self.active_task.cancel()
+        if not bot_id:
+            self._clear_bot_stream(None)
+        await self.publish({'type': 'stopped', 'bot_id': bot_id or 'all', 'message': committed_msg, 'seq': self.stream_seq})
+        return {'stopped': True, 'committed_message': committed_msg, 'seq': self.stream_seq}
 
     def _get_bot_lock(self, bot_id: str) -> asyncio.Lock:
         b = (bot_id or 'companion').strip()
@@ -63,8 +184,9 @@ class Brain:
     def is_any_bot_busy(self) -> bool:
         return self.lock.locked() or any(lk.locked() for lk in self.bot_locks.values())
 
-    def persona(self):
-        bot = get_assistant(self.store, self.bot_context.get())
+    def persona(self, bot_id: str | None = None):
+        target = bot_id or self.bot_context.get()
+        bot = get_assistant(self.store, target)
         roster = [
             f"- id={b['id']}, 名字={b['name']}, 模型={b.get('model') or '默认'}, 简介={b.get('description','')}"
             for b in self.store.state.get('assistants', [])
@@ -113,7 +235,7 @@ class Brain:
             sp_name = speaker_name or get_assistant(self.store, sp_id)['name']
         except Exception:
             sp_name = sp_id
-        prev = self.live_stream or {}
+        prev = self.streams_by_bot.get(bot_id) or self.live_stream or {}
         prev_text = str(prev.get('text') or '')
         prefix = (self.stream_prefix_var.get() or '').strip()
         turn_id = self.turn_id_var.get() or str(prev.get('turn_id') or '')
@@ -132,15 +254,71 @@ class Brain:
             else:
                 effective_text = piece
         trace_tail = []
+        sub_agents = []
+        todos = []
         cur_exec = self.executions_by_bot.get(bot_id) or self.execution
-        if cur_exec and isinstance(cur_exec.get('trace'), list):
-            for step in cur_exec['trace'][-6:]:
+        if cur_exec:
+            if isinstance(cur_exec.get('trace'), list):
+                trace_tail = compact_trace_list(cur_exec['trace'][-16:])
+            if isinstance(cur_exec.get('sub_agents'), list):
+                sub_agents = list(cur_exec['sub_agents'])
+            elif isinstance(cur_exec.get('sub_agents'), dict):
+                sub_agents = list(cur_exec['sub_agents'].values())
+            if isinstance(cur_exec.get('todos'), list):
+                todos = list(cur_exec['todos'])
+        same_stream = (prev.get('bot_id') == bot_id and prev.get('turn_id') == turn_id and prev.get('speaker_id') == sp_id)
+        if not trace_tail and same_stream and isinstance(prev.get('trace'), list):
+            trace_tail = list(prev['trace'])
+        # If LLM is currently streaming arguments for a tool call (`tool` is a real tool name),
+        # anchor it in `trace_tail` immediately as a running entry so it NEVER pops in and out!
+        is_real_tool_name = bool(
+            tool and isinstance(tool, str)
+            and not tool.startswith(('正在', '已执行', '并行执行'))
+        )
+        if is_real_tool_name:
+            if not trace_tail or trace_tail[-1].get('tool') != tool or trace_tail[-1].get('status') != 'running':
                 trace_tail.append({
-                    'tool': step.get('tool', ''),
-                    'arguments': step.get('arguments') or {},
-                    'duration_ms': step.get('duration_ms', 0),
+                    'tool': tool,
+                    'arguments': {},
+                    'duration_ms': 0,
+                    'status': 'running',
                 })
-        effective_thought = str(prev.get('thought') or '') if thought is None else thought
+        elif same_stream and isinstance(prev.get('trace'), list) and len(prev['trace']) > len(trace_tail):
+            trace_tail = list(prev['trace'])
+        # Never allow `tool` to drop to None mid-turn while tools have been called or are running!
+        effective_tool = tool
+        if not effective_tool:
+            if isinstance(cur_exec, dict) and cur_exec.get('tool'):
+                effective_tool = str(cur_exec['tool'])
+            elif same_stream and prev.get('tool'):
+                effective_tool = str(prev['tool'])
+            elif trace_tail:
+                effective_tool = f'已执行 {len(trace_tail)} 步'
+        raw_thought = str(prev.get('thought') or '') if thought is None else thought
+        if trace_tail:
+            step_lines = []
+            for idx_s, st_item in enumerate(trace_tail[-6:], max(1, len(trace_tail) - 5)):
+                st_name = st_item.get('tool', 'tool')
+                st_args = st_item.get('arguments') or {}
+                st_op = st_args.get('op') or st_args.get('action') or st_args.get('path') or st_args.get('query') or ''
+                st_label = f"{st_name}({st_op})" if st_op else st_name
+                is_run = st_item.get('status') == 'running' or st_item.get('duration_ms', 0) == 0
+                mark = '▸' if is_run else '✓'
+                dur_txt = '' if is_run else f" · {st_item.get('duration_ms', 0)}ms"
+                step_lines.append(f"{mark} 第{idx_s}步 {st_label}{dur_txt}")
+            steps_summary = '\n'.join(step_lines)
+            if raw_thought and not raw_thought.startswith(('✓ 第', '▸ 第')):
+                effective_thought = f"{steps_summary}\n{raw_thought}"
+            else:
+                effective_thought = steps_summary
+        else:
+            effective_thought = raw_thought
+        delta_text = ''
+        if same_stream and prev_text and not self._is_placeholder_text(prev_text) and effective_text.startswith(prev_text):
+            delta_text = effective_text[len(prev_text):]
+        live_choices = list(self.choices_var.get() or [])
+        if not live_choices and same_stream and isinstance(prev.get('choices'), list):
+            live_choices = list(prev['choices'])
         self.stream_seq += 1
         self.live_stream = {
             'seq': self.stream_seq,
@@ -149,13 +327,17 @@ class Brain:
             'speaker_id': sp_id,
             'speaker_name': sp_name,
             'text': effective_text,
+            'delta': delta_text,
             'thought': effective_thought,
-            'tool': tool,
+            'tool': effective_tool,
             'trace': trace_tail,
+            'sub_agents': sub_agents,
+            'todos': todos,
+            'choices': live_choices,
             'updated_at': time.time(),
         }
         self.streams_by_bot[bot_id] = self.live_stream
-        await self.publish({'type':'stream', 'stream':self.live_stream})
+        await self.publish({'type': 'stream', 'stream': self.live_stream})
 
     async def complete(self, messages, tools=None, big=False):
         bot_id = self.bot_context.get()
@@ -163,126 +345,15 @@ class Brain:
             bot = get_assistant(self.store, bot_id)
         except ValueError:
             bot = {}
-        base_url = self.store.config.effective_base_url()
-        api_key = self.store.config.effective_api_key(big=big) or self.store.config.effective_api_key(big=not big)
-        model = self.store.config.effective_model(bot_model=bot.get('model', ''), big=big) or self.store.config.effective_model(bot_model=bot.get('model', ''), big=not big)
-        if not api_key or not model:
-            raise ValueError('请先在设置中配置 API Key 和 Model')
-        payload = {'model':model, 'messages':messages, 'stream':True}
-        if tools:
-            payload.update(tools=tools, tool_choice='auto')
-        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=30.0), trust_env=False) as client:
-            async with client.stream('POST', base_url + '/chat/completions', headers={'Authorization':'Bearer ' + api_key}, json=payload) as r:
-                if r.status_code >= 400:
-                    err_bytes = await r.aread()
-                    detail = err_bytes.decode('utf-8', errors='replace')[:400].strip()
-                    raise ValueError(f'模型网关返回 HTTP {r.status_code} (model={model})：{detail or "请检查 Base URL、Key、Model 或额度"}')
-                ctype = r.headers.get('content-type', '')
-                if 'text/event-stream' not in ctype:
-                    raw_bytes = await r.aread()
-                    body = json.loads(raw_bytes.decode('utf-8', errors='replace'))
-                    usage = body.get('usage') or {}
-                    if usage.get('prompt_tokens'):
-                        self.last_prompt_tokens[bot_id] = int(usage['prompt_tokens'])
-                    msg = body['choices'][0]['message']
-                    if msg.get('content'):
-                        await self._set_stream(text=msg['content'])
-                    return {k:v for k,v in msg.items() if k in ('role','content','tool_calls')}
-
-                content_parts: list[str] = []
-                reasoning_parts: list[str] = []
-                tool_calls_map: dict[int, dict] = {}
-                last_emit = 0.0
-                first_content_at = 0.0
-                emitted_content_count = 0
-                next_auto_idx = 0
-                async for line in r.aiter_lines():
-                    line = line.strip()
-                    if not line or not line.startswith('data:'):
-                        continue
-                    data_str = line[5:].strip()
-                    if data_str == '[DONE]':
-                        break
-                    try:
-                        chunk = json.loads(data_str)
-                    except ValueError:
-                        continue
-                    usage = chunk.get('usage') or {}
-                    if usage.get('prompt_tokens'):
-                        self.last_prompt_tokens[bot_id] = int(usage['prompt_tokens'])
-                    choices = chunk.get('choices') or []
-                    if not choices:
-                        continue
-                    choice0 = choices[0]
-                    delta = choice0.get('delta') or choice0.get('message') or {}
-                    r_delta = delta.get('reasoning_content') or delta.get('reasoning')
-                    if r_delta:
-                        reasoning_parts.append(r_delta)
-                        if not content_parts:
-                            now = time.time()
-                            if now - last_emit >= 0.08:
-                                last_emit = now
-                                tail_thought = ''.join(reasoning_parts).strip()[-360:]
-                                await self._set_stream(text=self.stream_prefix_var.get() or '正在思考…', thought=tail_thought)
-                    c_delta = delta.get('content')
-                    if c_delta:
-                        if not first_content_at:
-                            first_content_at = time.time()
-                        content_parts.append(c_delta)
-                        now = time.time()
-                        if now - last_emit >= 0.04:
-                            last_emit = now
-                            emitted_content_count += 1
-                            await self._set_stream(text=''.join(content_parts), thought='')
-                    tc_deltas = delta.get('tool_calls') or []
-                    for tc in tc_deltas:
-                        raw_idx = tc.get('index')
-                        tc_id = tc.get('id')
-                        if raw_idx is None:
-                            idx = next_auto_idx
-                            next_auto_idx += 1
-                        else:
-                            idx = int(raw_idx)
-                            if tc_id and idx in tool_calls_map and tool_calls_map[idx].get('id') and tool_calls_map[idx]['id'] != tc_id:
-                                idx = max(tool_calls_map.keys()) + 1
-                        entry = tool_calls_map.setdefault(idx, {
-                            'id': tc_id or f'call_{idx}_{secrets.token_hex(4)}',
-                            'type': 'function',
-                            'function': {'name': '', 'arguments': ''}
-                        })
-                        if tc_id:
-                            entry['id'] = tc_id
-                        fn = tc.get('function') or {}
-                        if fn.get('name'):
-                            entry['function']['name'] += fn['name']
-                        if fn.get('arguments'):
-                            entry['function']['arguments'] += fn['arguments']
-                        now = time.time()
-                        if now - last_emit >= 0.08:
-                            last_emit = now
-                            cur_fn = entry['function']
-                            t_name = cur_fn.get('name') or 'tool'
-                            t_args = cur_fn.get('arguments') or ''
-                            live_preview = self._summarize_streaming_tool(t_name, t_args)
-                            cur_text = ''.join(content_parts).strip() or self.stream_prefix_var.get() or f'正在调用 {t_name}…'
-                            await self._set_stream(text=cur_text, tool=t_name, thought=live_preview)
-
-                full_content = ''.join(content_parts)
-                if full_content:
-                    burst_elapsed = (time.time() - first_content_at) if first_content_at else 0.0
-                    # If upstream flash model burst all content in < 0.7s, pace out 5 progressive stream frames
-                    # so high-latency clients see smooth progressive streaming instead of an abrupt wall of text
-                    if not tool_calls_map and burst_elapsed < 0.75 and len(full_content) > 24 and emitted_content_count <= 4:
-                        steps = 5
-                        for step_i in range(1, steps):
-                            cut = max(1, int(len(full_content) * step_i / steps))
-                            await self._set_stream(text=full_content[:cut], thought='')
-                            await asyncio.sleep(0.09)
-                    await self._set_stream(text=full_content, thought='')
-                result_msg: dict = {'role': 'assistant', 'content': full_content or ''}
-                if tool_calls_map:
-                    result_msg['tool_calls'] = [tool_calls_map[k] for k in sorted(tool_calls_map.keys())]
-                return result_msg
+        return await self.llm.complete_stream(
+            messages=messages,
+            bot_id=bot_id,
+            bot_model=str(bot.get('model') or ''),
+            tools=tools,
+            big=big,
+            stream_prefix=self.stream_prefix_var.get() or '',
+            on_stream=lambda text='', tool=None, thought=None: self._set_stream(text=text, tool=tool, thought=thought),
+        )
 
     async def _fetch_available_models(self) -> list[str]:
         base_url = self.store.config.effective_base_url()
@@ -637,15 +708,19 @@ class Brain:
         if action == 'list':
             return {
                 'tasks': [
-                    {k:v for k,v in info.items() if k != 'proc'}
+                    {k: v for k, v in info.items() if k != 'proc'}
                     for info in self.bg_tasks.values()
-                ]
+                ],
+                'watchdogs': [
+                    {k: v for k, v in w.items() if k != 'task'}
+                    for w in self.watchdogs.values()
+                ],
             }
         if action == 'logs':
             tid = str(args.get('task_id') or '').strip()
             info = self.bg_tasks.get(tid)
             if not info:
-                return {'error':f'未找到后台任务 {tid}'}
+                return {'error': f'未找到后台任务 {tid}'}
             log_path = Path(info['log_file'])
             return {
                 'task_id': tid,
@@ -653,11 +728,27 @@ class Brain:
                 'exit_code': info.get('exit_code'),
                 'logs': log_path.read_text('utf-8', errors='replace')[-12000:] if log_path.exists() else '',
             }
+        if action == 'send_stdin':
+            tid = str(args.get('task_id') or '').strip()
+            input_text = str(args.get('input_text') or args.get('command') or '')
+            info = self.bg_tasks.get(tid)
+            if not info or info.get('status') != 'running':
+                return {'error': f'未找到正在运行的后台任务 {tid}'}
+            proc = info.get('proc')
+            if not proc or proc.stdin is None:
+                return {'error': f'任务 {tid} 不支持 stdin 输入'}
+            try:
+                line_bytes = (input_text if input_text.endswith('\n') else input_text + '\n').encode('utf-8')
+                proc.stdin.write(line_bytes)
+                await proc.stdin.drain()
+                return {'sent_stdin': True, 'task_id': tid, 'bytes': len(line_bytes)}
+            except Exception as e:
+                return {'error': f'写入 stdin 失败: {e}'}
         if action == 'kill':
             tid = str(args.get('task_id') or '').strip()
             info = self.bg_tasks.get(tid)
             if not info:
-                return {'error':f'未找到后台任务 {tid}'}
+                return {'error': f'未找到后台任务 {tid}'}
             proc = info.get('proc')
             if proc and info['status'] == 'running':
                 try:
@@ -668,11 +759,11 @@ class Brain:
                 except Exception:
                     pass
                 info['status'] = 'killed'
-            return {'killed':True, 'task_id':tid}
+            return {'killed': True, 'task_id': tid}
         if action == 'start':
             cmd = str(args.get('command') or '').strip()
             if not cmd:
-                return {'error':'command 不能为空'}
+                return {'error': 'command 不能为空'}
             tid = 'bg-' + secrets.token_hex(4)
             log_dir = self.harness.root / '.bg_logs'
             log_dir.mkdir(parents=True, exist_ok=True)
@@ -686,7 +777,7 @@ class Brain:
             env['DEFAULT_MODEL'] = self.store.config.effective_model()
             out_f = log_file.open('w', encoding='utf-8')
             proc = await asyncio.create_subprocess_shell(
-                cmd, cwd=str(self.harness.root), stdout=out_f, stderr=asyncio.subprocess.STDOUT,
+                cmd, cwd=str(self.harness.root), stdin=asyncio.subprocess.PIPE, stdout=out_f, stderr=asyncio.subprocess.STDOUT,
                 start_new_session=(sys.platform == 'linux'), env=env
             )
             info = {
@@ -699,6 +790,7 @@ class Brain:
                 'proc': proc,
             }
             self.bg_tasks[tid] = info
+
             async def watch():
                 try:
                     rc = await proc.wait()
@@ -711,30 +803,395 @@ class Brain:
                     tail = log_file.read_text('utf-8', errors='replace')[-2000:] if log_file.exists() else ''
                     msg_text = f'⚙️ [后台任务 `{tid}` 已结束 (exit={info.get("exit_code")})]\n命令：`{cmd[:120]}`\n输出摘要：\n```\n{tail}\n```'
                     m = self.store.message('assistant', msg_text, kind='result', bot_id=owner_bot, notify=False)
-                    await self.publish({'type':'message', 'message':m})
+                    self.stream_seq += 1
+                    m['seq'] = self.stream_seq
+                    self.context_search.index_message(m)
+                    await self.publish({'type': 'message', 'message': m, 'seq': self.stream_seq})
+
             asyncio.create_task(watch())
-            return {'started':True, 'task_id':tid, 'log_file':f'.bg_logs/{tid}.log'}
-        return {'error':f'未知 bg_task action: {action}'}
+            return {'started': True, 'task_id': tid, 'log_file': f'.bg_logs/{tid}.log'}
+        return {'error': f'未知 bg_task action: {action}'}
+
+    async def _tool_watchdog_task(self, args: dict):
+        """Zero-token self-written watchdog scripts that silently monitor targets and wake the agent ONLY on TRIGGER:"""
+        action = str(args.get('action') or 'list').strip().lower()
+        if action == 'list':
+            return {
+                'watchdogs': [
+                    {k: v for k, v in w.items() if k != 'task'}
+                    for w in self.watchdogs.values()
+                ]
+            }
+        if action in ('stop', 'kill', 'remove'):
+            tid = str(args.get('task_id') or args.get('name') or '').strip()
+            w = self.watchdogs.get(tid)
+            if not w:
+                for k, cand in list(self.watchdogs.items()):
+                    if cand.get('name') == tid:
+                        w = cand
+                        tid = k
+                        break
+            if not w:
+                return {'error': f'未找到盯盘哨兵 {tid}'}
+            w['status'] = 'stopped'
+            t = w.get('task')
+            if t and not t.done():
+                t.cancel()
+            self.watchdogs.pop(tid, None)
+            return {'stopped': True, 'task_id': tid}
+
+        if action == 'logs':
+            tid = str(args.get('task_id') or args.get('name') or '').strip()
+            w = self.watchdogs.get(tid)
+            if not w:
+                return {'error': f'未找到盯盘哨兵 {tid}'}
+            return {k: v for k, v in w.items() if k != 'task'}
+
+        if action == 'run_now':
+            tid = str(args.get('task_id') or args.get('name') or '').strip()
+            w = self.watchdogs.get(tid)
+            if not w:
+                return {'error': f'未找到盯盘哨兵 {tid}'}
+            out = await self._exec_watchdog_once(w)
+            return {'ran': True, 'task_id': tid, 'output': out}
+
+        if action == 'start':
+            name = str(args.get('name') or '监控哨兵').strip()[:80]
+            script = str(args.get('script') or '').strip()
+            if not script:
+                return {'error': 'script 不能为空（请提供 Python 或 Bash 探针脚本，当检测到目标变化时打印 "TRIGGER: 详情"）'}
+            interval_sec = max(15, min(86400, int(args.get('interval_sec') or 120)))
+            owner_bot = str(args.get('bot_id') or self.bot_context.get() or 'companion').strip()
+            tid = 'wd-' + secrets.token_hex(4)
+            wd_dir = self.harness.root / '.watchdogs'
+            wd_dir.mkdir(parents=True, exist_ok=True)
+            is_py = ('import ' in script or 'print(' in script or script.startswith('#!/usr/bin/env python'))
+            ext = '.py' if is_py else '.sh'
+            script_path = wd_dir / f'{tid}{ext}'
+            script_path.write_text(script, encoding='utf-8')
+            w_info: dict = {
+                'task_id': tid,
+                'name': name,
+                'bot_id': owner_bot,
+                'interval_sec': interval_sec,
+                'script_path': str(script_path),
+                'status': 'running',
+                'runs': 0,
+                'triggers': 0,
+                'last_run_at': 0.0,
+                'last_output': '',
+                'created_at': time.time(),
+            }
+
+            async def _loop():
+                while w_info.get('status') == 'running':
+                    try:
+                        await self._exec_watchdog_once(w_info)
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        w_info['last_output'] = f'Error: {e}'
+                    await asyncio.sleep(interval_sec)
+
+            w_info['task'] = asyncio.create_task(_loop())
+            self.watchdogs[tid] = w_info
+            return {
+                'started': True,
+                'task_id': tid,
+                'name': name,
+                'interval_sec': interval_sec,
+                'note': '哨兵已在后台以 0 Token 模式静默运行；当脚本输出包含 "TRIGGER:" 时将自动唤醒你向主人汇报。',
+            }
+        return {'error': f'未知 watchdog_task action: {action}'}
+
+    async def _exec_watchdog_once(self, w_info: dict) -> str:
+        script_path = Path(w_info['script_path'])
+        cmd = f'{sys.executable} "{script_path}"' if script_path.suffix == '.py' else f'bash "{script_path}"'
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            cwd=str(self.harness.root),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            raw_out, _ = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raw_out = b'Timeout after 30s'
+        out_str = raw_out.decode('utf-8', errors='replace').strip()
+        w_info['runs'] = int(w_info.get('runs') or 0) + 1
+        w_info['last_run_at'] = time.time()
+        w_info['last_output'] = out_str[-800:]
+        if 'TRIGGER:' in out_str:
+            w_info['triggers'] = int(w_info.get('triggers') or 0) + 1
+            trig_detail = out_str.split('TRIGGER:', 1)[1].strip()[:1500]
+            asyncio.create_task(
+                self.run_scheduled(
+                    f'【盯盘哨兵「{w_info["name"]}」命中触发条件】\n探针输出：{trig_detail}\n请立即向主人汇报此变化并给出处理建议。',
+                    bot_id=w_info.get('bot_id', 'companion'),
+                    label=f'哨兵触发 ({w_info["name"]})',
+                )
+            )
+        return out_str[-800:]
+
+    async def _tool_conversation_search(self, args: dict):
+        query = str(args.get('query') or '').strip()
+        bot_id = str(args.get('bot_id') or 'all').strip()
+        limit = int(args.get('limit') or 10)
+        cur_bot = self.room_context.get() or self.bot_context.get()
+        try:
+            self.context_search.sync_store_messages(self.store.state.get('messages', []))
+        except Exception:
+            pass
+        # Exclude messages already in the current bot's active 200K window so we primarily search
+        # pre-200K compacted history, compact_summary blocks, timeline/notes, and other bots' rooms!
+        active_ids = {
+            str(m.get('id'))
+            for m in self.store.state.get('messages', [])
+            if m.get('bot_id', 'companion') == cur_bot and m.get('kind') != 'compact_summary'
+        }
+        return self.context_search.conversation_search(
+            query=query,
+            bot_id=bot_id,
+            limit=limit,
+            exclude_msg_ids=active_ids if bot_id in ('all', cur_bot, '') else set(),
+            vault=self.vault,
+        )
+
+    async def _tool_ctx_search(self, args: dict):
+        query = str(args.get('query') or '').strip()
+        ctx_id = str(args.get('ctx_id') or '').strip()
+        limit = int(args.get('limit') or 8)
+        return self.context_search.ctx_search(query=query, ctx_id=ctx_id, limit=limit)
+
+    async def _tool_present_choices(self, args: dict):
+        raw_choices = args.get('choices') or args.get('options') or args.get('items')
+        prompt_txt = str(args.get('prompt') or args.get('question') or args.get('title') or '').strip()
+        if isinstance(raw_choices, str):
+            raw_choices = [ln.strip() for ln in re.split(r'[\n;|]+', raw_choices) if ln.strip()]
+        if not isinstance(raw_choices, list):
+            return {'error': 'choices 必须是列表（如 ["选项A", "选项B"]）'}
+        cleaned: list[dict] = []
+        for c in raw_choices[:6]:
+            if isinstance(c, dict):
+                lbl = str(c.get('label') or c.get('title') or c.get('text') or c.get('value') or '').strip()[:72]
+                val = str(c.get('value') or c.get('prompt') or c.get('text') or lbl).strip()[:240]
+                if lbl:
+                    cleaned.append({'label': lbl, 'value': val or lbl})
+            else:
+                s = str(c).strip()
+                if s:
+                    cleaned.append({'label': s[:72], 'value': s[:240]})
+        if not cleaned:
+            return {'error': 'choices 不能为空'}
+        self.choices_var.set(cleaned)
+        if prompt_txt:
+            self.choices_prompt_var.set(prompt_txt)
+        bot_id = self.room_context.get() or self.bot_context.get()
+        cur_exec = self.executions_by_bot.get(bot_id) or self.execution
+        if isinstance(cur_exec, dict):
+            cur_exec['choices'] = cleaned
+        cur_prefix = (self.stream_prefix_var.get() or '').strip()
+        if cur_prefix and prompt_txt and prompt_txt not in cur_prefix:
+            combined_stream_txt = cur_prefix + '\n\n' + prompt_txt
+        else:
+            combined_stream_txt = cur_prefix or prompt_txt or '正在思考…'
+        await self._set_stream(
+            text=combined_stream_txt,
+            tool='present_choices',
+        )
+        return {
+            'ok': True,
+            'choices_attached': [item['label'] for item in cleaned],
+            'note': '可点击选项按钮已附加到回复气泡底部。若前面已说明清楚，无需再重复生成多余总结。',
+        }
+
+    @staticmethod
+    def _extract_implicit_choices(text: str) -> list[dict]:
+        """
+        When the assistant asks the user to choose among numbered/bulleted options in prose
+        without explicitly invoking `present_choices`, automatically extract 2..5 clickable choices!
+        """
+        if not text or len(text) < 18:
+            return []
+        tail = text[-260:]
+        asks_choice = (
+            '?' in tail or '？' in tail
+            or any(k in tail for k in ('哪一个', '哪个', '哪种', '怎么选', '选哪', '想先', '你想', '觉得呢', '怎么搞', '还是', '要不', '方向', '方案', '先试'))
+        )
+        if not asks_choice:
+            return []
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        numbered: list[dict] = []
+        rx = re.compile(r'^(?:(\d+)[\.、\)]|([①②③④⑤⑥])|(?:[-*•]\s*(?:方案|选项|方向)\s*[A-Za-z0-9一二三四五]?[：:\s]))\s*(.+)$')
+        for ln in lines:
+            m = rx.match(ln)
+            if not m:
+                continue
+            body = m.group(3).strip()
+            body_clean = re.sub(r'\*\*([^*]+)\*\*', r'\1', body).strip()
+            if len(body_clean) < 2 or len(body_clean) > 180:
+                continue
+            # Split title vs description at colon / dash / parenthesis
+            short_title = re.split(r'[：:—–(（。；;]', body_clean, maxsplit=1)[0].strip()
+            if len(short_title) < 2 or len(short_title) > 42:
+                short_title = body_clean[:34]
+            idx_num = m.group(1) or m.group(2) or str(len(numbered) + 1)
+            label = f"{idx_num}. {short_title}" if not short_title.startswith(str(idx_num)) else short_title
+            value = body_clean[:120]
+            numbered.append({'label': label[:64], 'value': value})
+        if 2 <= len(numbered) <= 6:
+            return numbered
+        return []
+
+    async def _tool_memory_pin(self, args: dict):
+        action = str(args.get('action') or 'list').strip().lower()
+        if action == 'list':
+            return {'pins': self.memory_engine.list_pins()}
+        if action in ('pin', 'add'):
+            return self.memory_engine.add_pin(str(args.get('text') or ''))
+        if action in ('unpin', 'remove', 'delete'):
+            return self.memory_engine.remove_pin(str(args.get('pin_id') or args.get('text') or ''))
+        return {'error': f'未知 memory_pin action: {action}'}
+
+    async def _tool_blackboard(self, args: dict):
+        action = str(args.get('action') or 'list').strip().lower()
+        bot_id = self.bot_context.get()
+        room_id = self.room_context.get() or bot_id
+        if action == 'write':
+            return self.context_search.blackboard_write(
+                key=str(args.get('key') or ''),
+                value=str(args.get('value') or ''),
+                author_bot=bot_id,
+                summary=str(args.get('summary') or ''),
+            )
+        if action == 'read':
+            return self.context_search.blackboard_read(str(args.get('key') or ''))
+        if action == 'delete':
+            return self.context_search.blackboard_delete(str(args.get('key') or ''))
+        if action == 'set_todos':
+            raw_steps = args.get('steps') if isinstance(args.get('steps'), list) else []
+            todos = []
+            for idx, st in enumerate(raw_steps[:12], 1):
+                if isinstance(st, dict):
+                    todos.append({
+                        'title': str(st.get('title') or st.get('text') or f'步骤 {idx}')[:120],
+                        'status': str(st.get('status') or ('done' if st.get('done') else 'pending')),
+                    })
+                elif isinstance(st, str):
+                    todos.append({'title': st[:120], 'status': 'pending'})
+            cur_exec = self.executions_by_bot.get(room_id) or self.execution
+            if isinstance(cur_exec, dict):
+                cur_exec['todos'] = todos
+                await self.publish({'type': 'execution', 'execution': cur_exec})
+            return {'ok': True, 'todos': todos}
+        return self.context_search.blackboard_list()
+
+    async def _tool_custom_tool(self, args: dict):
+        action = str(args.get('action') or 'list').strip().lower()
+        plugins_dir = self.harness.root / 'plugins'
+        plugins_dir.mkdir(parents=True, exist_ok=True)
+        if action == 'list':
+            return self.harness.extension_registry.summary()
+        if action == 'delete':
+            t_name = re.sub(r'[^a-zA-Z0-9_]', '', str(args.get('name') or '')).strip()
+            p_file = plugins_dir / f'{t_name}.py'
+            if p_file.exists():
+                p_file.unlink()
+            self.harness.extension_registry.tool_plugins.pop(t_name, None)
+            return {'deleted': True, 'name': t_name}
+        if action == 'create':
+            t_name = re.sub(r'[^a-zA-Z0-9_]', '', str(args.get('name') or '')).strip().lower()
+            desc = str(args.get('description') or f'Custom tool {t_name}').strip()
+            code = str(args.get('code') or '').strip()
+            if not t_name or not code:
+                return {'error': 'create 需要提供 name 和 code (包含 async def run(args, context) -> dict)'}
+            try:
+                params_schema = json.loads(str(args.get('parameters_json') or '{"type":"object","properties":{}}'))
+            except Exception:
+                params_schema = {'type': 'object', 'properties': {}}
+            indented_code = '\n'.join('        ' + ln for ln in code.splitlines())
+            plugin_src = (
+                f'"""Dynamic Custom Tool: {t_name}"""\n'
+                f'import asyncio, json, os, re, time, httpx\n'
+                f'from pathlib import Path\n\n'
+                f'class DynamicPlugin_{t_name}:\n'
+                f'    name = {json.dumps(t_name)}\n'
+                f'    description = {json.dumps(desc, ensure_ascii=False)}\n'
+                f'    parameters = {repr(params_schema)}\n\n'
+                f'    async def execute(self, args: dict, context: dict) -> dict:\n'
+                f'{indented_code}\n'
+                f'        if "run" in locals() and callable(locals()["run"]):\n'
+                f'            res = locals()["run"](args, context)\n'
+                f'            return (await res) if asyncio.iscoroutine(res) else res\n'
+                f'        return {{"ok": True}}\n\n'
+                f'def register(registry):\n'
+                f'    registry.register_tool(DynamicPlugin_{t_name}())\n'
+            )
+            p_file = plugins_dir / f'{t_name}.py'
+            p_file.write_text(plugin_src, encoding='utf-8')
+            loaded = self.harness.extension_registry.discover_plugins_dir(plugins_dir)
+            return {'created': True, 'name': t_name, 'loaded_plugins': loaded}
+        return {'error': f'未知 custom_tool action: {action}'}
+
+    async def _tool_phone_macro(self, args: dict):
+        action = str(args.get('action') or 'list').strip().lower()
+        cfg_dir = self.harness.root / '.config'
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        macro_file = cfg_dir / 'phone_macros.json'
+        macros: dict = {}
+        if macro_file.exists():
+            try:
+                macros = json.loads(macro_file.read_text('utf-8'))
+            except Exception:
+                macros = {}
+        if action == 'list':
+            return {'macros': macros}
+        name = str(args.get('name') or '').strip()
+        if not name:
+            return {'error': '请提供宏名称 name'}
+        if action == 'save':
+            steps = args.get('steps') if isinstance(args.get('steps'), list) else []
+            if not steps:
+                return {'error': 'steps 不能为空'}
+            macros[name] = {
+                'name': name,
+                'description': str(args.get('description') or ''),
+                'steps': steps[:30],
+                'updated_at': time.time(),
+            }
+            macro_file.write_text(json.dumps(macros, ensure_ascii=False, indent=2), encoding='utf-8')
+            return {'saved': True, 'name': name, 'steps_count': len(steps[:30])}
+        if action == 'delete':
+            macros.pop(name, None)
+            macro_file.write_text(json.dumps(macros, ensure_ascii=False, indent=2), encoding='utf-8')
+            return {'deleted': True, 'name': name}
+        if action == 'run':
+            item = macros.get(name)
+            if not item:
+                return {'error': f'未找到手机动作宏 "{name}"'}
+            return await self._tool_phone_workspace({'op': 'batch', 'steps': item.get('steps', [])})
+        return {'error': f'未知 phone_macro action: {action}'}
 
     async def _broadcast_desktop_frame(self, res_or_frame: dict, op: str):
         if not isinstance(res_or_frame, dict):
             return
         b64 = res_or_frame.get('image')
-        if not b64:
-            return
-        import base64
-        try:
-            (self.harness.root / 'desktop-latest.jpg').write_bytes(base64.b64decode(b64))
-        except Exception:
-            pass
+        if b64:
+            import base64
+            try:
+                (self.harness.root / 'desktop-latest.jpg').write_bytes(base64.b64decode(b64))
+            except Exception:
+                pass
         room_id = self.room_context.get() or self.bot_context.get()
+        # Only broadcast lightweight metadata (no heavy base64 image in chat stream) to save bandwidth;
+        # the client pulls /api/computer/frame only when the user actually opens the Cloud Computer view!
         await self.publish({
             'type': 'cloud_desktop_frame',
             'bot_id': room_id,
             'speaker_id': self.bot_context.get(),
             'op': op,
             'frame': {
-                'image': b64,
                 'hash': res_or_frame.get('hash', ''),
                 'url': res_or_frame.get('url', ''),
                 'title': res_or_frame.get('title', ''),
@@ -796,6 +1253,15 @@ class Brain:
                     res = {k: v for k, v in res.items() if k != 'image'}
                     res['saved_screenshot'] = 'desktop-latest.jpg'
                 return res
+            if op in ('search', 'web_search'):
+                q = str(args.get('query') or args.get('text') or args.get('goal') or args.get('url') or '').strip()
+                engine = str(args.get('engine') or args.get('target') or 'auto').strip()
+                res = await self.computer.client.call('POST', '/search', body={'query': q, 'engine': engine, 'include_frame': True})
+                if isinstance(res, dict) and res.get('image'):
+                    await self._broadcast_desktop_frame(res, 'search')
+                    res = {k: v for k, v in res.items() if k != 'image'}
+                    res['saved_screenshot'] = 'desktop-latest.jpg'
+                return res
             if op in ('launch_app', 'app', 'open_app'):
                 app_name = str(args.get('app') or args.get('text') or 'lite_browser').strip()
                 res = await self.computer.client.call('POST', '/input', body={'kind':'launch_app', 'app':app_name, 'text':str(args.get('url') or args.get('text') or ''), 'include_frame':True})
@@ -848,23 +1314,40 @@ class Brain:
                     res['saved_screenshot'] = 'desktop-latest.jpg'
                 res.update({'clicked_text': matched.get('text', txt_q), 'x': cx, 'y': cy})
                 return res
-            if op in ('click', 'double_click', 'right_click', 'type', 'key', 'scroll'):
-                payload: dict = {'kind':op, 'include_frame':True}
-                if op in ('click', 'double_click', 'right_click'):
-                    payload.update(x=int(args.get('x') or 0), y=int(args.get('y') or 0))
-                elif op == 'type':
+            if op in ('click', 'double_click', 'right_click', 'type', 'key', 'hotkey', 'scroll', 'move', 'hover', 'drag', 'focus_window', 'close_window', 'tile_windows', 'clipboard', 'click_ref', 'type_ref'):
+                payload: dict = {'kind': op, 'include_frame': True}
+                if op in ('click', 'double_click', 'right_click', 'move', 'hover'):
+                    payload.update(
+                        x=int(args.get('x') or 0),
+                        y=int(args.get('y') or 0),
+                        nx=int(args.get('nx') if args.get('nx') is not None else -1),
+                        ny=int(args.get('ny') if args.get('ny') is not None else -1),
+                        grid=str(args.get('grid') or ''),
+                    )
+                elif op == 'drag':
+                    payload.update(
+                        x=int(args.get('x') or 0),
+                        y=int(args.get('y') or 0),
+                        x2=int(args.get('x2') or 0),
+                        y2=int(args.get('y2') or 0),
+                    )
+                elif op in ('type', 'clipboard'):
                     payload.update(text=str(args.get('text') or ''))
-                elif op == 'key':
-                    payload.update(key=str(args.get('key') or 'Return'))
+                elif op in ('key', 'hotkey'):
+                    payload.update(key=str(args.get('key') or args.get('text') or 'Return'))
                 elif op == 'scroll':
                     payload.update(x=int(args.get('x') or 640), y=int(args.get('y') or 400), direction=str(args.get('text') or 'down'), amount=4)
+                elif op in ('focus_window', 'close_window'):
+                    payload.update(target=str(args.get('target') or args.get('app') or args.get('text') or ''))
+                elif op in ('click_ref', 'type_ref'):
+                    payload.update(ref=str(args.get('ref') or args.get('target') or ''), text=str(args.get('text') or ''))
                 res = await self.computer.client.call('POST', '/input', body=payload)
                 if isinstance(res, dict) and res.get('image'):
                     await self._broadcast_desktop_frame(res, op)
                     res = {k: v for k, v in res.items() if k != 'image'}
                     res['saved_screenshot'] = 'desktop-latest.jpg'
                 return res
-            return {'error':f'未知 cloud_desktop op: {op}'}
+            return {'error': f'未知 cloud_desktop op: {op}'}
         except Exception as e:
             return {'error':str(e)[:260]}
 
@@ -875,11 +1358,24 @@ class Brain:
         except ValueError:
             bot_notify = True
         extra.setdefault('notify', bot_notify)
+        pending_choices = self.choices_var.get()
+        if pending_choices and 'choices' not in extra:
+            extra['choices'] = list(pending_choices)
+            self.choices_var.set(None)
+            self.choices_prompt_var.set('')
+        elif 'choices' not in extra and kind in ('chat', 'curiosity', 'result'):
+            implicit_choices = self._extract_implicit_choices(str(text or ''))
+            if implicit_choices:
+                extra['choices'] = implicit_choices
         m = self.store.message('assistant', text, kind, **extra)
         self.stream_seq += 1
         turn_id = self.turn_id_var.get() or m['id']
         m['seq'] = self.stream_seq
         m['turn_id'] = turn_id
+        try:
+            self.context_search.index_message(m)
+        except Exception:
+            pass
         self.last_completed_stream = {
             'seq': self.stream_seq,
             'turn_id': turn_id,
@@ -891,7 +1387,7 @@ class Brain:
             'done': True,
             'completed_at': time.time(),
         }
-        await self.publish({'type':'message', 'message':m, 'seq':self.stream_seq})
+        await self.publish({'type': 'message', 'message': m, 'seq': self.stream_seq})
         if track and extra['notify']:
             await self.escalation.track(m)
         return m
@@ -901,22 +1397,53 @@ class Brain:
         body = str(args.get('body') or '').strip()[:2000]
         urgent = bool(args.get('urgent', False))
         if not body:
-            return {'error':'通知内容不能为空'}
+            return {'error': '通知内容不能为空'}
         bot_id = self.room_context.get() or self.bot_context.get()
         bot = get_assistant(self.store, self.bot_context.get())
-        m = self.store.message(
-            'assistant', f'🔔 **{title}**\n{body}', 'notification',
-            bot_id=bot_id, from_bot_id=bot['id'], from_bot_name=bot['name'],
-            title=title, urgent=urgent, notify=True
-        )
-        await self.publish({'type':'message', 'message':m})
-        await self.escalation.track(m)
-        if urgent and m['id'] in self.store.state['pending']:
-            self.store.state['pending'][m['id']]['stage'] = 3
-            self.store.save()
-            await self.publish({'type':'escalation', 'stage':3, 'id':m['id'], 'text':m['text'], 'demo':False})
-        await self.publish({'type':'user_notification', 'id':m['id'], 'bot_id':bot_id, 'bot_name':bot['name'], 'title':title, 'body':body, 'urgent':urgent})
-        return {'notified':True, 'id':m['id'], 'title':title, 'urgent':urgent}
+        nid = 'notif-' + secrets.token_hex(6)
+        await self.publish({
+            'type': 'user_notification',
+            'id': nid,
+            'bot_id': bot_id,
+            'bot_name': bot['name'],
+            'title': title,
+            'body': body,
+            'urgent': urgent,
+        })
+        return {
+            'notified': True,
+            'id': nid,
+            'title': title,
+            'urgent': urgent,
+            'note': '手机系统通知栏推送已发出；请直接将提醒正文作为本轮最终回复输出即可，禁止再额外说“推送已经发了”。',
+        }
+
+    async def _tool_emergency_alarm(self, args: dict):
+        title = str(args.get('title') or '紧急呼叫').strip()[:120]
+        reason = str(args.get('reason') or '').strip()[:1000]
+        duration_sec = max(5, min(45, int(args.get('duration_sec') or 18)))
+        if not reason:
+            return {'error': '必须提供触发紧急响铃的具体原因 reason'}
+        now = time.time()
+        if self.store.state.get('snooze_until', 0) > now:
+            return {'suppressed': True, 'reason': '当前处于主人设定的免打扰时段，已拦截紧急闹钟'}
+        if now - self._last_emergency_alarm_at < 180.0:
+            return {'suppressed': True, 'reason': '3 分钟内已触发过一次紧急响铃，避免重复打扰'}
+        self._last_emergency_alarm_at = now
+        bot_id = self.room_context.get() or self.bot_context.get()
+        bot = get_assistant(self.store, self.bot_context.get())
+        aid = 'alarm-' + secrets.token_hex(6)
+        await self.publish({
+            'type': 'emergency_alarm',
+            'id': aid,
+            'bot_id': bot_id,
+            'bot_name': bot['name'],
+            'title': f'🚨 {title}',
+            'body': reason,
+            'duration_sec': duration_sec,
+            'urgent': True,
+        })
+        return {'alarm_triggered': True, 'id': aid, 'duration_sec': duration_sec, 'title': title}
 
     @staticmethod
     def _is_vision_capable_model(model_id: str) -> bool:
@@ -1164,16 +1691,74 @@ class Brain:
         except Exception:
             pass
 
+    @staticmethod
+    def _resolve_phone_grid_or_norm(args: dict, width: int, height: int) -> tuple[int, int] | None:
+        """
+        Convert coarse grid (`A1..F10`), normalized 0-1000 (`nx`, `ny`), or float 0..1 (`x`, `y`)
+        into exact virtual display pixel coordinates `(px, py)`.
+        """
+        grid_raw = str(args.get('grid') or '').strip().upper()
+        if grid_raw and len(grid_raw) >= 2 and grid_raw[0].isalpha() and grid_raw[1:].replace('.', '', 1).isdigit():
+            col_idx = max(0, min(5, ord(grid_raw[0]) - ord('A')))
+            row_val = max(0.0, min(9.9, float(grid_raw[1:]) - 1.0))
+            px = int(((col_idx + 0.5) / 6.0) * width)
+            py = int(((row_val + 0.5) / 10.0) * height)
+            return max(0, min(width - 1, px)), max(0, min(height - 1, py))
+        nx = args.get('nx')
+        ny = args.get('ny')
+        if nx is not None and ny is not None:
+            try:
+                nx_f, ny_f = float(nx), float(ny)
+                if 0 <= nx_f <= 1000 and 0 <= ny_f <= 1000:
+                    return (
+                        max(0, min(width - 1, int(round(nx_f * width / 1000.0)))),
+                        max(0, min(height - 1, int(round(ny_f * height / 1000.0)))),
+                    )
+            except (ValueError, TypeError):
+                pass
+        return None
+
     async def _tool_phone_workspace(self, args: dict):
         import base64
         op = str(args.get('op') or 'status').strip().lower()
-        if op not in ('status', 'release', 'auto_release'):
+        if op not in ('status', 'release', 'auto_release', 'notifications', 'get_notifications', 'recent_notifications', 'notifs', 'notification'):
             self._used_phone_in_turn = True
 
         # Never delegate to local phone sub-agent op="run" from cloud tool calls (prevents fake user messages & 10-min loops)
         if op in ('run', 'task'):
             op = 'ui_tree'
             args = {'op': 'ui_tree', 'refresh': True}
+
+        cur_w, cur_h = self._last_phone_size
+        resolved_pt = self._resolve_phone_grid_or_norm(args, cur_w, cur_h)
+        if resolved_pt is not None and op in ('tap', 'tap_node', 'click_node', 'tap_and_type'):
+            args = {**args, 'x': resolved_pt[0], 'y': resolved_pt[1]}
+            if op in ('tap_node', 'click_node') and not args.get('ref') and not args.get('text'):
+                op = 'tap'
+                args['op'] = 'tap'
+
+        # Coarse combo action for WeChat / no-accessibility-tree screens: tap input box -> paste text -> optional send/enter
+        if op == 'tap_and_type':
+            tx = int(args.get('x') if args.get('x') is not None else (cur_w // 2))
+            ty = int(args.get('y') if args.get('y') is not None else int(cur_h * 0.94))
+            content_txt = str(args.get('text') or '').strip()
+            tap_r = await self._raw_phone_rpc('tap', {'op': 'tap', 'x': tx, 'y': ty})
+            await asyncio.sleep(0.22)
+            type_r = await self._raw_phone_rpc('text', {'op': 'text', 'text': content_txt}) if content_txt else {}
+            if args.get('submit'):
+                await asyncio.sleep(0.18)
+                # Tap WeChat right-bottom send button area or press Enter
+                await self._raw_phone_rpc('key', {'op': 'key', 'key': 'enter'})
+            return {
+                **(tap_r if isinstance(tap_r, dict) else {}),
+                **(type_r if isinstance(type_r, dict) else {}),
+                'ok': True,
+                'op': 'tap_and_type',
+                'x': tx,
+                'y': ty,
+                'typed': bool(content_txt),
+                'submitted': bool(args.get('submit')),
+            }
 
         if op == 'batch' and isinstance(args.get('steps'), list):
             steps_list = [s for s in args['steps'][:10] if isinstance(s, dict) and s.get('op') != 'batch']
@@ -1285,23 +1870,31 @@ class Brain:
         raw_target = str(args.get('to_bot_id') or '').strip()
         text = str(args.get('text') or '').strip()
         if not raw_target or not text:
-            return {'error':'to_bot_id 和 text 不能为空'}
+            return {'error': 'to_bot_id 和 text 不能为空'}
         self.store.sync_from_workspace()
         target_bot = self._resolve_bot(raw_target)
         if target_bot is None:
             available = [f"{b['id']} ({b['name']})" for b in self.store.state.get('assistants', [])]
             return {
-                'error':f'未找到目标 Bot "{raw_target}"。当前可用 Bot: {", ".join(available)}。可先调用 manage_bot(action="create", name="{raw_target}") 创建它，或发给现有的 Bot。'
+                'error': f'未找到目标 Bot "{raw_target}"。当前可用: {", ".join(available)}。可先调用 manage_bot(action="create", name="{raw_target}") 创建。'
             }
         target_id = target_bot['id']
         from_id = self.bot_context.get()
         room_id = self.room_context.get() or from_id
         if target_id == from_id:
-            return {'error':'不能给自己发送 send_message'}
+            return {'error': '不能给自己发送 send_message'}
+        chain = list(self.call_chain_var.get() or (from_id,))
+        if target_id in chain:
+            return {'error': f'检测到 Bot 循环调用链路 ({" -> ".join(chain + [target_id])})，已自动拦截以防死锁；请直接汇总当前信息。'}
         depth = self.hop_depth.get()
         if depth >= 5:
-            return {'error':'Bot 间连续转发已达单次上限 (5 跳)，请先总结当前进展'}
+            return {'error': 'Bot 间连续转发已达单次上限 (5 跳)，请先总结当前进展'}
         from_bot = get_assistant(self.store, from_id)
+        parent_turn_id = self.turn_id_var.get() or ('turn-' + secrets.token_hex(6))
+        parent_exec = self.executions_by_bot.get(room_id) or self.execution
+        if isinstance(parent_exec, dict):
+            subs = parent_exec.setdefault('sub_agents', {})
+            subs[target_id] = {'bot_id': target_id, 'name': target_bot['name'], 'status': 'thinking', 'goal': text[:120], 'updated_at': time.time()}
 
         # 1. Show delegation bubble in the current active room AND in target_bot's private history
         if room_id != target_id:
@@ -1314,7 +1907,11 @@ class Brain:
                 from_bot_name=from_bot['name'],
                 notify=False,
             )
-            await self.publish({'type':'message', 'message':room_delegation})
+            self.stream_seq += 1
+            room_delegation['seq'] = self.stream_seq
+            room_delegation['turn_id'] = parent_turn_id
+            room_delegation['is_sub_turn'] = True
+            await self.publish({'type': 'message', 'message': room_delegation, 'seq': self.stream_seq})
         delegated_msg = self.store.message(
             'user',
             f'@{target_bot["name"]} [来自 {from_bot["name"]}]:\n{text}',
@@ -1324,36 +1921,67 @@ class Brain:
             from_bot_name=from_bot['name'],
             notify=False,
         )
-        await self.publish({'type':'message', 'message':delegated_msg})
+        self.stream_seq += 1
+        delegated_msg['seq'] = self.stream_seq
+        delegated_msg['turn_id'] = parent_turn_id
+        delegated_msg['is_sub_turn'] = True
+        await self.publish({'type': 'message', 'message': delegated_msg, 'seq': self.stream_seq})
 
-        # 2. Execute target_bot with live streaming into room_id!
+        # 2. Execute target_bot with live streaming into room_id
         depth_token = self.hop_depth.set(depth + 1)
+        chain_token = self.call_chain_var.set(tuple(chain + [target_id]))
         bot_token = self.bot_context.set(target_id)
         room_token = self.room_context.set(room_id)
-        sub_turn_token = self.turn_id_var.set('turn-' + secrets.token_hex(6))
+        sub_turn_token = self.turn_id_var.set(parent_turn_id)
         sub_prefix_token = self.stream_prefix_var.set('')
         try:
             await self._set_stream(text='正在思考…', speaker_id=target_id, speaker_name=target_bot['name'])
             allowed = target_bot.get('tools') or [t['function']['name'] for t in TOOLS]
             async def sub_progress(event):
+                if isinstance(parent_exec, dict):
+                    subs = parent_exec.setdefault('sub_agents', {})
+                    if event['type'] == 'tool_start':
+                        subs[target_id] = {'bot_id': target_id, 'name': target_bot['name'], 'status': f"调用 {event['tool']}", 'goal': text[:120], 'updated_at': time.time()}
+                        if isinstance(parent_exec.get('trace'), list):
+                            parent_exec['trace'].append({
+                                'tool': event['tool'],
+                                'arguments': event.get('arguments') or {},
+                                'duration_ms': 0,
+                                'status': 'running',
+                            })
+                        parent_exec['tool'] = event['tool']
+                    elif event['type'] == 'tool_end':
+                        if isinstance(parent_exec.get('trace'), list):
+                            entry_done = dict(event['entry'])
+                            entry_done['status'] = 'done'
+                            if parent_exec['trace'] and parent_exec['trace'][-1].get('status') == 'running' and parent_exec['trace'][-1].get('tool') == entry_done.get('tool'):
+                                parent_exec['trace'][-1] = entry_done
+                            else:
+                                parent_exec['trace'].append(entry_done)
+                        parent_exec['tool'] = f"正在分析 {event['entry'].get('tool', '工具')} 结果…"
+                    elif event['type'] == 'turn_text':
+                        subs[target_id] = {'bot_id': target_id, 'name': target_bot['name'], 'status': '生成回复中', 'goal': text[:120], 'updated_at': time.time()}
                 if event['type'] == 'turn_text':
                     self.stream_prefix_var.set(event['text'])
                     await self._set_stream(text=event['text'], speaker_id=target_id, speaker_name=target_bot['name'])
                 elif event['type'] == 'tool_start':
                     await self._set_stream(text=self.stream_prefix_var.get() or f"正在调用 {event['tool']}…", tool=event['tool'], speaker_id=target_id, speaker_name=target_bot['name'])
+                elif event['type'] == 'tool_end':
+                    await self._set_stream(text=self.stream_prefix_var.get() or '正在思考…', tool=f"正在分析 {event['entry'].get('tool', '工具')} 结果…", speaker_id=target_id, speaker_name=target_bot['name'])
             result = await self.harness.run(
                 f'来自同事 Bot「{from_bot["name"]} ({from_id})」的协作请求：\n{text}',
                 lambda msgs, tools=None: self.complete(msgs, tools=tools, big=(target_bot.get('engine') == 'big')),
-                self.context() + '\n助手的角色设定：' + self.persona(),
+                self.context() + '\n角色设定：' + self.persona(target_id),
                 allowed_tools=allowed,
                 on_event=sub_progress,
             )
             reply_text = result['text']
-            # Record in target_bot's own window
+            if isinstance(parent_exec, dict) and 'sub_agents' in parent_exec and target_id in parent_exec['sub_agents']:
+                parent_exec['sub_agents'][target_id]['status'] = 'done'
             target_reply = self.store.message(
                 'assistant',
                 reply_text,
-                kind='result',
+                kind='bot_reply',
                 bot_id=target_id,
                 from_bot_id=target_id,
                 from_bot_name=target_bot['name'],
@@ -1361,8 +1989,11 @@ class Brain:
                 trace=result['trace'],
                 notify=False,
             )
-            await self.publish({'type':'message', 'message':target_reply})
-            # Also post directly as target_bot's bubble in room_id so user sees A & B chatting in the same window!
+            self.stream_seq += 1
+            target_reply['seq'] = self.stream_seq
+            target_reply['turn_id'] = parent_turn_id
+            target_reply['is_sub_turn'] = True
+            await self.publish({'type': 'message', 'message': target_reply, 'seq': self.stream_seq})
             if room_id != target_id:
                 caller_copy = self.store.message(
                     'assistant',
@@ -1374,48 +2005,64 @@ class Brain:
                     trace=result['trace'],
                     notify=False,
                 )
-                await self.publish({'type':'message', 'message':caller_copy})
+                self.stream_seq += 1
+                caller_copy['seq'] = self.stream_seq
+                caller_copy['turn_id'] = parent_turn_id
+                caller_copy['is_sub_turn'] = True
+                await self.publish({'type': 'message', 'message': caller_copy, 'seq': self.stream_seq})
             return {
-                'status':'replied',
-                'from_bot_id':target_id,
-                'from_bot_name':target_bot['name'],
-                'reply':reply_text,
-                'trace_count':len(result['trace']),
+                'status': 'replied',
+                'from_bot_id': target_id,
+                'from_bot_name': target_bot['name'],
+                'reply': reply_text,
+                'trace_count': len(result['trace']),
             }
         except Exception as e:
             err_str = str(e)[:280]
+            if isinstance(parent_exec, dict) and 'sub_agents' in parent_exec and target_id in parent_exec['sub_agents']:
+                parent_exec['sub_agents'][target_id]['status'] = 'error'
             configured_model = target_bot.get('model') or self.store.config.effective_model(big=(target_bot.get('engine') == 'big')) or '未配置'
             avail_models = (await self._fetch_available_models())[:18]
-            models_hint = f'当前网关真实可用模型列表：{", ".join(avail_models)}' if avail_models else '请调用 list_models() 查看可用模型'
+            models_hint = f'当前可用模型：{", ".join(avail_models)}' if avail_models else '请调用 list_models() 查看可用模型'
             err_msg_text = (
                 f'⚠️ **[{target_bot["name"]} 报错]**: {err_str}\n'
-                f'当前配置模型: `{configured_model}`\n'
+                f'当前模型: `{configured_model}`\n'
                 f'💡 {models_hint}'
             )
             err_target = self.store.message(
                 'assistant', err_msg_text, kind='error',
                 bot_id=target_id, from_bot_id=target_id, from_bot_name=target_bot['name'], notify=False
             )
-            await self.publish({'type':'message', 'message':err_target})
+            self.stream_seq += 1
+            err_target['seq'] = self.stream_seq
+            err_target['turn_id'] = parent_turn_id
+            err_target['is_sub_turn'] = True
+            await self.publish({'type': 'message', 'message': err_target, 'seq': self.stream_seq})
             if room_id != target_id:
                 err_caller = self.store.message(
                     'assistant', err_msg_text, kind='error',
                     bot_id=room_id, from_bot_id=target_id, from_bot_name=target_bot['name'], notify=False
                 )
-                await self.publish({'type':'message', 'message':err_caller})
+                self.stream_seq += 1
+                err_caller['seq'] = self.stream_seq
+                err_caller['turn_id'] = parent_turn_id
+                err_caller['is_sub_turn'] = True
+                await self.publish({'type': 'message', 'message': err_caller, 'seq': self.stream_seq})
             return {
-                'error':err_str,
-                'from_bot_id':target_id,
-                'from_bot_name':target_bot['name'],
-                'current_model':configured_model,
-                'available_models_wheelchair':avail_models,
-                'self_heal_hint':f'目标 Bot 模型或调用报错！请直接调用 manage_bot(action="update", bot_id="{target_id}", model="可用模型名") 将其修改为上述 available_models_wheelchair 中的有效模型，然后再次调用 send_message 重试！',
+                'error': err_str,
+                'from_bot_id': target_id,
+                'from_bot_name': target_bot['name'],
+                'current_model': configured_model,
+                'available_models_wheelchair': avail_models,
+                'self_heal_hint': f'目标 Bot 报错，可调用 manage_bot(action="update", bot_id="{target_id}", model="有效模型名") 修复后重试。',
             }
         finally:
+            self._clear_bot_stream(target_id)
             self.stream_prefix_var.reset(sub_prefix_token)
             self.turn_id_var.reset(sub_turn_token)
             self.room_context.reset(room_token)
             self.bot_context.reset(bot_token)
+            self.call_chain_var.reset(chain_token)
             self.hop_depth.reset(depth_token)
 
     AUTO_COMPACT_TOKENS = 200_000
@@ -1423,117 +2070,53 @@ class Brain:
 
     @staticmethod
     def _estimate_tokens(text: str) -> int:
-        if not text:
-            return 0
-        cjk = sum(1 for ch in text if '\u4e00' <= ch <= '\u9fff')
-        other_bytes = len(text.encode('utf-8')) - cjk * 3
-        return cjk + max(0, other_bytes) // 3
+        return MemoryEngine.estimate_tokens(text)
 
     def _estimate_messages_tokens(self, messages: list[dict]) -> int:
-        total = 0
-        for m in messages:
-            total += 6 + self._estimate_tokens(str(m.get('content') or ''))
-            if m.get('tool_calls'):
-                total += self._estimate_tokens(json.dumps(m['tool_calls'], ensure_ascii=False))
-        return total
+        return MemoryEngine.estimate_messages_tokens(messages)
 
     @staticmethod
     def _prune_tool_loop_messages(messages: list[dict]):
-        """Keep prefix cache 100% intact across tool steps; only fold older tool outputs if an individual output exceeds 16K chars."""
-        tool_indices = [idx for idx, m in enumerate(messages) if m.get('role') == 'tool']
-        if len(tool_indices) <= 2:
-            return
-        for idx in tool_indices[:-2]:
-            content = str(messages[idx].get('content') or '')
-            if len(content) > 16000 and '[早期工具输出已自动折叠]' not in content:
-                messages[idx]['content'] = content[:1600] + f'\n...[早期超大工具输出已自动折叠，原长 {len(content)} 字符]...'
+        MemoryEngine.prune_tool_loop_messages(messages)
 
     def context(self):
-        """Pi-style lean index + core traits; full notes are read on-demand via read_file / memory_search to save tokens & preserve prefix cache."""
-        raw_idx = self.vault.read('INDEX.md')
-        idx = raw_idx[:3500] if len(raw_idx) <= 3500 else (raw_idx[:2200] + '\n...\n' + raw_idx[-1200:])
-        raw_traits = self.vault.read('profile/user_traits.md')
-        traits = raw_traits[-2500:] if len(raw_traits) > 2500 else raw_traits
-        return f'【记忆库目录 INDEX.md（可用 read_file("memory_vault/...") 或 memory_search 翻阅详情）】\n{idx}\n\n【用户核心画像】\n{traits}'
+        return self.memory_engine.build_prompt_context()
 
     async def _auto_compact_if_needed(self, bot_id: str, force: bool = False) -> dict | None:
-        bot_msgs = [m for m in self.store.state['messages'] if m.get('bot_id', 'companion') == bot_id]
-        if len(bot_msgs) <= (2 if force else 6):
-            return None
+        """Silent background 200K compaction via MemoryEngine (never pollutes live_stream, emits compact_summary card to chat)."""
         sys_tokens = self._estimate_tokens(self.harness.system_instructions(self.context())) + 800
-        msg_tokens = sum(self._estimate_tokens(m.get('text', '')) + 12 for m in bot_msgs)
-        reported_tokens = self.last_prompt_tokens.get(bot_id, 0)
-        total_tokens = max(sys_tokens + msg_tokens, reported_tokens)
-        if not force and total_tokens < self.AUTO_COMPACT_TOKENS:
-            return None
-
-        kept_tokens = 0
-        split_idx = max(1, len(bot_msgs) - 2)
-        for i in range(len(bot_msgs) - 1, 0, -1):
-            kept_tokens += self._estimate_tokens(bot_msgs[i].get('text', '')) + 12
-            if kept_tokens >= self.KEEP_RECENT_TOKENS:
-                split_idx = i
-                break
-        older = bot_msgs[:max(1, split_idx)]
-        if len(older) <= 1 and older[0].get('kind') == 'compact_summary' and not force:
-            return None
-        summary_lines = [f"- [{m.get('from_bot_name') or m['role']}]: {m.get('text', '')[:600]}" for m in older]
-        raw_transcript = '\n'.join(f"[{m.get('from_bot_name') or m['role']}]: {m.get('text', '')[:1800]}" for m in older)
-        llm_summary = ''
-        try:
-            await self._set_stream(text=f'📦 上下文已达 200K Tokens ({total_tokens})，正在自动压缩归档早期 {len(older)} 条对话…', speaker_id=bot_id)
-            sum_msg = await self.complete([
-                {
-                    'role': 'system',
-                    'content': '你是 200K 上下文自动压缩引擎。请将以下早期对话历史浓缩为高信息密度的结构化摘要，完整保留所有关键事实、用户偏好、时间节点、文件路径、代码/命令结论以及未决事项。'
-                },
-                {'role': 'user', 'content': raw_transcript[:150000]}
-            ], tools=None, big=False)
-            llm_summary = (sum_msg.get('content') or '').strip()
-        except Exception:
-            llm_summary = ''
-        final_summary = llm_summary or '\n'.join(summary_lines[-40:])
-        archive_text = f"## 200K 自动压缩归档 ({now_iso()} · bot={bot_id} · 压缩前约 {total_tokens} tokens / {len(older)} 条消息)\n" + final_summary
-        self.vault.log(archive_text)
-        older_ids = {m['id'] for m in older}
-        compact_marker = {
-            'id': secrets.token_hex(12),
-            'role': 'assistant',
-            'bot_id': bot_id,
-            'kind': 'compact_summary',
-            'text': f'📦 [上下文达 200K Tokens，已自动压缩早期 {len(older)} 条对话并归档至 memory_vault/timeline]：\n' + final_summary,
-            'created_at': older[-1].get('created_at', time.time()),
-            'notify': False,
-        }
-        new_all = []
-        inserted = False
-        for m in self.store.state['messages']:
-            if m['id'] in older_ids:
-                if not inserted:
-                    new_all.append(compact_marker)
-                    inserted = True
-                continue
-            new_all.append(m)
-        self.store.state['messages'] = new_all
-        new_est = sys_tokens + kept_tokens + self._estimate_tokens(final_summary)
-        self.last_prompt_tokens[bot_id] = new_est
-        self.store.save()
-        return {'compacted_messages': len(older), 'before_tokens': total_tokens, 'after_tokens': new_est, 'summary': final_summary}
+        res = await self.memory_engine.auto_compact_if_needed(
+            bot_id=bot_id,
+            sys_tokens=sys_tokens,
+            silent_complete_fn=lambda msgs: self.llm.complete_silent(msgs, tools=None, big=False, bot_id=bot_id),
+            force=force,
+        )
+        if res and isinstance(res.get('marker'), dict):
+            marker = res['marker']
+            self.stream_seq += 1
+            marker['seq'] = self.stream_seq
+            self.store.save()
+            await self.publish({'type': 'message', 'message': marker, 'seq': self.stream_seq})
+        return res
 
     async def curiosity(self, manual=False, bot_id=None):
         if not manual and (self.store.state['snooze_until'] > time.time() or not self.store.config.enabled):
-            return {'suppressed':True}
+            return {'suppressed': True}
         async with self.lock:
             target_id = bot_id or self.store.state['primary_bot_id']
             if not manual:
                 bot_history = [m for m in self.store.state['messages'] if m.get('bot_id', 'companion') == target_id]
-                if bot_history and bot_history[-1].get('kind') == 'curiosity':
-                    # Unanswered backoff: do not burn quota repeating proactive outreach if the user hasn't replied yet
+                if bot_history and bot_history[-1].get('role') == 'assistant':
+                    # Unanswered backoff: never talk to ourselves when the last message in the room is already from the assistant
                     self.store.state['last_curiosity'] = time.time()
                     self.store.save()
                     return {'suppressed': True, 'reason': 'unanswered_backoff'}
             marker = self.bot_context.set(target_id)
             room_marker = self.room_context.set(target_id)
+            cur_turn_token = self.turn_id_var.set('turn-' + secrets.token_hex(6))
+            cur_prefix_token = self.stream_prefix_var.set('')
+            cur_choices_token = self.choices_var.set(None)
+            cur_choices_prompt_token = self.choices_prompt_var.set('')
             self.activity = 'curiosity'
             try:
                 bot = get_assistant(self.store, target_id)
@@ -1552,48 +2135,50 @@ class Brain:
                         for m in recent_items
                     ]
                     allowed = set(bot.get('tools') or [t['function']['name'] for t in TOOLS]) & {
-                        'read_file', 'write_file', 'edit_file', 'memory_search', 'web_search', 'web_fetch', 'schedule_task'
+                        'read_file', 'write_file', 'edit_file', 'memory_search', 'web_search', 'web_fetch', 'schedule_task', 'present_choices'
                     }
                     available_tools = [t for t in TOOLS if t['function']['name'] in allowed]
-                    opps = self.vault.read('tasks/sniffed_opportunities.md')[:4000]
-                    deadlines = self.vault.read('tasks/active_deadlines.md')[:4000]
-                    routines_md = self.vault.read('playbooks/routines.md')[:4000]
+                    opps = self.vault.read('tasks/sniffed_opportunities.md')[:3000]
+                    deadlines = self.vault.read('tasks/active_deadlines.md')[:3000]
+                    routines_md = self.vault.read('playbooks/routines.md')[:3000]
+                    raw_imp, missing_imp = self.memory_engine.get_personal_impression()
                     schedule_md = ''
                     try:
-                        schedule_md = self.vault.read('profile/course_schedule.md')[:6000]
+                        schedule_md = self.vault.read('profile/course_schedule.md')[:4000]
                     except Exception:
                         pass
+                    missing_hint = ('\n- ' + '\n- '.join(missing_imp[:8])) if missing_imp else '（主要维度已初步记录，可深入细节）'
                     sys_prompt = (
-                        self.harness.system_instructions(self.context()) + '\n\n'
-                        '当前北京时间：' + self._fmt_bj(time.time()) + ' (' + now_iso() + ')\n'
-                        '你的身份设定：' + self.persona() + '\n\n'
-                        '【当前课表参考】\n' + (schedule_md or '（未记录）') + '\n\n'
-                        '【当前待确认死线 active_deadlines.md】\n' + deadlines + '\n\n'
-                        '【当前常驻自动化 routines.md】\n' + routines_md + '\n\n'
-                        '【当前代劳机会池 sniffed_opportunities.md】\n' + opps + '\n\n'
-                        '【✨ 云端主动嗅探与高价值提问（Actionable Curiosity）】\n'
-                        '现在是你在云端主动发起一次「真正有用」的提问或情报投递的时刻！\n'
-                        '⚠️ **绝对禁止的废话/逼话黑名单（违反即算严重失职）**：\n'
-                        '- 严禁顺着最近几句聊天记录瞎延伸八卦或闲聊（例如：禁止问“这套系统你是怎么搭的”、“你那199个App常用几个/猜对了吗”、“杠精要不要试试”等毫无产出的废话）！\n'
-                        '- 严禁在好奇心里复读或念叨刚才聊过的报错、手机连接状态、Root状态或上一条已经问过的话题！\n'
-                        '- 严禁空手问“在忙什么呢”、“今天过得怎么样”等毫无信息量的寒暄！\n\n'
-                        '✅ **你必须做的事（二选一，每次只聚焦一件事，2～4句话内说清）**：\n'
-                        '1. **【先查硬核干货，再问要不要落地】**：先调用 `web_search` 搜索一条跟主人实际需求强相关的最新实用情报（例如：最新高性价比/免费大模型 API 动态、Claude/Grok/开源 Agent 实用工具或脚本、或者结合当前专业课的实用工程计算/资料工具），**第一句直接给出具体干货结论（带真实名称/关键细节），第二句问主人要不要你帮他在云端工作区配好、写成脚本或设为日常追踪**。\n'
-                        '2. **【直击学业/日常工作流的具体代劳卡点】**：对照上面的课表、`active_deadlines.md` 和 `routines.md`，找出当前真正空白且能立刻帮主人省事的一项具体事务来问（例如：询问本周《高速铁路技术》《混凝土结构设计原理》《工程测量》等课程有没有近期要交的作业/实验报告/课程设计需要提前备资料和设死线；或者询问每天有没有固定要盯的网站/教务通知/GitHub项目/价格变动需要你写成后台定时巡检）。\n'
-                        '**核心检验标准**：主人只需回你一句话（如“有，周四交XXX”或“帮我盯一下XXX”），你就能立刻动手替他干一件实事！'
+                        self.harness.static_system_instructions(self.memory_engine.build_static_pinned_block()) + '\n\n'
+                        '你的设定：' + self.persona() + '\n\n'
+                        '当前时间：' + self._fmt_bj(time.time()) + ' (' + now_iso() + ')\n'
+                        '主人立体个人印象档案 (memory_vault/profile/personal_impression.md)：\n' + raw_imp[:2200] + '\n\n'
+                        '尚未了解的个人印象维度：' + missing_hint + '\n\n'
+                        '课表：\n' + (schedule_md or '（未记录）') + '\n\n'
+                        '待确认截止事项：\n' + deadlines + '\n\n'
+                        '常驻例行：\n' + routines_md + '\n\n'
+                        '待办机会池：\n' + opps + '\n\n'
+                        '请主动向主人发起一次简短、真诚、自然的搭话（2~4句话）：\n'
+                        '- 重要原则：不要每次只问工作或任务！请优先从「尚未了解的个人印象维度」（如主人的出生地/家乡、成长经历、当前身份与理想、家庭氛围与重要的人/宠物、生活饮食喜好、性格与相处偏好）中挑一个还没问过的小话题，像亲近的伙伴一样自然地问一句，逐渐补全对主人的个人印象；或者结合当前时间/课表/情报分享一件具体有用的事。\n'
+                        '- 严禁生硬查户口，每次只轻轻问一个具体而温暖的小问题，不要顺着最近报错复读。\n'
+                        '- 务必调用 `present_choices(choices=[...])` 提供 3~4 个贴心选项，方便主人一键点选回答（主人也可以自己打字）。\n'
                     )
                     messages = [
                         {'role':'system', 'content':sys_prompt},
                         {'role':'user', 'content':'最近对话摘要（仅用于防重复，严禁顺着里面的闲聊或报错继续尬聊）：\n' + json.dumps(recent_digest, ensure_ascii=False)}
                     ]
                     msg = {'content': ''}
-                    for _ in range(8):
-                        msg = await self.complete(messages, tools=available_tools or None)
+                    cur_accumulated: list[str] = []
+                    for _ in range(6):
+                        msg = await self.llm.complete_silent(messages, tools=available_tools or None, big=False, bot_id=target_id)
+                        step_txt = (msg.get('content') or '').strip()
+                        if step_txt and (not cur_accumulated or (step_txt != cur_accumulated[-1] and step_txt not in cur_accumulated[-1])):
+                            cur_accumulated.append(step_txt)
                         calls = msg.get('tool_calls') or []
                         if not calls:
                             break
                         messages.append(msg)
-                        for c in calls[:6]:
+                        for c in calls[:4]:
                             try:
                                 args = json.loads(c['function']['arguments'])
                             except (ValueError, KeyError):
@@ -1603,11 +2188,18 @@ class Brain:
                             result = await self.harness.execute(name, args) if name in allowed else {'error':'此助手未启用该工具'}
                             trace.append({'tool':name, 'arguments':args, 'result':result, 'duration_ms':round((asyncio.get_running_loop().time()-started)*1000)})
                             messages.append({'role':'tool', 'tool_call_id':c['id'], 'content':json.dumps(result, ensure_ascii=False)})
-                    text = (msg.get('content') or '').strip()
+                        if all(c['function']['name'] == 'present_choices' for c in calls[:4]) and cur_accumulated:
+                            break
+                    choice_prompt = (self.choices_prompt_var.get() or '').strip()
+                    if choice_prompt and all(choice_prompt not in p for p in cur_accumulated):
+                        cur_accumulated.append(choice_prompt)
+                    text = '\n\n'.join(cur_accumulated).strip()
                     if not text and trace:
-                        summary = await self.complete(
+                        summary = await self.llm.complete_silent(
                             messages + [{'role':'user', 'content':'请基于以上探索结果，直接用自然亲切的语气对主人说一句主动搭话并带一个有趣的小问题，不要再调用工具。'}],
-                            tools=None
+                            tools=None,
+                            big=False,
+                            bot_id=target_id,
                         )
                         text = (summary.get('content') or '').strip()
                     text = text or '主人这会儿在忙什么呢？有什么好玩的事跟余聊聊吗？'
@@ -1631,21 +2223,39 @@ class Brain:
                     })
                 return emitted
             finally:
-                self.live_stream = None
+                self._clear_bot_stream(target_id)
+                self.choices_var.reset(cur_choices_token)
+                self.choices_prompt_var.reset(cur_choices_prompt_token)
+                self.stream_prefix_var.reset(cur_prefix_token)
+                self.turn_id_var.reset(cur_turn_token)
                 self.room_context.reset(room_marker)
                 self.bot_context.reset(marker)
-                self.activity = self.ready_state()
+                self.activity = 'thinking' if self.executions_by_bot else self.ready_state()
 
     def ready_state(self):
         has_key = bool(self.store.config.effective_api_key(big=False) or self.store.config.effective_api_key(big=True))
         has_model = bool(self.store.config.effective_model(big=False) or self.store.config.effective_model(big=True))
         return 'curiosity_idle' if (has_key and has_model) else 'awaiting_config'
 
-    async def enqueue_chat(self, text: str, bot_id: str = 'companion', mode: str = 'auto') -> dict:
+    async def enqueue_chat(self, text: str, bot_id: str = 'companion', mode: str = 'auto', client_msg_id: str | None = None) -> dict:
+        if client_msg_id:
+            now_ts = time.time()
+            self._recent_client_msg_ids = {k: v for k, v in self._recent_client_msg_ids.items() if now_ts - v < 120.0}
+            if client_msg_id in self._recent_client_msg_ids:
+                return {
+                    'queued': True,
+                    'deduplicated': True,
+                    'recent_tail': self.store.state['messages'][-10:],
+                    'seq': self.stream_seq,
+                }
+            self._recent_client_msg_ids[client_msg_id] = now_ts
+
         bot = get_assistant(self.store, bot_id)
         turn_id = 'turn-' + secrets.token_hex(6)
         self.store.state['last_user'] = time.time()
         m = self.store.message('user', text, bot_id=bot_id)
+        if client_msg_id:
+            m['client_msg_id'] = client_msg_id
         self.stream_seq += 1
         m['seq'] = self.stream_seq
         m['turn_id'] = turn_id
@@ -1693,7 +2303,13 @@ class Brain:
             'seq': self.stream_seq,
         }
 
-    async def chat(self, text, bot_id='companion', mode='auto', pre_recorded_user_msg=None, turn_id=None):
+    async def chat(self, text, bot_id='companion', mode='auto', pre_recorded_user_msg=None, turn_id=None, client_msg_id: str | None = None):
+        if client_msg_id and pre_recorded_user_msg is None:
+            now_ts = time.time()
+            self._recent_client_msg_ids = {k: v for k, v in self._recent_client_msg_ids.items() if now_ts - v < 120.0}
+            if client_msg_id in self._recent_client_msg_ids:
+                return self.store.state['messages'][-1] if self.store.state['messages'] else {'text': ''}
+            self._recent_client_msg_ids[client_msg_id] = now_ts
         bot = get_assistant(self.store, bot_id)
         has_api = bool((self.store.config.effective_api_key(big=False) or self.store.config.effective_api_key(big=True)) and (self.store.config.effective_model(big=False) or self.store.config.effective_model(big=True)))
         if mode == 'execute' or (mode == 'auto' and bot.get('engine') == 'big' and not has_api):
@@ -1760,97 +2376,198 @@ class Brain:
                     else:
                         recent[-1]['content'] = enriched
 
-                # 100% static system prompt (NO per-second timestamp here!) so upstream LLM Prefix Cache hits 100% across turns & tool steps
+                # 100% static system prompt (messages[0]) so upstream LLM Prefix Cache hits 100% across turns & tool steps
                 system = (
-                    self.harness.system_instructions(self.context()) + '\n\n'
-                    '你的角色设定：' + self.persona() + '\n\n'
-                    '注意：请直接用自然、干脆的语言回复主人，并在需要时直接调用工具（如 phone_workspace 优先使用 ui_tree/tap_node/type_node 操作手机虚拟屏、send_message 给其它 Bot 发消息、manage_bot 创建或修改 Bot、list_models 查模型、read_file/write_file/run_bash 操作工作区）。'
+                    self.harness.static_system_instructions(self.memory_engine.build_static_pinned_block()) + '\n\n'
+                    '你的设定：' + self.persona(bot_id)
                 )
-                allowed = set(bot.get('tools') or [t['function']['name'] for t in TOOLS])
-                available_tools = [t for t in TOOLS if t['function']['name'] in allowed]
-                messages = [{'role':'system', 'content':system}, *recent]
+                all_schemas = self.harness.all_tools()
+                plugin_names = set(self.harness.extension_registry.tool_plugins.keys())
+                allowed = set(bot.get('tools') or [t['function']['name'] for t in all_schemas]) | plugin_names
+                available_tools = [t for t in all_schemas if t['function']['name'] in allowed]
+                ctx_snapshot = self.context()
+                if recent and recent[-1]['role'] == 'user' and isinstance(recent[-1].get('content'), str) and ctx_snapshot:
+                    recent[-1]['content'] = f"[记忆快照]\n{ctx_snapshot[:3000]}\n\n{recent[-1]['content']}"
+                messages = [{'role': 'system', 'content': system}, *recent]
                 trace = []
                 accumulated_texts: list[str] = []
+                final_turn_text: str = ''
                 parsed_meta: dict = {}
+                choices_reset_token = self.choices_var.set(None)
+                choices_prompt_token = self.choices_prompt_var.set('')
+                recent_call_sigs: list[str] = []
                 await self._set_stream(text='正在思考…', speaker_id=bot_id, speaker_name=bot['name'])
                 msg = {'content': '收到。'}
                 use_big = (bot.get('engine') == 'big')
                 for _ in range(40):
-                    self._prune_tool_loop_messages(messages)
-                    if self._estimate_messages_tokens(messages) >= self.AUTO_COMPACT_TOKENS:
-                        for old_m in messages[1:-4]:
-                            if old_m.get('role') == 'tool' and len(str(old_m.get('content') or '')) > 400:
-                                old_m['content'] = str(old_m['content'])[:280] + '\n...[已触发上下文自动压缩]...'
+                    # NEVER mutate already-sent messages in `messages` (preserves 100% Prefix Cache!)
                     msg = await self.complete(messages, tools=available_tools or None, big=use_big)
                     turn_content = (msg.get('content') or '').strip()
                     if turn_content:
                         clean_piece, piece_meta = self._extract_reply_piece(turn_content)
                         if piece_meta:
                             parsed_meta.update(piece_meta)
-                        piece_to_add = clean_piece or turn_content
-                        if not accumulated_texts or accumulated_texts[-1] != piece_to_add:
-                            accumulated_texts.append(piece_to_add)
-                        self.stream_prefix_var.set('\n\n'.join(accumulated_texts))
+                        piece_to_add = (clean_piece or turn_content).strip()
+                        if piece_to_add:
+                            if not accumulated_texts:
+                                accumulated_texts.append(piece_to_add)
+                            elif piece_to_add != accumulated_texts[-1] and piece_to_add not in accumulated_texts[-1]:
+                                if accumulated_texts[-1] in piece_to_add:
+                                    accumulated_texts[-1] = piece_to_add
+                                else:
+                                    accumulated_texts.append(piece_to_add)
+                            final_turn_text = '\n\n'.join(accumulated_texts)
+                            self.stream_prefix_var.set(final_turn_text)
                     calls = msg.get('tool_calls') or []
                     if not calls:
                         break
                     messages.append(msg)
-                    for c in calls[:24]:
-                        try:
-                            args = json.loads(c['function']['arguments'])
-                        except (ValueError, KeyError):
-                            args = {}
-                        name = c['function']['name']
-                        my_exec['tool'] = name
-                        self.execution = my_exec
-                        stream_txt = '\n\n'.join(accumulated_texts) if accumulated_texts else f'正在调用 {name}…'
-                        await self._set_stream(text=stream_txt, tool=name, speaker_id=bot_id, speaker_name=bot['name'], thought=self._summarize_streaming_tool(name, c['function'].get('arguments') or ''))
-                        await self.publish({'type':'execution', 'execution':my_exec})
-                        started = asyncio.get_running_loop().time()
-                        result = await self.harness.execute(name, args) if name in allowed else {'error':'此助手未启用该工具'}
-                        entry = {'tool':name, 'arguments':args, 'result':result, 'duration_ms':round((asyncio.get_running_loop().time()-started)*1000)}
-                        trace.append(entry)
-                        my_exec['trace'].append(entry)
-                        my_exec['tool'] = None
+                    batch_calls = calls[:24]
+                    # Check if we have multiple independent send_message or read-only calls that can run concurrently
+                    can_parallel = (
+                        len(batch_calls) > 1
+                        and all(c['function']['name'] in ('send_message', 'web_search', 'web_fetch', 'read_file', 'memory_search', 'conversation_search', 'ctx_search') for c in batch_calls)
+                    )
+                    if can_parallel:
+                        names = [c['function']['name'] for c in batch_calls]
+                        running_entries = []
+                        for c_item in batch_calls:
+                            try:
+                                c_args_init = json.loads(c_item['function']['arguments'])
+                            except (ValueError, KeyError):
+                                c_args_init = {}
+                            r_ent = compact_trace_list([{'tool': c_item['function']['name'], 'arguments': c_args_init, 'duration_ms': 0, 'status': 'running'}])[0]
+                            my_exec['trace'].append(r_ent)
+                            running_entries.append(r_ent)
+                        my_exec['tool'] = f"并行执行 ({', '.join(names[:3])})"
                         self.execution = my_exec
                         await self._set_stream(
-                            text='\n\n'.join(accumulated_texts) if accumulated_texts else '正在思考…',
-                            tool=None,
+                            text=final_turn_text or f"正在并行执行 {len(batch_calls)} 项任务…",
+                            tool=my_exec['tool'],
                             speaker_id=bot_id,
                             speaker_name=bot['name'],
-                            thought=f'已完成 {len(trace)} 步操作，正在继续思考与生成…'
                         )
-                        await self.publish({'type':'execution', 'execution':my_exec})
-                        messages.append({'role':'tool', 'tool_call_id':c['id'], 'content':json.dumps(result, ensure_ascii=False)})
+                        await self.publish({'type': 'execution', 'execution': my_exec})
+                        async def _run_one(c_item):
+                            try:
+                                c_args = json.loads(c_item['function']['arguments'])
+                            except (ValueError, KeyError):
+                                c_args = {}
+                            c_name = c_item['function']['name']
+                            t0 = asyncio.get_running_loop().time()
+                            res = await self.harness.execute(c_name, c_args) if c_name in allowed else {'error': '此助手未启用该工具'}
+                            dur = round((asyncio.get_running_loop().time() - t0) * 1000)
+                            return c_item, c_name, c_args, res, dur
+                        parallel_results = await asyncio.gather(*[_run_one(c_item) for c_item in batch_calls])
+                        for idx_p, (c_item, c_name, c_args, result, dur) in enumerate(parallel_results):
+                            entry = compact_trace_list([{'tool': c_name, 'arguments': c_args, 'result': result, 'duration_ms': dur, 'status': 'done'}])[0]
+                            trace.append(entry)
+                            if idx_p < len(running_entries):
+                                running_entries[idx_p].clear()
+                                running_entries[idx_p].update(entry)
+                            else:
+                                my_exec['trace'].append(entry)
+                            tool_content_str = self.context_search.maybe_offload_tool_output(
+                                c_name, c_args, result, bot_id=bot_id, turn_id=self.turn_id_var.get()
+                            )
+                            messages.append({'role': 'tool', 'tool_call_id': c_item['id'], 'content': tool_content_str})
+                        my_exec['tool'] = f'已执行 {len(trace)} 步'
+                        self.execution = my_exec
+                        await self._set_stream(
+                            text=final_turn_text or '正在思考…',
+                            tool=my_exec['tool'],
+                            speaker_id=bot_id,
+                            speaker_name=bot['name'],
+                            thought=f'已完成 {len(trace)} 步操作，正在继续…'
+                        )
+                        await self.publish({'type': 'execution', 'execution': my_exec})
+                    else:
+                        for c in batch_calls:
+                            try:
+                                args = json.loads(c['function']['arguments'])
+                            except (ValueError, KeyError):
+                                args = {}
+                            name = c['function']['name']
+                            sig = f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
+                            recent_call_sigs.append(sig)
+                            running_entry = compact_trace_list([{'tool': name, 'arguments': args, 'duration_ms': 0, 'status': 'running'}])[0]
+                            my_exec['trace'].append(running_entry)
+                            my_exec['tool'] = name
+                            self.execution = my_exec
+                            stream_txt = final_turn_text if final_turn_text else f'正在调用 {name}…'
+                            await self._set_stream(
+                                text=stream_txt,
+                                tool=name,
+                                speaker_id=bot_id,
+                                speaker_name=bot['name'],
+                                thought=self._summarize_streaming_tool(name, c['function'].get('arguments') or '')
+                            )
+                            await self.publish({'type': 'execution', 'execution': my_exec})
+                            started = asyncio.get_running_loop().time()
+                            if len(recent_call_sigs) >= 3 and recent_call_sigs[-1] == recent_call_sigs[-2] == recent_call_sigs[-3]:
+                                result = {'error': f'检测到连续 3 次重复调用相同工具与参数 ({name})，已自动拦截。请更换方法或直接基于已有信息回复。'}
+                            else:
+                                result = await self.harness.execute(name, args) if name in allowed else {'error': '此助手未启用该工具'}
+                            entry = compact_trace_list([{'tool': name, 'arguments': args, 'result': result, 'duration_ms': max(1, round((asyncio.get_running_loop().time() - started) * 1000)), 'status': 'done'}])[0]
+                            trace.append(entry)
+                            running_entry.clear()
+                            running_entry.update(entry)
+                            # Keep clean non-null step count between consecutive tool steps so client UI never renders a fake extra tool row!
+                            my_exec['tool'] = f'已执行 {len(trace)} 步'
+                            self.execution = my_exec
+                            await self._set_stream(
+                                text=final_turn_text if final_turn_text else '正在思考…',
+                                tool=my_exec['tool'],
+                                speaker_id=bot_id,
+                                speaker_name=bot['name'],
+                                thought=f'已完成 {len(trace)} 步操作，正在继续…'
+                            )
+                            await self.publish({'type': 'execution', 'execution': my_exec})
+                            # Offload >12K outputs into SQLite FTS5 BEFORE appending so `messages` stays immutable!
+                            tool_content_str = self.context_search.maybe_offload_tool_output(
+                                name, args, result, bot_id=bot_id, turn_id=self.turn_id_var.get()
+                            )
+                            messages.append({'role': 'tool', 'tool_call_id': c['id'], 'content': tool_content_str})
+                        # If this tool step only attached `present_choices` and we already have the assistant's reply text,
+                        # stop immediately so a second post-tool turn never overwrites or tacks on redundant text!
+                        if all(c['function']['name'] == 'present_choices' for c in batch_calls) and len(final_turn_text.strip()) >= 12:
+                            break
 
-                content_str = (msg.get('content') or '').strip()
-                if not content_str and trace:
-                    await self._set_stream(text='\n\n'.join(accumulated_texts) if accumulated_texts else '正在整理回复…', speaker_id=bot_id, speaker_name=bot['name'])
+                choice_prompt_str = (self.choices_prompt_var.get() or '').strip()
+                if choice_prompt_str and all(choice_prompt_str not in p for p in accumulated_texts):
+                    accumulated_texts.append(choice_prompt_str)
+                    final_turn_text = '\n\n'.join(accumulated_texts)
+                    self.stream_prefix_var.set(final_turn_text)
+
+                if not accumulated_texts and trace:
+                    await self._set_stream(text=final_turn_text or '正在整理回复…', speaker_id=bot_id, speaker_name=bot['name'])
                     final_msg = await self.complete(
-                        messages + [{'role':'user', 'content':'请基于以上工具执行结果，直接用自然、清晰的话回复主人，不要再调用工具。'}],
-                        tools=None
+                        messages + [{'role': 'user', 'content': '请基于以上工具执行结果，直接用自然、清晰的话回复主人，不要再调用工具。'}],
+                        tools=None,
+                        big=use_big,
                     )
                     content_str = (final_msg.get('content') or '').strip()
                     if content_str:
                         clean_piece, piece_meta = self._extract_reply_piece(content_str)
                         if piece_meta:
                             parsed_meta.update(piece_meta)
-                        piece_to_add = clean_piece or content_str
-                        if not accumulated_texts or accumulated_texts[-1] != piece_to_add:
+                        piece_to_add = (clean_piece or content_str).strip()
+                        if piece_to_add and (not accumulated_texts or accumulated_texts[-1] != piece_to_add):
                             accumulated_texts.append(piece_to_add)
-                        self.stream_prefix_var.set('\n\n'.join(accumulated_texts))
-                joined_reply = '\n\n'.join(accumulated_texts).strip()
+                        final_turn_text = '\n\n'.join(accumulated_texts)
+                        self.stream_prefix_var.set(final_turn_text)
+                joined_reply = '\n\n'.join(accumulated_texts).strip() or final_turn_text.strip()
                 if not joined_reply and trace:
                     last_tool = trace[-1]
                     joined_reply = f"已执行 `{last_tool['tool']}`，结果：{json.dumps(last_tool['result'], ensure_ascii=False)[:400]}"
                 data = dict(parsed_meta)
-                data['reply'] = joined_reply or content_str or '收到，已处理完毕。'
+                data['reply'] = joined_reply or '收到，已处理完毕。'
                 for trait in data.get('traits', [])[:5]:
                     if isinstance(trait, str):
                         self.vault.append('profile/user_traits.md', f'- {now_iso()}（用户陈述）{trait}')
                 op = data.get('opportunity')
                 if isinstance(op, dict) and op.get('title') and op.get('goal'):
-                    op = {'title':str(op['title'])[:200], 'goal':str(op['goal'])[:3000], 'ready':op.get('ready') is True, 'done':False, 'created_at':time.time()}
+                    op = {'title': str(op['title'])[:200], 'goal': str(op['goal'])[:3000], 'ready': op.get('ready') is True, 'done': False, 'created_at': time.time()}
                     self.store.state['opportunities'].append(op)
                     self.vault.append('tasks/sniffed_opportunities.md', f'## {op["title"]}\n\n{op["goal"]}\n\n状态：' + ('上下文已对齐，可试做一步' if op['ready'] else '仍需追问'))
                 deadline = data.get('deadline')
@@ -1865,18 +2582,31 @@ class Brain:
                 self.store.save()
                 self.wake.set()
                 extra = {'trace': trace, 'from_bot_id': bot_id, 'from_bot_name': bot['name']} if trace else {'from_bot_id': bot_id, 'from_bot_name': bot['name']}
-                return await self.emit(reply_out, 'chat', engine='small_brain', track=False, **extra)
+                try:
+                    return await self.emit(reply_out, 'chat', engine='small_brain', track=False, **extra)
+                finally:
+                    self.choices_var.reset(choices_reset_token)
+                    self.choices_prompt_var.reset(choices_prompt_token)
             except asyncio.CancelledError:
-                return await self.emit('本次执行已停止。', 'stopped', track=False, trace=list(my_exec['trace']))
+                cur_turn = self.turn_id_var.get()
+                if cur_turn and cur_turn in self._stopped_turn_ids:
+                    # `stop_immediately()` already committed the partial message for this turn; do NOT emit a duplicate!
+                    return {'stopped': True}
+                partial = (final_turn_text or '\n\n'.join(accumulated_texts)).strip()
+                if partial:
+                    return await self.emit(
+                        partial,
+                        'chat',
+                        engine='small_brain',
+                        track=False,
+                        trace=list(my_exec['trace']),
+                        from_bot_id=bot_id,
+                        from_bot_name=bot['name'],
+                    )
+                return {'stopped': True}
             finally:
                 await self._auto_release_phone_if_used()
-                self.streams_by_bot.pop(bot_id, None)
-                self.executions_by_bot.pop(bot_id, None)
-                self.active_tasks_by_bot.pop(bot_id, None)
-                self.live_stream = next(iter(self.streams_by_bot.values()), None)
-                self.execution = next(iter(self.executions_by_bot.values()), None)
-                self.active_task = next(iter(self.active_tasks_by_bot.values()), None)
-                self.activity = 'thinking' if self.executions_by_bot else self.ready_state()
+                self._clear_bot_stream(bot_id)
                 self.stream_prefix_var.reset(prefix_token)
                 self.turn_id_var.reset(turn_token)
 
@@ -1898,8 +2628,13 @@ class Brain:
             turn_token = self.turn_id_var.set('turn-' + secrets.token_hex(6))
             prefix_token = self.stream_prefix_var.set('')
             self.activity = 'deep_research'
-            self.active_task = asyncio.current_task()
-            self.execution = {'bot_id':bot_id, 'goal':goal or '整理任务池', 'trace':[], 'tool':None, 'started_at':time.time()}
+            cur_task = asyncio.current_task()
+            self.active_task = cur_task
+            if cur_task:
+                self.active_tasks_by_bot[bot_id] = cur_task
+            my_exec = {'bot_id':bot_id, 'goal':goal or '整理任务池', 'trace':[], 'tool':None, 'started_at':time.time()}
+            self.executions_by_bot[bot_id] = my_exec
+            self.execution = my_exec
             try:
                 if record_user:
                     self.store.state['last_user'] = time.time()
@@ -1921,13 +2656,27 @@ class Brain:
                             self.stream_prefix_var.set(event['text'])
                             await self._set_stream(text=event['text'], speaker_id=bot_id, speaker_name=bot['name'])
                         elif event['type'] == 'tool_start':
-                            self.execution['tool'] = event['tool']
+                            my_exec['trace'].append({
+                                'tool': event['tool'],
+                                'arguments': event.get('arguments') or {},
+                                'duration_ms': 0,
+                                'status': 'running',
+                            })
+                            my_exec['tool'] = event['tool']
+                            self.execution = my_exec
                             await self._set_stream(text=self.stream_prefix_var.get() or f"正在调用 {event['tool']}…", tool=event['tool'], speaker_id=bot_id, speaker_name=bot['name'])
-                            await self.publish({'type':'execution', 'execution':self.execution})
+                            await self.publish({'type':'execution', 'execution':my_exec})
                         else:
-                            self.execution['trace'].append(event['entry'])
-                            self.execution['tool'] = None
-                            await self.publish({'type':'execution', 'execution':self.execution})
+                            entry_done = dict(event['entry'])
+                            entry_done['status'] = 'done'
+                            if my_exec['trace'] and my_exec['trace'][-1].get('status') == 'running' and my_exec['trace'][-1].get('tool') == entry_done.get('tool'):
+                                my_exec['trace'][-1] = entry_done
+                            else:
+                                my_exec['trace'].append(entry_done)
+                            my_exec['tool'] = f"正在分析 {entry_done.get('tool', '工具')} 结果…"
+                            self.execution = my_exec
+                            await self._set_stream(text=self.stream_prefix_var.get() or '正在思考…', tool=my_exec['tool'], speaker_id=bot_id, speaker_name=bot['name'])
+                            await self.publish({'type':'execution', 'execution':my_exec})
                     result = await self.harness.run(
                         goal,
                         lambda messages, tools=None: self.complete(messages, tools, big=True),
@@ -1956,15 +2705,15 @@ class Brain:
                 self.store.state['last_research'] = time.time()
                 self.store.save()
                 self.vault.log('完成一次任务执行：' + (goal or '本地任务池快照'))
-                return await self.emit(result['text'] + '\n\n这是你需要的吗？以后要我接着干吗？', 'result', trace=result['trace'], goal=goal or '整理任务池快照', from_bot_id=bot_id, from_bot_name=bot['name'])
+                return await self.emit(result['text'], 'chat', trace=result['trace'], goal=goal or '整理任务池快照', from_bot_id=bot_id, from_bot_name=bot['name'])
             except asyncio.CancelledError:
-                return await self.emit('本次执行已停止。已完成的文件修改会保留，可以在工具记录中检查。', 'stopped', track=False, trace=list(self.execution['trace']))
+                partial = (self.stream_prefix_var.get() or '').strip()
+                if partial:
+                    return await self.emit(partial, 'chat', track=False, trace=list(my_exec['trace']), from_bot_id=bot_id, from_bot_name=bot['name'])
+                return {'stopped': True}
             finally:
                 await self._auto_release_phone_if_used()
-                self.live_stream = None
-                self.execution = None
-                self.active_task = None
-                self.activity = self.ready_state()
+                self._clear_bot_stream(bot_id)
                 self.stream_prefix_var.reset(prefix_token)
                 self.turn_id_var.reset(turn_token)
 
@@ -2001,9 +2750,20 @@ class Brain:
         try:
             async with self.lock:
                 bot = get_assistant(self.store, target_id)
+                now_ts = time.time()
+                self._last_scheduled_fire_by_bot[target_id] = now_ts
+                # Prevent immediate curiosity follow-up right after a scheduled reminder fires!
+                self.store.state['last_curiosity'] = now_ts
                 self.activity = 'deep_research'
-                self.active_task = asyncio.current_task()
-                self.execution = {'bot_id': target_id, 'goal': goal[:200], 'trace': [], 'tool': None, 'started_at': time.time()}
+                cur_task = asyncio.current_task()
+                self.active_task = cur_task
+                if cur_task:
+                    self.active_tasks_by_bot[target_id] = cur_task
+                my_exec = {'bot_id': target_id, 'goal': goal[:200], 'trace': [], 'tool': None, 'started_at': now_ts}
+                self.executions_by_bot[target_id] = my_exec
+                self.execution = my_exec
+                sched_turn_token = self.turn_id_var.set('turn-' + secrets.token_hex(6))
+                sched_prefix_token = self.stream_prefix_var.set('')
                 try:
                     recent = []
                     for msg_item in self.store.state['messages']:
@@ -2014,13 +2774,13 @@ class Brain:
                             recent.append({'role': msg_item['role'], 'content': txt[:1500]})
                     recent = recent[-24:]
                     system = (
-                        self.harness.system_instructions(self.context()) + '\n\n'
-                        '当前北京时间：' + self._fmt_bj(time.time()) + ' (' + now_iso() + ')\n'
-                        '你的角色设定：' + self.persona() + '\n\n'
-                        f'【⏰ 云端{label}准点触发】\n'
-                        '请按以下定时任务目标直接执行（可按需调用 read_file 查阅 memory_vault、web_search、notify_user 等工具），然后用自然、简练的话直接向主人汇报结果。不要在结尾加“这是你需要的吗？以后要我接着干吗？”等机械套话。'
+                        self.harness.static_system_instructions(self.memory_engine.build_static_pinned_block()) + '\n\n'
+                        '你的设定：' + self.persona(target_id) + '\n\n'
+                        '当前时间：' + self._fmt_bj(time.time()) + ' (' + now_iso() + ')\n'
+                        f'[{label}触发]：请按任务目标直接执行，并直接输出一句给主人的提醒内容（不要调用 notify_user 或 schedule_task，你的回复本身就会直接作为提醒推送给主人，不要再附加“推送已发送”之类的自我汇报）。'
                     )
-                    allowed = set(bot.get('tools') or [t['function']['name'] for t in TOOLS])
+                    # Exclude notify_user and schedule_task from scheduled execution so the LLM never double-notifies or re-schedules the same reminder!
+                    allowed = (set(bot.get('tools') or [t['function']['name'] for t in TOOLS])) - {'notify_user', 'schedule_task'}
                     available_tools = [t for t in TOOLS if t['function']['name'] in allowed]
                     messages = [
                         {'role': 'system', 'content': system},
@@ -2029,20 +2789,18 @@ class Brain:
                     ]
                     trace = []
                     accumulated_texts: list[str] = []
-                    notified_explicitly = False
-                    sched_turn_token = self.turn_id_var.set('turn-' + secrets.token_hex(6))
-                    sched_prefix_token = self.stream_prefix_var.set('')
+                    final_turn_text: str = ''
                     await self._set_stream(text=f'⏰ 正在执行{label}…', speaker_id=target_id, speaker_name=bot['name'])
                     msg = {'content': ''}
                     use_big = (bot.get('engine') == 'big')
                     for _ in range(30):
-                        self._prune_tool_loop_messages(messages)
                         msg = await self.complete(messages, tools=available_tools or None, big=use_big)
                         turn_txt = (msg.get('content') or '').strip()
                         if turn_txt:
+                            final_turn_text = turn_txt
                             if not accumulated_texts or accumulated_texts[-1] != turn_txt:
                                 accumulated_texts.append(turn_txt)
-                            self.stream_prefix_var.set('\n\n'.join(accumulated_texts))
+                            self.stream_prefix_var.set(final_turn_text)
                         calls = msg.get('tool_calls') or []
                         if not calls:
                             break
@@ -2053,20 +2811,26 @@ class Brain:
                             except (ValueError, KeyError):
                                 args = {}
                             name = c['function']['name']
-                            if name == 'notify_user':
-                                notified_explicitly = True
-                            self.execution['tool'] = name
-                            await self._set_stream(text='\n\n'.join(accumulated_texts) if accumulated_texts else f'正在调用 {name}…', tool=name, speaker_id=target_id, speaker_name=bot['name'])
-                            await self.publish({'type': 'execution', 'execution': self.execution})
+                            running_entry = {'tool': name, 'arguments': args, 'duration_ms': 0, 'status': 'running'}
+                            my_exec['trace'].append(running_entry)
+                            my_exec['tool'] = name
+                            self.execution = my_exec
+                            await self._set_stream(text=final_turn_text or f'正在调用 {name}…', tool=name, speaker_id=target_id, speaker_name=bot['name'])
+                            await self.publish({'type': 'execution', 'execution': my_exec})
                             started = asyncio.get_running_loop().time()
                             result = await self.harness.execute(name, args) if name in allowed else {'error': '此助手未启用该工具'}
-                            entry = {'tool': name, 'arguments': args, 'result': result, 'duration_ms': round((asyncio.get_running_loop().time() - started) * 1000)}
+                            entry = {'tool': name, 'arguments': args, 'result': result, 'duration_ms': max(1, round((asyncio.get_running_loop().time() - started) * 1000)), 'status': 'done'}
                             trace.append(entry)
-                            self.execution['trace'].append(entry)
-                            self.execution['tool'] = None
-                            await self.publish({'type': 'execution', 'execution': self.execution})
-                            messages.append({'role': 'tool', 'tool_call_id': c['id'], 'content': json.dumps(result, ensure_ascii=False)})
-                    final_text = '\n\n'.join(accumulated_texts).strip() or (msg.get('content') or '').strip()
+                            running_entry.update(entry)
+                            my_exec['tool'] = f'正在分析 {name} 结果…'
+                            self.execution = my_exec
+                            await self._set_stream(text=final_turn_text or '正在思考…', tool=my_exec['tool'], speaker_id=target_id, speaker_name=bot['name'])
+                            await self.publish({'type': 'execution', 'execution': my_exec})
+                            tool_content_str = self.context_search.maybe_offload_tool_output(
+                                name, args, result, bot_id=target_id, turn_id=self.turn_id_var.get()
+                            )
+                            messages.append({'role': 'tool', 'tool_call_id': c['id'], 'content': tool_content_str})
+                    final_text = final_turn_text.strip() or '\n\n'.join(accumulated_texts).strip() or (msg.get('content') or '').strip()
                     if not final_text and trace:
                         sum_msg = await self.complete(
                             messages + [{'role': 'user', 'content': '请基于以上定时任务执行结果，直接用自然简练的话输出给主人的提醒内容，不要再调用工具。'}],
@@ -2074,16 +2838,16 @@ class Brain:
                         )
                         sum_txt = (sum_msg.get('content') or '').strip()
                         if sum_txt:
-                            accumulated_texts.append(sum_txt)
-                        final_text = '\n\n'.join(accumulated_texts).strip()
+                            final_text = sum_txt
                     final_text = final_text or f'⏰ {goal}'
                     self.vault.log(f'完成{label}：{goal[:120]}')
+                    self.store.state['last_curiosity'] = time.time()
                     self.store.save()
                     emitted = await self.emit(
-                        final_text, 'curiosity', track=True,
+                        final_text, 'curiosity', track=False,
                         trace=trace, goal=goal, from_bot_id=target_id, from_bot_name=bot['name']
                     )
-                    if not notified_explicitly and bot.get('notify', True):
+                    if bot.get('notify', True):
                         await self.publish({
                             'type': 'user_notification',
                             'id': emitted['id'],
@@ -2096,10 +2860,7 @@ class Brain:
                     return emitted
                 finally:
                     await self._auto_release_phone_if_used()
-                    self.live_stream = None
-                    self.execution = None
-                    self.active_task = None
-                    self.activity = self.ready_state()
+                    self._clear_bot_stream(target_id)
                     try:
                         self.stream_prefix_var.reset(sched_prefix_token)
                         self.turn_id_var.reset(sched_turn_token)
@@ -2109,59 +2870,55 @@ class Brain:
             self.room_context.reset(room_marker)
             self.bot_context.reset(marker)
 
+    async def edit_and_rerun(self, message_id: str, new_text: str, bot_id: str = 'companion') -> dict:
+        """Edit an existing user message in `bot_id` room, archive/remove subsequent messages in that room, and re-run."""
+        new_text = (new_text or '').strip()
+        if not new_text:
+            raise ValueError('新消息内容不能为空')
+        msgs = self.store.state.get('messages', [])
+        target_idx = -1
+        for idx, m in enumerate(msgs):
+            if m.get('id') == message_id and m.get('bot_id', 'companion') == bot_id:
+                target_idx = idx
+                break
+        if target_idx < 0:
+            raise ValueError('未找到该条消息')
+        # Index removed tail messages into FTS5 before trimming so nothing is ever lost
+        kept = []
+        for idx, m in enumerate(msgs):
+            if idx < target_idx or m.get('bot_id', 'companion') != bot_id:
+                kept.append(m)
+            else:
+                self.context_search.index_message(m)
+        self.store.state['messages'] = kept
+        self.store.save()
+        return await self.enqueue_chat(new_text, bot_id=bot_id)
+
+    async def reroll_last(self, bot_id: str = 'companion', message_id: str | None = None) -> dict:
+        """Re-generate the assistant reply for the last user message (or the user message preceding `message_id`)."""
+        msgs = self.store.state.get('messages', [])
+        room_indices = [i for i, m in enumerate(msgs) if m.get('bot_id', 'companion') == bot_id]
+        if not room_indices:
+            raise ValueError('当前房间暂无消息可重答')
+        last_user_idx = -1
+        for i in reversed(room_indices):
+            if msgs[i].get('role') == 'user':
+                last_user_idx = i
+                break
+        if last_user_idx < 0:
+            raise ValueError('未找到上一条用户消息')
+        user_text = str(msgs[last_user_idx].get('text') or '').strip()
+        return await self.edit_and_rerun(msgs[last_user_idx]['id'], user_text, bot_id=bot_id)
+
     def quiet(self):
-        h = datetime.now(TZ).hour
-        start, end = self.store.config.quiet_start_hour, self.store.config.quiet_end_hour
-        return (start <= h < end) if start < end else (h >= start or h < end) if start != end else False
+        return self.scheduler_engine.is_quiet_hour()
 
     async def _sleep_time_consolidate(self):
-        """Letta & A-MEM inspired Sleep-Time Compute: silently consolidate recent conversation facts into Zettelkasten atomic notes during user idle periods."""
-        s = self.store.state
-        last_consolidated = float(s.get('last_sleep_consolidate', 0.0))
-        last_user = float(s.get('last_user', 0.0))
-        if last_user <= last_consolidated or (time.time() - last_user) < 1200:
-            return
-        new_msgs = [
-            m for m in s.get('messages', [])
-            if float(m.get('created_at', 0)) > last_consolidated and m.get('role') in ('user', 'assistant') and m.get('kind') not in ('curiosity', 'error', 'compact_summary')
-        ]
-        s['last_sleep_consolidate'] = time.time()
-        self.store.save()
-        if len(new_msgs) < 4:
-            return
+        """Silent background Sleep-Time Compute via MemoryEngine (never touches live_stream)."""
         async with self.lock:
-            try:
-                digest = '\n'.join(f"[{m.get('role')}]: {(m.get('text') or '')[:500]}" for m in new_msgs[-16:])
-                existing_traits = self.vault.read('profile/user_traits.md')[-1800:]
-                prompt = (
-                    '你是 Sleep-Time Compute 睡眠期记忆整理器（参考 Letta / A-MEM Zettelkasten 原子记忆理论）。\n'
-                    '请检查以下最近对话是否有值得长期记住的【新事实、用户偏好变更、重要决定、项目/课程进展】。\n'
-                    '如果没有任何新的长期价值信息，严格只输出 `NONE`。\n'
-                    '如果有，请严格输出 JSON 对象：{"new_traits": ["一句话新画像事实（若无则空数组）"], "note_slug": "英文短文件名如 project-update", "note_title": "卡片标题", "note_markdown": "包含 # 标题、关键事实列表与 [[关联双链]] 的精简原子卡片正文（不超过300字）"}\n\n'
-                    f'【已有画像尾部（勿重复）】\n{existing_traits}\n\n【近期新增对话】\n{digest}'
-                )
-                res_msg = await self.complete([{'role': 'user', 'content': prompt}], tools=None, big=False)
-                raw = (res_msg.get('content') or '').strip()
-                if not raw or raw.upper() == 'NONE':
-                    return
-                m_json = re.search(r'\{.*\}', raw, flags=re.DOTALL)
-                if not m_json:
-                    return
-                data = json.loads(m_json.group(0))
-                changed = False
-                for tr in (data.get('new_traits') or [])[:3]:
-                    if isinstance(tr, str) and tr.strip() and tr.strip() not in existing_traits:
-                        self.vault.append('profile/user_traits.md', f'- {now_iso()}（睡眠整理）{tr.strip()}')
-                        changed = True
-                slug = re.sub(r'[^a-zA-Z0-9_-]', '', str(data.get('note_slug') or ''))[:40].lower()
-                md_body = str(data.get('note_markdown') or '').strip()
-                if slug and md_body:
-                    self.vault.write(f'notes/{slug}.md', md_body + f'\n\n> 更新时间：{now_iso()}\n')
-                    changed = True
-                if changed:
-                    self.vault.reindex()
-            except Exception:
-                pass
+            await self.memory_engine.sleep_time_consolidate(
+                silent_complete_fn=lambda msgs: self.llm.complete_silent(msgs, tools=None, big=False)
+            )
 
     async def scheduler(self):
         while True:
@@ -2212,15 +2969,19 @@ class Brain:
                     if not is_clock_routine and self.quiet():
                         continue
                     if now >= float(r['next_run']):
+                        r_bot = r.get('bot_id', 'companion')
                         r['last_run'] = now
                         r['next_run'] = self._compute_next_routine_run(r, now + 2)
                         r['next_run_bj'] = self._fmt_bj(r['next_run'])
                         self.store.save()
+                        # Skip duplicate fire if a one-shot timer already fired for the same bot in the last 55s
+                        if now - self._last_scheduled_fire_by_bot.get(r_bot, 0.0) < 55.0:
+                            break
                         if has_api:
                             if is_clock_routine:
-                                await self.run_scheduled(r['goal'], bot_id=r.get('bot_id', 'companion'), label=f"定点例行 ({r['daily_time']})")
+                                await self.run_scheduled(r['goal'], bot_id=r_bot, label=f"定点例行 ({r['daily_time']})")
                             else:
-                                await self.research(r['goal'], bot_id=r.get('bot_id', 'companion'))
+                                await self.research(r['goal'], bot_id=r_bot)
                         break
                 # 3. Sleep-Time Compute memory consolidation when user has been idle >= 20 min
                 if has_api and not self.lock.locked() and (now - s.get('last_user', 0)) >= 1200 and s.get('last_user', 0) > s.get('last_sleep_consolidate', 0):

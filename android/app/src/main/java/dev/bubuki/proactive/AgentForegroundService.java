@@ -3,6 +3,10 @@ package dev.bubuki.proactive;
 import android.app.*;
 import android.content.*;
 import android.content.pm.ServiceInfo;
+import android.media.AudioAttributes;
+import android.media.Ringtone;
+import android.media.RingtoneManager;
+import android.net.Uri;
 import android.os.*;
 import org.json.*;
 import java.util.*;
@@ -12,6 +16,8 @@ import okhttp3.*;
 public class AgentForegroundService extends Service {
     static volatile boolean connected=false;
     static volatile boolean running=false;
+    private static volatile Ringtone activeAlarmRingtone=null;
+    private static volatile Vibrator activeVibrator=null;
     private final Handler handler=new Handler(Looper.getMainLooper());
     private final ExecutorService io=Executors.newSingleThreadExecutor();
     private final ExecutorService cmdPool=Executors.newCachedThreadPool();
@@ -25,11 +31,36 @@ public class AgentForegroundService extends Service {
     private final Set<String> notified=new HashSet<>();
     private final Set<String> nonces=new HashSet<>();
     private long snoozeUntil=0;
+    private final Runnable autoStopAlarmRunnable=()->stopEmergencyAlarm(this);
+
+    static synchronized void stopEmergencyAlarm(Context ctx){
+        try{
+            if(activeAlarmRingtone!=null){
+                if(activeAlarmRingtone.isPlaying()) activeAlarmRingtone.stop();
+                activeAlarmRingtone=null;
+            }
+        }catch(Exception ignored){}
+        try{
+            if(activeVibrator!=null){
+                activeVibrator.cancel();
+                activeVibrator=null;
+            }
+        }catch(Exception ignored){}
+        if(ctx!=null){
+            try{
+                ctx.getSystemService(NotificationManager.class).cancel(99119);
+            }catch(Exception ignored){}
+        }
+    }
+
     @Override public void onCreate(){
         super.onCreate();running=true;overlay=new OverlayController(this);
         NotificationManager nm=getSystemService(NotificationManager.class);
         nm.createNotificationChannel(new NotificationChannel("pulse_connection","云端连接",NotificationManager.IMPORTANCE_LOW));
         nm.createNotificationChannel(new NotificationChannel("pulse_nudges","好奇心与催单",NotificationManager.IMPORTANCE_HIGH));
+        NotificationChannel alarmChan=new NotificationChannel("pulse_emergency_alarm","紧急闹钟提醒",NotificationManager.IMPORTANCE_HIGH);
+        alarmChan.enableVibration(true);
+        nm.createNotificationChannel(alarmChan);
         Intent open=new Intent(this,NativePulseActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK|Intent.FLAG_ACTIVITY_SINGLE_TOP);
         Notification notification=new Notification.Builder(this,"pulse_connection").setSmallIcon(R.drawable.ic_launcher)
             .setContentTitle("共生 · 轻声等候").setContentText("加密连接日本节点 · 平时没有悬浮球")
@@ -50,7 +81,7 @@ public class AgentForegroundService extends Service {
         io.execute(()->{try{
             JSONObject settings=SecurePrefs.read(this);
             if(!settings.optBoolean("background",true)){handler.post(this::stopSelf);return;}
-            SecureTransport.Session s=new SecureTransport(this).session(new JSONObject());
+            SecureTransport.Session s=new SecureTransport(this).session(new JSONObject(), true);
             sessionKey=s.key;nonces.clear();
             OkHttpClient client=SecureTransport.HTTP.newBuilder().pingInterval(30,TimeUnit.SECONDS).readTimeout(0,TimeUnit.SECONDS).build();
             String url=s.base.replaceFirst("^http","ws")+"/ws/client";
@@ -77,13 +108,31 @@ public class AgentForegroundService extends Service {
         try{NativePulseModel.dispatchRealtimeEvent(event);}catch(Exception ignored){}
         String type=event.optString("type");
         if(type.equals("connected")){connected=true;retrySeconds=2;snoozeUntil=event.optLong("snooze_until")*1000;}
-        if(type.equals("snooze")){snoozeUntil=event.optLong("until")*1000;pendingOverlay=null;overlay.hide();for(String id:notified)getSystemService(NotificationManager.class).cancel(id.hashCode());}
+        if(type.equals("snooze")){
+            snoozeUntil=event.optLong("until")*1000;pendingOverlay=null;overlay.hide();
+            stopEmergencyAlarm(this);
+            for(String id:notified)getSystemService(NotificationManager.class).cancel(id.hashCode());
+        }
         if(type.equals("ack")){
             JSONArray ids=event.optJSONArray("ids");
             if(ids!=null)for(int i=0;i<ids.length();i++){
                 String id=ids.optString(i);getSystemService(NotificationManager.class).cancel(id.hashCode());
                 if(pendingOverlay!=null&&id.equals(pendingOverlay.optString("id"))){pendingOverlay=null;overlay.hide();}
             }
+        }
+        if(type.equals("emergency_alarm")){
+            String action=event.optString("action","ring");
+            if("stop".equals(action)){
+                handler.removeCallbacks(autoStopAlarmRunnable);
+                stopEmergencyAlarm(this);
+            }else if(System.currentTimeMillis()>=snoozeUntil){
+                String title=event.optString("title","🚨 紧急闹钟提醒");
+                String body=event.optString("body","检测到十万火急事项，请立即查看！");
+                String botId=event.optString("bot_id","companion");
+                int durSec=Math.max(5,Math.min(30,event.optInt("duration_sec",15)));
+                startEmergencyAlarm(title,body,botId,durSec);
+            }
+            return;
         }
         if(type.equals("phone_workspace_command")){
             String reqId=event.optString("request_id","");
@@ -101,7 +150,7 @@ public class AgentForegroundService extends Service {
                     }else{
                         JSONObject input=new JSONObject(cmdArgs.toString());
                         input.put("op",op);
-                        if(Arrays.asList("capture","ui_tree","dump","tap","tap_node","swipe","text","type_node","key","launch").contains(op)){
+                        if(Arrays.asList("capture","ui_tree","dump","tap","tap_node","tap_and_type","batch","swipe","text","type_node","key","launch").contains(op)){
                             JSONObject st=RootPhoneHarness.status(this);
                             if(!st.optBoolean("root")){
                                 RootPhoneHarness.command(this,new JSONObject().put("op","connect"));
@@ -119,31 +168,42 @@ public class AgentForegroundService extends Service {
                             if(nc<3||"com.tencent.mm".equals(pkg)){
                                 try{
                                     JSONObject snap=RootPhoneHarness.command(this,new JSONObject().put("op","preview").put("since",-1));
-                                    if(snap.has("image"))res.put("image",snap.getString("image")).put("width",snap.optInt("width",1080)).put("height",snap.optInt("height",2400));
+                                    if(snap.has("image"))res.put("image",snap.getString("image")).put("width",snap.optInt("width",540)).put("height",snap.optInt("height",1200));
                                 }catch(Exception ignored){}
                             }
                         }
-                        if(Arrays.asList("launch","tap","tap_node","swipe","text","type_node","key").contains(op)){
+                        if(Arrays.asList("launch","tap","tap_node","tap_and_type","batch","swipe","text","type_node","key").contains(op)){
                             Thread.sleep(op.equals("launch") ? 750 : 420);
+                            int ncAfter=0;
                             try{
                                 JSONObject tree=RootPhoneHarness.command(this,new JSONObject().put("op","ui_tree").put("refresh",true));
-                                if(tree.has("summary"))res.put("ui_tree",tree.getString("summary")).put("node_count",tree.optInt("nodeCount",0)).put("package",tree.optString("package",""));
+                                ncAfter=tree.optInt("nodeCount",0);
+                                if(tree.has("summary"))res.put("ui_tree",tree.getString("summary")).put("node_count",ncAfter).put("package",tree.optString("package",""));
                             }catch(Exception ignored){}
-                            try{
-                                JSONObject snap=RootPhoneHarness.command(this,new JSONObject().put("op","preview").put("since",-1));
-                                if(snap.has("image"))res.put("image",snap.getString("image")).put("width",snap.optInt("width",1080)).put("height",snap.optInt("height",2400));
-                            }catch(Exception ignored){}
+                            if(ncAfter<3){
+                                try{
+                                    JSONObject snap=RootPhoneHarness.command(this,new JSONObject().put("op","preview").put("since",-1));
+                                    if(snap.has("image"))res.put("image",snap.getString("image")).put("width",snap.optInt("width",540)).put("height",snap.optInt("height",1200));
+                                }catch(Exception ignored){}
+                            }
                         }
                     }
                 }catch(Exception e){
                     try{res.put("error",MainActivity.safeError(e));}catch(Exception ignored){}
                 }
+                boolean sentViaWs=false;
+                JSONObject reply=new JSONObject();
                 try{
+                    reply.put("type","phone_workspace_result").put("request_id",reqId).put("result",res);
                     if(socket!=null&&sessionKey!=null){
-                        JSONObject reply=new JSONObject().put("type","phone_workspace_result").put("request_id",reqId).put("result",res);
-                        socket.send(SecureTransport.encrypt(sessionKey,reply).toString());
+                        sentViaWs=socket.send(SecureTransport.encrypt(sessionKey,reply).toString());
                     }
                 }catch(Exception ignored){}
+                if(!sentViaWs){
+                    try{
+                        new SecureTransport(this).request("POST","/api/phone/result",reply,null);
+                    }catch(Exception ignored){}
+                }
             });
             return;
         }
@@ -168,6 +228,53 @@ public class AgentForegroundService extends Service {
         }
         broadcast();
     }
+
+    private void startEmergencyAlarm(String title,String body,String botId,int durSec){
+        stopEmergencyAlarm(this);
+        try{
+            Uri alarmUri=RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM);
+            if(alarmUri==null) alarmUri=RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE);
+            if(alarmUri==null) alarmUri=RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION);
+            if(alarmUri!=null){
+                Ringtone r=RingtoneManager.getRingtone(getApplicationContext(),alarmUri);
+                if(r!=null){
+                    r.setAudioAttributes(new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ALARM)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build());
+                    if(Build.VERSION.SDK_INT>=28) r.setLooping(true);
+                    r.play();
+                    activeAlarmRingtone=r;
+                }
+            }
+        }catch(Exception ignored){}
+        try{
+            Vibrator vib=getSystemService(Vibrator.class);
+            if(vib!=null && vib.hasVibrator()){
+                long[] pattern=new long[]{0,500,300,500,300,600};
+                vib.vibrate(VibrationEffect.createWaveform(pattern,0));
+                activeVibrator=vib;
+            }
+        }catch(Exception ignored){}
+        handler.removeCallbacks(autoStopAlarmRunnable);
+        handler.postDelayed(autoStopAlarmRunnable,durSec*1000L);
+
+        Intent open=new Intent(this,NativePulseActivity.class).setFlags(Intent.FLAG_ACTIVITY_NEW_TASK|Intent.FLAG_ACTIVITY_SINGLE_TOP).putExtra("openBot",botId);
+        PendingIntent tap=PendingIntent.getActivity(this,99119,open,PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
+        Notification n=new Notification.Builder(this,"pulse_emergency_alarm")
+            .setSmallIcon(R.drawable.ic_launcher)
+            .setContentTitle(title)
+            .setContentText(body)
+            .setStyle(new Notification.BigTextStyle().bigText(body))
+            .setContentIntent(tap)
+            .setCategory(Notification.CATEGORY_ALARM)
+            .setOngoing(true)
+            .addAction(new Notification.Action.Builder(null,"关闭闹钟",AgentActionReceiver.pending(this,"stop_alarm","alarm")).build())
+            .addAction(new Notification.Action.Builder(null,"免打扰 1 小时",AgentActionReceiver.pending(this,"snooze","alarm")).build())
+            .build();
+        try{getSystemService(NotificationManager.class).notify(99119,n);}catch(SecurityException ignored){}
+    }
+
     private void tryShowOverlay(){
         if(pendingOverlay==null||System.currentTimeMillis()<snoozeUntil)return;
         PowerManager pm=getSystemService(PowerManager.class);KeyguardManager km=getSystemService(KeyguardManager.class);
@@ -184,6 +291,6 @@ public class AgentForegroundService extends Service {
         try{getSystemService(NotificationManager.class).notify(id.hashCode(),n);}catch(SecurityException ignored){}
     }
     private void broadcast(){sendBroadcast(new Intent(getPackageName()+".UPDATE").setPackage(getPackageName()));}
-    @Override public void onDestroy(){stopped=true;running=false;connected=false;handler.removeCallbacksAndMessages(null);if(socket!=null)socket.close(1000,"stopped by user");overlay.hide();if(screen!=null)unregisterReceiver(screen);io.shutdownNow();cmdPool.shutdownNow();super.onDestroy();}
+    @Override public void onDestroy(){stopped=true;running=false;connected=false;stopEmergencyAlarm(this);handler.removeCallbacksAndMessages(null);if(socket!=null)socket.close(1000,"stopped by user");overlay.hide();if(screen!=null)unregisterReceiver(screen);io.shutdownNow();cmdPool.shutdownNow();super.onDestroy();}
     @Override public IBinder onBind(Intent i){return null;}
 }

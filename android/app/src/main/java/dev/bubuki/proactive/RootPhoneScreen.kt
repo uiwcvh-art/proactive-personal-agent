@@ -99,22 +99,59 @@ import kotlin.math.min
                 if (error.isNotBlank() || state.error.isNotBlank()) Text(error.ifBlank { state.error }, color = MaterialTheme.colorScheme.error, fontSize = 12.sp, lineHeight = 20.sp)
                 if (created) {
                     val frame = remember(state.imageInfo, state.display) { runCatching { JSONObject(state.imageInfo.ifBlank { state.display }) }.getOrDefault(JSONObject()) }; val width = frame.optInt("width", display.optInt("width", 1080)).coerceAtLeast(1); val height = frame.optInt("height", display.optInt("height", 2400)).coerceAtLeast(1)
+                    val curTier = display.optString("tier", FloatingVirtualDisplay.currentTier().rpcName)
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text("自适应分辨率档位 · ${width}×${height}", Modifier.weight(1f), color = colors.ink2, fontSize = 11.sp)
+                        listOf("compact" to "紧凑 S", "balanced" to "标准 M", "large" to "大屏 L").forEach { (tierKey, label) ->
+                            val selected = curTier == tierKey
+                            Box(
+                                Modifier
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(if (selected) colors.accent.copy(alpha = 0.22f) else colors.fill)
+                                    .border(1.dp, if (selected) colors.accent else colors.hair, RoundedCornerShape(10.dp))
+                                    .clickable(enabled = manual) {
+                                        act("resize", JSONObject().put("tier", tierKey))
+                                    }
+                                    .padding(horizontal = 10.dp, vertical = 5.dp)
+                            ) {
+                                Text(label, color = if (selected) colors.ink else colors.ink2, fontSize = 11.sp, fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal)
+                            }
+                        }
+                    }
                     BoxWithConstraints(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(colors.fill).border(1.dp, colors.hair, RoundedCornerShape(18.dp)).padding(12.dp), contentAlignment = Alignment.Center) {
-                        val h = min(440f, maxWidth.value * height / width).dp; val w = (h.value * width / height).dp
+                        val h = min(460f, maxWidth.value * height / width).dp; val w = (h.value * width / height).dp
                         val bitmap = image
                         if (bitmap == null) Text("打开一个应用后，画面会出现在这里。", Modifier.padding(32.dp), color = colors.ink2, fontSize = 12.sp)
                         else Image(bitmap, "独立工作区实时画面", Modifier.size(w, h).clip(RoundedCornerShape(9.dp)).pointerInput(manual, state.imageInfo) {
                             if (!manual) return@pointerInput
                             awaitEachGesture {
-                                val down = awaitFirstDown(requireUnconsumed = false); var end = down.position; var ended = false
-                                do { val event = awaitPointerEvent(); val pointer = event.changes.firstOrNull { it.id == down.id } ?: break; end = pointer.position; pointer.consume(); if (!pointer.pressed) { ended = true; break } } while (true)
-                                if (ended) {
-                                    fun x(value: Float) = (value / size.width * width).toInt().coerceIn(0, width - 1)
-                                    fun y(value: Float) = (value / size.height * height).toInt().coerceIn(0, height - 1)
-                                    val args = JSONObject().put("display_id", frame.optInt("displayId")).put("expected_rotation", frame.optInt("rotation"))
-                                    if (abs(end.x - down.position.x) + abs(end.y - down.position.y) < viewConfiguration.touchSlop) { args.put("x", x(end.x)).put("y", y(end.y)); act("tap", args) }
-                                    else { args.put("x1", x(down.position.x)).put("y1", y(down.position.y)).put("x2", x(end.x)).put("y2", y(end.y)); act("swipe", args) }
-                                }
+                                val down = awaitFirstDown(requireUnconsumed = false)
+                                fun x(value: Float) = (value / size.width.coerceAtLeast(1) * width).toInt().coerceIn(0, width - 1)
+                                fun y(value: Float) = (value / size.height.coerceAtLeast(1) * height).toInt().coerceIn(0, height - 1)
+                                RootPhoneHarness.sendLiveTouch(activity, "down", x(down.position.x), y(down.position.y))
+                                var end = down.position
+                                var lastMoveAt = android.os.SystemClock.uptimeMillis()
+                                var lastX = x(down.position.x)
+                                var lastY = y(down.position.y)
+                                do {
+                                    val event = awaitPointerEvent()
+                                    val pointer = event.changes.firstOrNull { it.id == down.id } ?: break
+                                    end = pointer.position
+                                    pointer.consume()
+                                    if (pointer.pressed) {
+                                        val now = android.os.SystemClock.uptimeMillis()
+                                        val tx = x(end.x)
+                                        val ty = y(end.y)
+                                        if (now - lastMoveAt >= 10L || abs(tx - lastX) + abs(ty - lastY) >= 2) {
+                                            lastMoveAt = now
+                                            lastX = tx
+                                            lastY = ty
+                                            RootPhoneHarness.sendLiveTouch(activity, "move", tx, ty)
+                                        }
+                                    }
+                                    if (!pointer.pressed) break
+                                } while (true)
+                                RootPhoneHarness.sendLiveTouch(activity, "up", x(end.x), y(end.y))
                             }
                         })
                     }

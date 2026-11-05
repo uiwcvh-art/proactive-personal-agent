@@ -32,15 +32,13 @@ def restrict_desktop(read_paths:list[Path], write_paths:list[Path]):
         try:check(libc.syscall(445,fd,1,ctypes.byref(Beneath(rights,parent)),0))
         finally:os.close(parent)
     read=(1<<0)|(1<<2)|(1<<3)
-    for path in ['/usr','/bin','/sbin','/lib','/lib64','/proc','/sys','/etc/fonts','/etc/ssl','/etc/ca-certificates','/etc/pki','/etc/alternatives','/etc/gtk-3.0','/etc/xdg','/var/cache/fontconfig']:
-        allow(path,read)
-    for path in ['/etc/ld.so.cache','/etc/ld.so.preload','/etc/nsswitch.conf','/etc/hosts','/etc/resolv.conf','/etc/passwd','/etc/group','/etc/localtime','/etc/timezone','/etc/machine-id','/etc/hostname','/etc/gai.conf','/etc/locale.alias']:
+    for path in ['/usr','/bin','/sbin','/lib','/lib64','/proc','/sys','/etc','/var/cache','/var/lib/apt','/var/lib/dpkg']:
         allow(path,read)
     for path in read_paths:allow(path,read)
     allow('/proc',read|(1<<1))
     for path in write_paths:allow(path,fs)
-    for path in ['/tmp','/var/tmp','/dev/pts']:allow(path,fs)
-    for path in ['/dev/null','/dev/zero','/dev/urandom','/dev/random','/dev/ptmx','/dev/tty']:
+    for path in ['/tmp','/var/tmp','/dev/pts','/dev/shm','/run']:allow(path,fs)
+    for path in ['/dev/null','/dev/zero','/dev/urandom','/dev/random','/dev/ptmx','/dev/tty','/dev/dri']:
         allow(path,(1<<1)|(1<<2))
     check(libc.prctl(38,1,0,0,0));check(libc.syscall(446,fd,0));os.close(fd)
 

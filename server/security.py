@@ -22,20 +22,31 @@ class CryptoBox:
         self.key = serialization.load_pem_private_key(path.read_bytes(), password=None)
         self.public_der = self.key.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
         self.seen = {}  # Reject replayed envelopes during a process lifetime.
+        self._session_keys: dict[str, tuple[bytes, float]] = {}  # Cache unwrapped AES session keys for 30 min
 
     def public(self): return {'public_key':b64(self.public_der), 'algorithm':'RSA-OAEP-SHA256+A256GCM'}
 
     def open(self, envelope):
         if len(envelope.get('data','')) > 6_000_000: raise ValueError('请求过大')
-        key = self.key.decrypt(unb64(envelope['key']), padding.OAEP(mgf=padding.MGF1(hashes.SHA256()),algorithm=hashes.SHA256(),label=None))
+        now = time.time()
+        enc_key_b64 = envelope['key']
+        cached = self._session_keys.get(enc_key_b64)
+        if cached and now - cached[1] < 1800:
+            key = cached[0]
+        else:
+            key = self.key.decrypt(unb64(enc_key_b64), padding.OAEP(mgf=padding.MGF1(hashes.SHA256()),algorithm=hashes.SHA256(),label=None))
+            if len(self._session_keys) > 256:
+                self._session_keys = {k: v for k, v in self._session_keys.items() if now - v[1] < 1800}
+            self._session_keys[enc_key_b64] = (key, now)
         nonce = unb64(envelope['nonce'])
         data = json.loads(AESGCM(key).decrypt(nonce, unb64(envelope['data']), None))
         stamp = data.get('timestamp', 0)
-        if abs(time.time()-stamp) > 300: raise ValueError('设备时钟偏差超过 5 分钟')
-        replay = envelope['key'] + envelope['nonce']
-        self.seen = {k:v for k,v in self.seen.items() if v > time.time()-300}
+        if abs(now - stamp) > 300: raise ValueError('设备时钟偏差超过 5 分钟')
+        replay = enc_key_b64[-32:] + ':' + envelope['nonce']
+        if len(self.seen) > 2000:
+            self.seen = {k:v for k,v in self.seen.items() if v > now - 300}
         if replay in self.seen: raise ValueError('重复请求')
-        self.seen[replay] = time.time()
+        self.seen[replay] = now
         return key, data
 
     @staticmethod

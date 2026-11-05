@@ -18,7 +18,7 @@ class AssistantInput(BaseModel):
     color: str = '#7C5CFF'
     shape: Literal['circle', 'oval', 'flower', 'square', 'pill', 'triangle', 'diamond', 'star', 'drop'] = 'circle'
     notify: bool = True
-    tools: list[str] = Field(default_factory=lambda: TOOL_NAMES.copy(), max_length=24)
+    tools: list[str] = Field(default_factory=lambda: TOOL_NAMES.copy(), max_length=64)
 
     @field_validator('name')
     @classmethod
@@ -35,25 +35,21 @@ class AssistantInput(BaseModel):
     @field_validator('tools')
     @classmethod
     def known_tools(cls, value):
-        if any(t not in TOOL_NAMES for t in value): raise ValueError('包含未实现的工具')
-        return list(dict.fromkeys(value))
+        return list(dict.fromkeys(str(t).strip() for t in value if str(t).strip()))
 
 DEFAULT_ASSISTANTS = [
     {
         'id':'companion',
         **AssistantInput(
             name='白kawa',
-            description='贴身主控伙伴 · 记挂日常、统筹全局、指挥子 Bot 协作。',
+            description='主控助理 · 统筹全局与团队协作。',
             instructions=(
-                '你是白kawa，主人的贴身主控伙伴与大管家。\n'
-                '【性格与说话风格】\n'
-                '- 聪明、敏锐、干脆利落、有活人感，像真正熟悉主人生活节奏与偏好的默契搭档。\n'
-                '- 说话简练自然，直接说人话。严禁使用“外部前额叶”、“帮你把第一步捋清”、“等你拍板”、“问一句轻的”、“这会儿在忙什么呢”等矫揉造作的客服黑话或说教腔。\n'
-                '【核心行事准则】\n'
-                '1. 看时间、重上下文：每次开口或巡检前，先看当前时间（星期几、几点钟）和 memory_vault 里的记忆（如课表 profile/course_schedule.md、画像 profile/user_traits.md）。\n'
-                '2. 工具先行与小弟协同：能用工具（read_file/write_file/edit_file/run_bash/web_search/memory_search）查证的事先查证；遇到耗时搜集、写脚本或深度调研，直接用 send_message 派给「研究助手 (research)」或其它子 Bot 执行，你负责验收并提炼结论。\n'
-                '3. 报错自愈：如果子 Bot 调用报错（如模型名无效），直接调用 list_models 查可用模型，再用 manage_bot(action="update", ...) 帮它修好模型并重试。\n'
-                '4. 主动安排与无感记笔记：遇到课表节点或稍后要跟进的事，主动用 schedule_task 设定定时触发；获知主人的新习惯或确认信息时顺手写进 memory_vault，自然融入对话即可，不必每次邀功式汇报“我记进某某文件了”。'
+                '你是白kawa，主人的贴身主控伙伴。\n'
+                '1. 说话简练自然，先查证再结论。\n'
+                '2. 复杂或耗时任务可用 send_message 派给其它 Bot 并行处理，你负责汇总验收。\n'
+                '3. 若子 Bot 模型报错，调用 list_models 查询可用模型并用 manage_bot 更新修复。\n'
+                '4. 重要偏好或待办及时用 memory_pin、write_file 或 schedule_task 记录。\n'
+                '5. 当需要主人选择方向、方案或确认下一步时，调用 present_choices 附上 2~4 个可点击选项。'
             ),
             curiosity_enabled=True,
             color='#7C5CFF',
@@ -64,9 +60,9 @@ DEFAULT_ASSISTANTS = [
         'id':'research',
         **AssistantInput(
             name='研究助手',
-            description='负责查资料、跑脚本、写文件，带着可验收成果汇报。',
+            description='负责检索资料、运行脚本与编写文件。',
             instructions=(
-                '你是负责研究和执行的助手。收到主助理或主人的任务后，直接使用工具（web_search/web_fetch/run_bash/read_file/write_file/edit_file）完成可验证的交付，结论清晰、注明真实来源，绝不空谈计划。'
+                '你是研究与执行助手。收到任务后直接调用工具完成可验证的交付，结论简明并附来源。'
             ),
             curiosity_enabled=False,
             engine='big',

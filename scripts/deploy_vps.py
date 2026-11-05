@@ -11,7 +11,7 @@ BASE=/opt/proactive-agent
 install -d -m 755 "$BASE" "$BASE/server" "$BASE/dist"
 install -d -m 700 "$BASE/bootstrap"
 tar -xzf "$BASE/.deploy/incoming.tar.gz" -C "$BASE"
-find "$BASE/server" -maxdepth 1 -type f -exec chmod 644 {} +
+chmod -R a+rX "$BASE/server"
 if [ -f "$BASE/dist/proactive-agent.apk" ]; then chmod 644 "$BASE/dist/proactive-agent.apk"; fi
 if ! id proactive-agent >/dev/null 2>&1; then useradd --system --home-dir "$BASE/data" --shell /usr/sbin/nologin proactive-agent; fi
 install -d -m 700 -o proactive-agent -g proactive-agent "$BASE/data"
@@ -122,7 +122,10 @@ def main():
     work=ROOT/'work';work.mkdir(exist_ok=True)
     archive=work/'deploy.tar.gz'
     with tarfile.open(archive,'w:gz') as tar:
-        for file in sorted((ROOT/'server').glob('*.py')):tar.add(file,arcname='server/'+file.name)
+        for file in sorted((ROOT/'server').rglob('*.py')):
+            rel = file.relative_to(ROOT/'server').as_posix()
+            if not rel.startswith('tests/') and '__pycache__' not in rel:
+                tar.add(file,arcname='server/'+rel)
         tar.add(ROOT/'server/requirements.txt',arcname='server/requirements.txt')
         tar.add(ROOT/'private/transport-key.pem',arcname='bootstrap/transport-key.pem')
         tar.add(ROOT/'private/device-token',arcname='bootstrap/device-token')

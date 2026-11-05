@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Literal
 import httpx
 from fastapi import FastAPI, Depends, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 from cryptography.exceptions import InvalidTag
@@ -12,7 +13,7 @@ from brain import Brain
 from escalation import Escalation
 from harness import Harness, TOOLS
 from security import CryptoBox
-from storage import Store
+from storage import Store, compact_trace_list
 from vault_manager import Vault, atomic_write
 from assistants import AssistantInput, AssistantPlacement, RoutineInput, RoutineUpdate, get_assistant, save_assistant, place_assistant
 from bot_identity import install_identity_routes
@@ -24,6 +25,9 @@ class ChatInput(BaseModel):
     bot_id:str|None=Field(None,max_length=40)
     mode:Literal['auto','chat','execute']='auto'
     async_ack:bool=False
+    client_msg_id:str|None=Field(None,max_length=80)
+class StopInput(BaseModel):
+    bot_id:str|None=Field(None,max_length=40)
 class VaultInput(BaseModel):
     path:str=Field(min_length=1,max_length=240)
     content:str=Field(max_length=512000)
@@ -50,6 +54,18 @@ class VisionInput(BaseModel):
 class ModelsInput(BaseModel):
     base_url:str|None=Field(None,max_length=500)
     api_key:str|None=Field(None,max_length=4096)
+class EditMessageInput(BaseModel):
+    message_id:str=Field(min_length=1,max_length=80)
+    text:str=Field(min_length=1,max_length=12000)
+    bot_id:str=Field('companion',max_length=40)
+class RerollInput(BaseModel):
+    bot_id:str=Field('companion',max_length=40)
+    message_id:str|None=Field(None,max_length=80)
+class PinInput(BaseModel):
+    action:Literal['add','remove','list']='list'
+    text:str|None=Field(None,max_length=500)
+    pin_id:str|None=Field(None,max_length=40)
+    category:str=Field('general',max_length=40)
 
 def create_app(data_dir=None, scheduler=True):
     root=Path(data_dir or os.getenv('AGENT_DATA_DIR',Path(__file__).parent/'data'))
@@ -72,21 +88,28 @@ def create_app(data_dir=None, scheduler=True):
     brain=Brain(store,vault,harness,publish,escalation)
     computer=ComputerCoordinator(store,brain,publish)
     brain.computer=computer
+    internal_client_holder:dict[str,httpx.AsyncClient]={}
+    desktop_status_cache:dict[str,Any]={'ts':0.0,'data':{'ready':False}}
 
     @asynccontextmanager
     async def lifespan(app):
+        internal_client_holder['client']=httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://local',timeout=httpx.Timeout(600.0,connect=30.0))
         task=asyncio.create_task(brain.scheduler()) if scheduler else None
         brain.activity=brain.ready_state()
         computer.ensure_monitor()
         try: yield
         finally:
+            ic=internal_client_holder.pop('client',None)
+            if ic:
+                with contextlib.suppress(Exception): await ic.aclose()
             await computer.close()
             if task:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError): await task
             store.save()
 
-    app=FastAPI(title='Pulse · Proactive Agent',version='2.6.2',lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
+    app=FastAPI(title='Pulse · Proactive Agent',version='2.7.0',lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
+    app.add_middleware(GZipMiddleware,minimum_size=500)
     app.state.store,app.state.vault,app.state.brain,app.state.escalation,app.state.crypto=store,vault,brain,escalation,crypto
     app.state.computer=computer
     phone_read_cache:dict[str,tuple[float,Any]]={}
@@ -109,7 +132,7 @@ def create_app(data_dir=None, scheduler=True):
         return response
 
     @app.get('/health')
-    async def health(): return {'status':'ok','service':'proactive-agent','version':'2.6.2'}
+    async def health(): return {'status':'ok','service':'proactive-agent','version':'2.7.0'}
 
     @app.get('/api/transport')
     async def transport(): return crypto.public()
@@ -123,27 +146,89 @@ def create_app(data_dir=None, scheduler=True):
             path=data['path']
             if not path.startswith('/api/') or path in ('/api/secure','/api/transport') or '?' in path or '#' in path:
                 raise ValueError('非法 API 路径')
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://local',timeout=httpx.Timeout(600.0,connect=30.0)) as client:
-                response=await client.request(data['method'],path,params=data.get('query'),json=data.get('body'),headers={'Authorization':'Bearer '+token})
+            ic=internal_client_holder.get('client')
+            if ic is not None:
+                response=await ic.request(data['method'],path,params=data.get('query'),json=data.get('body'),headers={'Authorization':'Bearer '+token})
+            else:
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://local',timeout=httpx.Timeout(600.0,connect=30.0)) as client:
+                    response=await client.request(data['method'],path,params=data.get('query'),json=data.get('body'),headers={'Authorization':'Bearer '+token})
             return crypto.seal(key,{'status':response.status_code,'body':response.json()})
         except (ValueError,KeyError,TypeError,InvalidTag): raise HTTPException(400,'加密请求无效、过期或重放')
 
+    async def _fast_desktop_status()->dict:
+        now_t=time.time()
+        if now_t-desktop_status_cache['ts']<1.8:
+            return dict(desktop_status_cache['data'])
+        try:
+            desktop=await asyncio.wait_for(computer.client.status(),timeout=0.35)
+            saved=store.state.get('computer_job',{})
+            if (desktop.get('job') or {}).get('id')==saved.get('id'):
+                desktop['bot_id']=saved.get('bot_id')
+            desktop_status_cache['ts']=now_t
+            desktop_status_cache['data']=desktop
+            return dict(desktop)
+        except Exception:
+            return dict(desktop_status_cache['data'])
+
+    def _slim_exec(ex:dict|None)->dict|None:
+        if not isinstance(ex,dict): return None
+        out=dict(ex)
+        if 'trace' in out:
+            out['trace']=compact_trace_list(out['trace'])
+        return out
+
     @app.get('/api/status',dependencies=[Depends(auth)])
-    async def status():
+    async def status(after_id:str|None=None):
         store.sync_from_workspace()
         s=store.state
-        desktop=await computer.client.status()
-        saved=s.get('computer_job',{})
-        if (desktop.get('job') or {}).get('id')==saved.get('id'):desktop['bot_id']=saved.get('bot_id')
+        desktop=await _fast_desktop_status()
         has_key=bool(store.config.effective_api_key(big=False) or store.config.effective_api_key(big=True))
         has_model=bool(store.config.effective_model(big=False) or store.config.effective_model(big=True))
         last_done=brain.last_completed_stream if (brain.last_completed_stream and time.time()-float(brain.last_completed_stream.get('completed_at') or 0)<15.0) else None
+        all_msgs=s['messages']
+        if after_id:
+            idx=next((i for i in range(len(all_msgs)-1,-1,-1) if all_msgs[i].get('id')==after_id),-1)
+            recent_tail=all_msgs[idx+1:] if idx>=0 else all_msgs[-3:]
+        else:
+            recent_tail=all_msgs[-3:]
+        slim_execs={k:_slim_exec(v) for k,v in (brain.executions_by_bot or {}).items() if v}
         return {'online':True,'activity':brain.activity,'enabled':store.config.enabled,'clients':len(clients),'snooze_until':s['snooze_until'],
                 'unread':len(s['pending']),'routine_count':len(s.get('routines',[])),'small_ready':bool(store.config.small_brain.api_key and store.config.small_brain.model) or (has_key and has_model),
                 'big_ready':bool(store.config.big_brain.api_key and store.config.big_brain.model) or (has_key and has_model),'last_error':s['last_error'],
-                'stage':max([p['stage'] for p in s['pending'].values()] or [0]),'execution':brain.execution,'stream':brain.live_stream,
-                'executions_by_bot':brain.executions_by_bot,'streams_by_bot':brain.streams_by_bot,
-                'last_completed_stream':last_done,'recent_tail':s['messages'][-10:],'seq':brain.stream_seq,'computer':desktop,'time':time.time()}
+                'stage':max([p['stage'] for p in s['pending'].values()] or [0]),'execution':_slim_exec(brain.execution),'stream':_slim_exec(brain.live_stream),
+                'executions_by_bot':slim_execs,'streams_by_bot':brain.streams_by_bot,
+                'context_by_bot':brain.memory_engine.get_all_bots_context_stats(),'auto_compact_tokens':store.config.auto_compact_tokens,
+                'last_completed_stream':last_done,'recent_tail':recent_tail,'seq':brain.stream_seq,'computer':desktop,'time':time.time()}
+
+    @app.get('/api/sync',dependencies=[Depends(auth)])
+    async def sync_delta(since_seq:int=0,bot_id:str|None=None):
+        store.sync_from_workspace()
+        s=store.state
+        desktop=await _fast_desktop_status()
+        has_key=bool(store.config.effective_api_key(big=False) or store.config.effective_api_key(big=True))
+        has_model=bool(store.config.effective_model(big=False) or store.config.effective_model(big=True))
+        last_done=brain.last_completed_stream if (brain.last_completed_stream and time.time()-float(brain.last_completed_stream.get('completed_at') or 0)<15.0) else None
+        all_msgs=s['messages']
+        if since_seq>0:
+            delta_msgs=[m for m in all_msgs if int(m.get('seq') or 0)>since_seq and (not bot_id or m.get('bot_id','companion')==bot_id)]
+        else:
+            delta_msgs=[m for m in all_msgs if not bot_id or m.get('bot_id','companion')==bot_id][-40:]
+        slim_execs={k:_slim_exec(v) for k,v in (brain.executions_by_bot or {}).items() if v}
+        return {
+            'online':True,'activity':brain.activity,'enabled':store.config.enabled,'snooze_until':s['snooze_until'],
+            'unread':len(s['pending']),'small_ready':has_key and has_model,'big_ready':has_key and has_model,
+            'last_error':s['last_error'],'execution':_slim_exec(brain.execution),'stream':_slim_exec(brain.live_stream),
+            'executions_by_bot':slim_execs,'streams_by_bot':brain.streams_by_bot,
+            'context_by_bot':brain.memory_engine.get_all_bots_context_stats(),'auto_compact_tokens':store.config.auto_compact_tokens,
+            'last_completed_stream':last_done,'delta_messages':delta_msgs,'recent_tail':all_msgs[-3:],
+            'bots':s['assistants'],'primary_bot_id':s['primary_bot_id'],
+            'seq':brain.stream_seq,'computer':desktop,'time':time.time()
+        }
+
+    @app.post('/api/phone/result',dependencies=[Depends(auth)])
+    async def phone_result_fallback(payload:dict[str,Any]):
+        brain.resolve_phone_command(payload)
+        return {'accepted':True}
 
     @app.post('/api/phone/command',dependencies=[Depends(auth)])
     async def phone_command(payload:dict[str,Any]):
@@ -205,14 +290,69 @@ def create_app(data_dir=None, scheduler=True):
             raise HTTPException(502,'请求 /models 失败：'+str(e)[:200])
 
     @app.get('/api/messages',dependencies=[Depends(auth)])
-    async def messages(bot_id:str|None=None):
+    async def messages(bot_id:str|None=None,after_id:str|None=None,limit:int=120):
         store.sync_from_workspace()
-        if bot_id is None: return {'messages':store.state['messages'],'pending':store.state['pending']}
-        try: get_assistant(store,bot_id)
-        except ValueError as e: raise HTTPException(404,str(e))
-        selected=[m for m in store.state['messages'] if m.get('bot_id','companion')==bot_id]
-        ids={m['id'] for m in selected}
-        return {'messages':selected,'pending':{k:v for k,v in store.state['pending'].items() if k in ids}}
+        cap=max(10,min(240,int(limit or 120)))
+        all_msgs=store.state['messages']
+        if bot_id is not None:
+            try: get_assistant(store,bot_id)
+            except ValueError as e: raise HTTPException(404,str(e))
+            all_msgs=[m for m in all_msgs if m.get('bot_id','companion')==bot_id]
+        is_delta=False
+        if after_id:
+            idx=next((i for i in range(len(all_msgs)-1,-1,-1) if all_msgs[i].get('id')==after_id),-1)
+            if idx>=0:
+                selected=all_msgs[idx+1:]
+                is_delta=True
+            else:
+                selected=all_msgs[-cap:]
+        else:
+            selected=all_msgs[-cap:]
+        if bot_id is None:
+            return {'messages':selected,'pending':store.state['pending'],'delta':is_delta}
+        ids={m['id'] for m in all_msgs}
+        return {'messages':selected,'pending':{k:v for k,v in store.state['pending'].items() if k in ids},'delta':is_delta}
+
+    @app.post('/api/messages/edit',dependencies=[Depends(auth)])
+    async def edit_message(data:EditMessageInput):
+        try: return await brain.edit_and_rerun(data.message_id,data.text,bot_id=data.bot_id)
+        except ValueError as e: raise HTTPException(400,str(e))
+
+    @app.post('/api/messages/reroll',dependencies=[Depends(auth)])
+    async def reroll_message(data:RerollInput):
+        try: return await brain.reroll_last(bot_id=data.bot_id,message_id=data.message_id)
+        except ValueError as e: raise HTTPException(400,str(e))
+
+    @app.get('/api/watchdogs',dependencies=[Depends(auth)])
+    async def list_watchdogs():
+        return await brain._tool_watchdog_task({'action':'list'})
+
+    @app.post('/api/watchdogs/{watchdog_id}/stop',dependencies=[Depends(auth)])
+    async def stop_watchdog(watchdog_id:str):
+        return await brain._tool_watchdog_task({'action':'stop','watchdog_id':watchdog_id})
+
+    @app.get('/api/memories/pins',dependencies=[Depends(auth)])
+    async def get_pins():
+        return {'pins':brain.memory_engine.list_pins()}
+
+    @app.post('/api/memories/pins',dependencies=[Depends(auth)])
+    async def manage_pins(data:PinInput):
+        return await brain._tool_memory_pin(data.model_dump())
+
+    @app.post('/api/context/compact',dependencies=[Depends(auth)])
+    async def compact_context(payload:dict[str,Any]|None=None):
+        body=payload or {}
+        target_bot=str(body.get('bot_id') or store.state.get('primary_bot_id') or 'companion').strip()
+        if body.get('auto_compact_tokens'):
+            try:
+                val=max(8000,min(1000000,int(body['auto_compact_tokens'])))
+                store.update_config({'auto_compact_tokens':val})
+            except Exception:
+                pass
+        res=await brain._auto_compact_if_needed(target_bot,force=True)
+        stats=brain.memory_engine.get_all_bots_context_stats()
+        await publish({'type':'context_compacted','bot_id':target_bot,'result':res,'context_by_bot':stats})
+        return {'compacted':bool(res),'result':res,'context':stats.get(target_bot),'context_by_bot':stats,'auto_compact_tokens':store.config.auto_compact_tokens}
 
     @app.get('/api/bots',dependencies=[Depends(auth)])
     async def bots():
@@ -264,9 +404,9 @@ def create_app(data_dir=None, scheduler=True):
         try: bot=get_assistant(store,bot_id)
         except ValueError as e: raise HTTPException(404,str(e))
         if data.async_ack:
-            return await brain.enqueue_chat(data.text.strip(),bot_id,data.mode)
+            return await brain.enqueue_chat(data.text.strip(),bot_id,data.mode,client_msg_id=data.client_msg_id)
         try:
-            res=await brain.chat(data.text.strip(),bot_id,data.mode)
+            res=await brain.chat(data.text.strip(),bot_id,data.mode,client_msg_id=data.client_msg_id)
             return {**(res if isinstance(res,dict) else {}),'recent_tail':store.state['messages'][-10:],'seq':brain.stream_seq}
         except Exception as e:
             err_msg=f'⚠️ [来自 {bot["name"]} ({bot_id}) 的报错]: {str(e)[:260]}'
@@ -310,17 +450,9 @@ def create_app(data_dir=None, scheduler=True):
         except ValueError as e: raise HTTPException(404,str(e))
 
     @app.post('/api/stop',dependencies=[Depends(auth)])
-    async def stop_execution():
-        stopped=False
-        for t in list(brain.active_tasks_by_bot.values()):
-            if t and not t.done():
-                t.cancel()
-                stopped=True
-        task=brain.active_task
-        if task and not task.done():
-            task.cancel()
-            stopped=True
-        return {'stopping':stopped}
+    async def stop_execution(data:StopInput|None=None):
+        bot_id=data.bot_id if data else None
+        return await brain.stop_immediately(bot_id=bot_id)
 
     @app.post('/api/ack',dependencies=[Depends(auth)])
     async def ack(data:AckInput):

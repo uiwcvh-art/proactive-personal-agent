@@ -56,6 +56,7 @@ class Config(BaseModel):
     overlay_after_minutes: int = Field(30, ge=2, le=2880)
     quiet_start_hour: int = Field(0, ge=0, le=23)
     quiet_end_hour: int = Field(8, ge=0, le=23)
+    auto_compact_tokens: int = Field(120000, ge=8000, le=1000000)
 
     @field_validator('api_base_url')
     @classmethod
@@ -89,6 +90,48 @@ class Config(BaseModel):
         data['smtp']['has_password'] = bool(data['smtp'].pop('password'))
         return data
 
+def compact_trace_list(trace: list | None) -> list[dict]:
+    """
+    Strip heavy tool outputs (read_file content, run_bash stdout, web_fetch HTML, Base64 screenshots)
+    and large write_file/edit_file argument blobs from persisted/broadcast UI trace arrays.
+    The client UI only ever displays tool name, short arguments (path/command/query/op), duration_ms,
+    status, and whether result has an 'error' key.
+    """
+    if not isinstance(trace, list):
+        return []
+    compacted: list[dict] = []
+    for step in trace[-24:]:
+        if not isinstance(step, dict):
+            continue
+        raw_args = step.get('arguments')
+        slim_args: dict = {}
+        if isinstance(raw_args, dict):
+            for k, v in raw_args.items():
+                if k in ('content', 'old', 'new', 'code', 'script', 'image', 'base64'):
+                    continue
+                if isinstance(v, str):
+                    slim_args[k] = v[:90]
+                elif isinstance(v, (int, float, bool)):
+                    slim_args[k] = v
+                elif isinstance(v, list):
+                    slim_args[k] = v[:4]
+        raw_res = step.get('result')
+        slim_res: dict = {}
+        if isinstance(raw_res, dict) and raw_res.get('error'):
+            slim_res['error'] = str(raw_res['error'])[:200]
+        entry: dict = {
+            'tool': str(step.get('tool') or ''),
+            'arguments': slim_args,
+            'duration_ms': int(step.get('duration_ms') or 0),
+        }
+        if step.get('status'):
+            entry['status'] = str(step['status'])
+        if slim_res:
+            entry['result'] = slim_res
+        compacted.append(entry)
+    return compacted
+
+
 class Store:
     def __init__(self, root: Path):
         self.root = root
@@ -105,7 +148,27 @@ class Store:
         self.state = json.loads(self.state_path.read_text('utf-8')) if self.state_path.exists() else {
             'messages':[], 'pending':{}, 'routines':[], 'opportunities':[], 'deadlines':[],
             'snooze_until':0, 'last_curiosity':0, 'last_research':0, 'last_user':time.time(), 'last_error':''}
+        self._scrub_state_bloat()
         self._sync_to_workspace()
+
+    def _scrub_state_bloat(self):
+        with self.lock:
+            msgs = self.state.get('messages')
+            if not isinstance(msgs, list):
+                return
+            changed = False
+            for m in msgs:
+                if isinstance(m, dict) and m.get('trace'):
+                    old_tr = m['trace']
+                    new_tr = compact_trace_list(old_tr)
+                    if old_tr != new_tr:
+                        m['trace'] = new_tr
+                        changed = True
+            if len(msgs) > 240:
+                self.state['messages'] = msgs[-240:]
+                changed = True
+            if changed:
+                atomic_write(self.state_path, json.dumps(self.state, ensure_ascii=False, indent=2))
 
     def _sync_to_workspace(self):
         """Write settings.json, bots.json, and routines.json into workspace so any Bot can inspect/edit its own setup."""
@@ -119,6 +182,7 @@ class Store:
                 'idle_research_minutes': self.config.idle_research_minutes,
                 'quiet_start_hour': self.config.quiet_start_hour,
                 'quiet_end_hour': self.config.quiet_end_hour,
+                'auto_compact_tokens': self.config.auto_compact_tokens,
             }
             atomic_write(self.settings_ws_path, json.dumps(settings_payload, ensure_ascii=False, indent=2))
             self._settings_mtime = self.settings_ws_path.stat().st_mtime_ns if self.settings_ws_path.exists() else 0
@@ -129,8 +193,12 @@ class Store:
                 atomic_write(self.routines_ws_path, json.dumps(self.state['routines'], ensure_ascii=False, indent=2))
                 self._routines_mtime = self.routines_ws_path.stat().st_mtime_ns if self.routines_ws_path.exists() else 0
 
-    def sync_from_workspace(self) -> bool:
+    def sync_from_workspace(self, force: bool = False) -> bool:
         """If a Bot edited workspace/settings.json or workspace/bots.json via tools/bash, apply changes."""
+        now_ts = time.time()
+        if not force and (now_ts - getattr(self, '_last_ws_sync_ts', 0.0)) < 1.5:
+            return False
+        self._last_ws_sync_ts = now_ts
         changed = False
         with self.lock:
             try:
@@ -142,7 +210,7 @@ class Store:
                             update = {}
                             for k in ('api_base_url', 'api_key', 'default_model', 'enabled',
                                       'curiosity_interval_minutes', 'idle_research_minutes',
-                                      'quiet_start_hour', 'quiet_end_hour'):
+                                      'quiet_start_hour', 'quiet_end_hour', 'auto_compact_tokens'):
                                 if k in raw:
                                     update[k] = raw[k]
                             if update:
@@ -236,9 +304,29 @@ class Store:
             return config.public()
 
     def message(self, role, text, kind='chat', **extra):
-        m = {'id': secrets.token_hex(12), 'role':role, 'text':text, 'kind':kind, 'created_at':time.time(), **extra}
+        now_ts = time.time()
+        clean_txt = str(text or '').strip()
+        target_bot = extra.get('bot_id', 'companion')
+        if 'trace' in extra:
+            extra['trace'] = compact_trace_list(extra['trace'])
         with self.lock:
+            if role == 'assistant' and clean_txt and self.state['messages']:
+                for prev in reversed(self.state['messages'][-6:]):
+                    if prev.get('bot_id', 'companion') == target_bot:
+                        if (
+                            prev.get('role') == 'assistant'
+                            and str(prev.get('text') or '').strip() == clean_txt
+                            and abs(now_ts - float(prev.get('created_at') or 0)) < 15.0
+                        ):
+                            if extra.get('trace') and not prev.get('trace'):
+                                prev['trace'] = extra['trace']
+                            if extra.get('choices') and not prev.get('choices'):
+                                prev['choices'] = extra['choices']
+                            self.save()
+                            return prev
+                        break
+            m = {'id': secrets.token_hex(12), 'role':role, 'text':text, 'kind':kind, 'created_at':now_ts, **extra}
             self.state['messages'].append(m)
-            self.state['messages'] = self.state['messages'][-600:]
+            self.state['messages'] = self.state['messages'][-240:]
             self.save()
         return m

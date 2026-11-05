@@ -28,6 +28,7 @@ import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
+import kotlin.math.abs
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
@@ -91,19 +92,34 @@ class NativePulseActivity : ComponentActivity() {
                 val wsOnline = AgentForegroundService.connected
                 val fast = model.ui.busyBot != null || model.ui.workingBot != null || model.ui.streamBotId != null || model.ui.activePanel == "cloud_desktop"
                 if (model.ui.activePanel == "cloud_desktop") {
-                    model.refreshStreamOnly()
-                    delay(360L)
-                } else if (fast) {
-                    model.refreshStreamOnly()
-                    delay(if (wsOnline) 1500L else 420L)
-                } else {
-                    if (tick % 3 == 0) {
-                        model.refresh()
+                    if (!wsOnline) {
+                        model.refreshStreamOnly()
                     } else {
+                        model.refreshCloudDesktopFrame(forceFull = false)
+                    }
+                    delay(if (wsOnline) 1800L else 900L)
+                } else if (fast) {
+                    if (!wsOnline) {
                         model.refreshStreamOnly()
                     }
-                    tick++
-                    delay(if (wsOnline) 3200L else 1800L)
+                    delay(if (wsOnline) 8000L else 650L)
+                } else {
+                    if (!wsOnline) {
+                        if (tick % 4 == 0) {
+                            model.refresh()
+                        } else {
+                            model.refreshStreamOnly()
+                        }
+                        tick++
+                        delay(4500L)
+                    } else {
+                        // When WebSocket is connected, all stream/message/execution events are pushed in 0ms;
+                        // only run a tiny delta heartbeat every 25s!
+                        delay(25_000L)
+                        if (isActive && resumed) {
+                            model.refreshStreamOnly()
+                        }
+                    }
                 }
             }
         }
@@ -141,18 +157,43 @@ internal data class PulseAttachment(val name: String, val path: String, val sour
     companion object { fun from(j: JSONObject) = PulseAttachment(j.optString("name"), j.getString("path"), j.optString("source", "workspace"), j.optLong("bytes"), j.optString("sha256")) }
 }
 
+internal data class PulseChoice(val label: String, val value: String) {
+    fun json(): JSONObject = JSONObject().put("label", label).put("value", value)
+    companion object {
+        fun from(j: JSONObject) = PulseChoice(
+            j.optString("label", j.optString("value", "")).trim(),
+            j.optString("value", j.optString("label", "")).trim()
+        )
+        fun parseArray(rawChoices: JSONArray?): List<PulseChoice> {
+            if (rawChoices == null) return emptyList()
+            return (0 until rawChoices.length()).mapNotNull { idx ->
+                val item = rawChoices.optJSONObject(idx)
+                if (item != null) from(item).takeIf { it.label.isNotBlank() }
+                else rawChoices.optString(idx).trim().takeIf { it.isNotBlank() }?.let { PulseChoice(it, it) }
+            }
+        }
+    }
+}
+
 internal data class PulseMessage(
     val id: String, val botId: String, val role: String, val text: String, val kind: String, val engine: String,
     val created: Double, val decision: String, val trace: String, val optimistic: Boolean = false,
-    val fromBotId: String = "", val fromBotName: String = ""
+    val fromBotId: String = "", val fromBotName: String = "",
+    val choices: List<PulseChoice> = emptyList(),
+    val isSubTurn: Boolean = false
 ) {
     companion object {
-        fun from(j: JSONObject) = PulseMessage(
-            j.getString("id"), j.optString("bot_id", "companion"), j.optString("role"),
-            j.optString("text"), j.optString("kind"), j.optString("engine"), j.optDouble("created_at"),
-            j.optString("decision"), (j.optJSONArray("trace") ?: JSONArray()).toString(), false,
-            j.optString("from_bot_id", ""), j.optString("from_bot_name", "")
-        )
+        fun from(j: JSONObject): PulseMessage {
+            val parsedChoices = PulseChoice.parseArray(j.optJSONArray("choices"))
+            return PulseMessage(
+                j.getString("id"), j.optString("bot_id", "companion"), j.optString("role"),
+                j.optString("text"), j.optString("kind"), j.optString("engine"), j.optDouble("created_at"),
+                j.optString("decision"), (j.optJSONArray("trace") ?: JSONArray()).toString(), false,
+                j.optString("from_bot_id", ""), j.optString("from_bot_name", ""),
+                parsedChoices,
+                j.optBoolean("is_sub_turn", false) || j.optString("kind") in listOf("bot_message", "bot_reply")
+            )
+        }
     }
 }
 
@@ -168,7 +209,7 @@ internal data class NativePulseState(
     val searching: Boolean = false, val query: String = "", val snoozed: Boolean = false,
     val smallReady: Boolean = false, val bigReady: Boolean = false, val smallModel: String = "", val bigModel: String = "",
     val defaultModel: String = "",
-    val dark: Boolean = false, val motion: Boolean = true, val haptics: Boolean = true, val routineCount: Int = 0,
+    val dark: Boolean = true, val motion: Boolean = true, val haptics: Boolean = true, val routineCount: Int = 0,
     val avatars: Map<String, ImageBitmap> = emptyMap(), val menu: PulseMenu? = null, val toast: String = "", val toastId: Long = 0,
     // Native panels: null | "settings" | "bot_edit" | "vault"
     val activePanel: String? = null,
@@ -182,8 +223,16 @@ internal data class NativePulseState(
     val savingSettings: Boolean = false,
     val curiosityEnabledGlobal: Boolean = true,
     val curiosityMinutes: String = "90",
+    val autoCompactTokens: String = "120000",
+    val contextTokensByBot: Map<String, Int> = emptyMap(),
+    val contextMsgsByBot: Map<String, Int> = emptyMap(),
+    val compactingContext: Boolean = false,
     val backgroundService: Boolean = true,
-    val appearance: String = "system",
+    val appearance: String = "dark",
+    val latestReleaseVersion: String = "",
+    val latestReleaseNotes: String = "",
+    val updateAvailable: Boolean = false,
+    val checkingUpdate: Boolean = false,
     // Bot Editor state
     val editingBotId: String? = null,
     val editBotName: String = "",
@@ -209,6 +258,8 @@ internal data class NativePulseState(
     val streamThought: String = "",
     val streamTool: String = "",
     val streamTrace: List<JSONObject> = emptyList(),
+    val streamChoices: List<PulseChoice> = emptyList(),
+    val consumedChoiceIds: Set<String> = emptySet(),
     val streamStartedAt: Long = 0L,
     val activeTypewriterMsgId: String? = null,
     val activeTypewriterChars: Int = Int.MAX_VALUE,
@@ -224,7 +275,13 @@ internal data class NativePulseState(
     val cloudDesktopPipVisible: Boolean = false,
     // Native Schedules & Automation panel state
     val schedulesData: JSONObject? = null,
-    val schedulesLoading: Boolean = false
+    val schedulesLoading: Boolean = false,
+    // Multi-agent sub_agents, todos, pinned memories, watchdogs, and message editing
+    val streamSubAgents: List<JSONObject> = emptyList(),
+    val streamTodos: List<JSONObject> = emptyList(),
+    val pinnedMemories: List<JSONObject> = emptyList(),
+    val watchdogs: List<JSONObject> = emptyList(),
+    val editingMessage: PulseMessage? = null
 )
 
 internal class NativePulseModel(private val activity: NativePulseActivity, restoredBot: String?) {
@@ -282,10 +339,8 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
         val cached = homeCache(prefs)
         remoteMessages = cached.third
         val initialBot = cached.first.firstOrNull { it.id == restoredBot }?.id ?: cached.second
-        val dark = when (prefs.optString("appearance", "system")) {
-            "dark" -> true; "light" -> false
-            else -> activity.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK == Configuration.UI_MODE_NIGHT_YES
-        }
+        val savedAppearance = prefs.optString("appearance", "dark").let { if (it == "light") "light" else "dark" }
+        val dark = savedAppearance != "light"
         val cfg = prefs.optJSONObject("config") ?: JSONObject()
         val defModel = cfg.optString("default_model").ifBlank { cfg.optJSONObject("big_brain")?.optString("model").orEmpty().ifBlank { cfg.optJSONObject("small_brain")?.optString("model").orEmpty() } }
         val defUrl = cfg.optString("api_base_url").ifBlank { cfg.optJSONObject("big_brain")?.optString("base_url").orEmpty().ifBlank { "https://api.openai.com/v1" } }
@@ -296,7 +351,7 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
             dark = dark, paired = prefs.optString("deviceToken", SecureTransport.defaultToken()).isNotBlank(),
             draft = draft(initialBot), attachments = attachments(initialBot), mode = draftMode(initialBot),
             defaultModel = defModel, apiBaseUrl = defUrl, serverUrl = prefs.optString("serverUrl", SecureTransport.DEFAULT_SERVER),
-            backgroundService = prefs.optBoolean("background", true), appearance = prefs.optString("appearance", "system"),
+            backgroundService = prefs.optBoolean("background", true), appearance = savedAppearance,
             motion = prefs.optBoolean("motion", true) && !animationsOff(activity), haptics = prefs.optBoolean("haptics", true)
         )
         activity.systemBarsFor(dark)
@@ -305,15 +360,41 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
     }
 
     /**
-     * Strictly preserves server chronological order for remoteMessages and appends in-flight optimisticList
+     * Strictly preserves server chronological order for remoteMessages, deduplicates identical assistant
+     * replies (e.g. when stopping/pausing a chat or phone workspace turn), and appends in-flight optimisticList
      * items at the tail so clock skew between phone and VPS NEVER causes AI messages to jump above user messages.
      */
     private fun combinedMessages(): List<PulseMessage> {
         val phoneMsgs = RootPhoneHarness.changes.value.messages.filter { it.role != "user" && it.kind != "phone_task" }
-        val baseList = if (phoneMsgs.isEmpty()) {
+        val rawMerged = if (phoneMsgs.isEmpty()) {
             remoteMessages
         } else {
             (remoteMessages + phoneMsgs).distinctBy { it.id }.sortedBy { it.created }
+        }
+        val baseList = ArrayList<PulseMessage>(rawMerged.size)
+        for (msg in rawMerged) {
+            val prev = baseList.lastOrNull()
+            if (prev != null &&
+                prev.botId == msg.botId &&
+                prev.role == msg.role &&
+                prev.role == "assistant" &&
+                prev.text.trim().isNotEmpty() &&
+                prev.text.trim() == msg.text.trim() &&
+                abs(prev.created - msg.created) < 30.0
+            ) {
+                val keepMsg = when {
+                    prev.id.startsWith("stopped-") && !msg.id.startsWith("stopped-") -> msg
+                    !prev.id.startsWith("stopped-") && msg.id.startsWith("stopped-") -> prev
+                    msg.trace.length > prev.trace.length || msg.choices.size > prev.choices.size -> msg
+                    else -> prev
+                }
+                baseList[baseList.lastIndex] = keepMsg.copy(
+                    trace = if (msg.trace.length > prev.trace.length) msg.trace else prev.trace,
+                    choices = if (msg.choices.isNotEmpty()) msg.choices else prev.choices
+                )
+            } else {
+                baseList.add(msg)
+            }
         }
         if (optimisticList.isEmpty()) return baseList
         val existingIds = baseList.asSequence().map { it.id }.toHashSet()
@@ -327,8 +408,20 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
 
     private fun applyPhoneState() {
         val phone = RootPhoneHarness.changes.value
-        ui = ui.copy(messages = combinedMessages(), workingBot = if (phone.active) phone.botId else remoteWorkingBot,
-            workingText = if (phone.active) when (phone.phase) { "waiting_user" -> "手机工作区需要你接管"; "stopping" -> "正在停止手机执行…"; else -> "正在操作独立手机工作区…" } else remoteWorkingText)
+        val activeWorking = if (phone.active) {
+            phone.botId
+        } else {
+            remoteWorkingBot ?: (if (sendGuardBotId != null && SystemClock.uptimeMillis() < sendGuardUntilUptime) sendGuardBotId else null)
+        }
+        ui = ui.copy(
+            messages = combinedMessages(),
+            workingBot = activeWorking,
+            workingText = if (phone.active) when (phone.phase) {
+                "waiting_user" -> "手机工作区需要你接管"
+                "stopping" -> "正在停止手机执行…"
+                else -> "正在操作独立手机工作区…"
+            } else remoteWorkingText
+        )
     }
 
     private fun scopeOf(settings: JSONObject): String {
@@ -361,6 +454,7 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                     .put("text", m.text).put("kind", m.kind).put("engine", m.engine)
                     .put("created_at", m.created).put("decision", m.decision)
                     .put("trace", runCatching { JSONArray(m.trace) }.getOrDefault(JSONArray()))
+                    .put("choices", JSONArray(m.choices.map { it.json() }))
                     .put("from_bot_id", m.fromBotId).put("from_bot_name", m.fromBotName)
             )
         }
@@ -399,16 +493,14 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                 remoteMessages = cached.third
                 ui = ui.copy(bots = cached.first, primary = cached.second, botId = cached.second, messages = combinedMessages(), chatOpen = false, avatars = emptyMap())
             }
-            val dark = when (settings.optString("appearance", "system")) {
-                "dark" -> true; "light" -> false
-                else -> activity.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK == Configuration.UI_MODE_NIGHT_YES
-            }
+            val savedApp = settings.optString("appearance", "dark").let { if (it == "light") "light" else "dark" }
+            val dark = savedApp != "light"
             val config = settings.optJSONObject("config") ?: JSONObject()
             val smallM = config.optJSONObject("small_brain")?.optString("model") ?: ""
             val bigM = config.optJSONObject("big_brain")?.optString("model") ?: ""
             val defM = config.optString("default_model").ifBlank { bigM.ifBlank { smallM } }
             ui = ui.copy(
-                paired = settings.optString("deviceToken", SecureTransport.defaultToken()).isNotBlank(), dark = dark,
+                paired = settings.optString("deviceToken", SecureTransport.defaultToken()).isNotBlank(), dark = dark, appearance = savedApp,
                 motion = settings.optBoolean("motion", true) && !animationsOff(activity), haptics = settings.optBoolean("haptics", true),
                 smallModel = smallM, bigModel = bigM, defaultModel = defM,
                 draft = draft(ui.botId), attachments = attachments(ui.botId),
@@ -438,6 +530,42 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
     }
 
     /**
+     * Monotonically merges streaming tool trace arrays within the same turn so a tool call item
+     * NEVER flickers or disappears between `tc_delta`, `execution`, and `stream` updates.
+     */
+    private fun mergeMonotonicTrace(
+        prev: List<JSONObject>,
+        incoming: List<JSONObject>,
+        sameBot: Boolean
+    ): List<JSONObject> {
+        if (!sameBot || prev.isEmpty()) return incoming
+        if (incoming.isEmpty()) return prev
+        if (incoming.size > prev.size) return incoming
+        if (incoming.size < prev.size) {
+            val result = prev.toMutableList()
+            incoming.forEachIndexed { idx, item ->
+                val prevItem = result[idx]
+                val prevDone = prevItem.optString("status") == "done"
+                val incDone = item.optString("status") == "done"
+                if (incDone || !prevDone) {
+                    result[idx] = item
+                }
+            }
+            return result
+        }
+        return incoming.mapIndexed { idx, item ->
+            val prevItem = prev[idx]
+            val prevDone = prevItem.optString("status") == "done"
+            val incDone = item.optString("status") == "done"
+            if (prevDone && !incDone && prevItem.optString("tool") == item.optString("tool")) {
+                prevItem
+            } else {
+                item
+            }
+        }
+    }
+
+    /**
      * Atomically merges incoming messages (from full `/api/messages`, `/api/status` `recent_tail`,
      * `/api/chat` response, or WebSocket `message` push) so newly arrived messages are NEVER lost
      * if an older high-latency (3000ms+) HTTP response lands out of order.
@@ -445,41 +573,61 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
     private fun mergeRemoteMessages(incoming: List<PulseMessage>, fullReplace: Boolean = false) {
         if (incoming.isEmpty() && !fullReplace) return
         val oldIds = remoteMessages.asSequence().map { it.id }.toHashSet()
-        val merged = if (fullReplace) {
+        val rawMerged = if (fullReplace) {
             val incomingIds = incoming.asSequence().map { it.id }.toHashSet()
             val maxIncomingCreated = incoming.maxOfOrNull { it.created } ?: 0.0
             val newerLocal = remoteMessages.filter { local ->
-                local.id !in incomingIds && local.created >= maxIncomingCreated - 1.0
+                !local.id.startsWith("stopped-") &&
+                    local.id !in incomingIds &&
+                    local.created >= maxIncomingCreated - 1.0 &&
+                    incoming.takeLast(12).none { it.botId == local.botId && it.role == local.role && it.text.trim() == local.text.trim() }
             }
             incoming + newerLocal
         } else {
             val byId = LinkedHashMap<String, PulseMessage>(remoteMessages.size + incoming.size)
-            remoteMessages.forEach { byId[it.id] = it }
+            remoteMessages.forEach { local ->
+                val replacedByServerStop = local.id.startsWith("stopped-") && incoming.any { inc ->
+                    !inc.id.startsWith("stopped-") && inc.botId == local.botId && inc.role == "assistant" &&
+                        (inc.text.trim() == local.text.trim() || abs(inc.created - local.created) < 20.0)
+                }
+                if (!replacedByServerStop) {
+                    byId[local.id] = local
+                }
+            }
             incoming.forEach { byId[it.id] = it }
             byId.values.toList()
+        }
+        val merged = ArrayList<PulseMessage>(rawMerged.size)
+        for (msg in rawMerged) {
+            val prev = merged.lastOrNull()
+            if (prev != null &&
+                prev.botId == msg.botId &&
+                prev.role == msg.role &&
+                prev.role == "assistant" &&
+                prev.text.trim().isNotEmpty() &&
+                prev.text.trim() == msg.text.trim() &&
+                abs(prev.created - msg.created) < 20.0
+            ) {
+                val keep = if (prev.id.startsWith("stopped-") && !msg.id.startsWith("stopped-")) msg else if (msg.trace.length > prev.trace.length) msg else prev
+                merged[merged.lastIndex] = keep.copy(
+                    trace = if (msg.trace.length > prev.trace.length) msg.trace else prev.trace,
+                    choices = if (msg.choices.isNotEmpty()) msg.choices else prev.choices
+                )
+            } else {
+                merged.add(msg)
+            }
         }
         remoteMessages = merged
         optimisticList.removeAll { opt ->
             merged.takeLast(18).any { it.role == "user" && it.botId == opt.botId && it.text.trim() == opt.text.trim() }
         }
-        // If a brand-new assistant message just arrived for the active bot (or finished a stream under 3000ms latency),
-        // smoothly typewriter-reveal any unrevealed suffix so it NEVER pops in as an abrupt wall of text!
+        // Clear sendGuard when a brand-new final assistant message arrives for the active bot
         if (!fullReplace && oldIds.isNotEmpty()) {
-            val newestAssistant = incoming.lastOrNull { it.role == "assistant" && it.id !in oldIds && it.text.length > 6 }
+            val newestAssistant = incoming.lastOrNull { it.role == "assistant" && !it.isSubTurn && it.id !in oldIds }
             if (newestAssistant != null && newestAssistant.id == merged.lastOrNull { it.botId == newestAssistant.botId }?.id) {
                 if (sendGuardBotId == newestAssistant.botId) {
                     sendGuardBotId = null
                     sendGuardUntilUptime = 0L
-                }
-                val curStream = ui.streamText
-                val alreadyRevealed = if (!isStreamPlaceholder(curStream) && curStream.isNotBlank() &&
-                    newestAssistant.text.startsWith(curStream.take(minOf(16, curStream.length)))) {
-                    curStream.length.coerceAtMost(newestAssistant.text.length)
-                } else {
-                    0
-                }
-                if (alreadyRevealed < newestAssistant.text.length - 6) {
-                    startMessageTypewriter(newestAssistant.id, newestAssistant.text.length, alreadyRevealed.coerceAtLeast(2))
                 }
             }
         }
@@ -489,73 +637,19 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
         streamPacerJob?.cancel()
         targetStreamFullText = ""
         typewriterJob?.cancel()
-        if (totalLength - startChars <= 14) {
-            ui = ui.copy(activeTypewriterMsgId = null, activeTypewriterChars = Int.MAX_VALUE)
-            return
-        }
-        var current = startChars.coerceIn(1, totalLength)
-        ui = ui.copy(activeTypewriterMsgId = msgId, activeTypewriterChars = current)
-        typewriterJob = scope.launch {
-            while (isActive && current < totalLength && ui.activeTypewriterMsgId == msgId) {
-                val remaining = totalLength - current
-                val step = when {
-                    remaining <= 10 -> 1
-                    remaining <= 28 -> 2
-                    remaining <= 70 -> 4
-                    else -> minOf(12, remaining / 8 + 2)
-                }
-                current = (current + step).coerceAtMost(totalLength)
-                ui = ui.copy(activeTypewriterChars = current)
-                delay(16L)
-            }
-            if (ui.activeTypewriterMsgId == msgId) {
-                ui = ui.copy(activeTypewriterMsgId = null, activeTypewriterChars = Int.MAX_VALUE)
-            }
-        }
+        ui = ui.copy(activeTypewriterMsgId = null, activeTypewriterChars = Int.MAX_VALUE)
     }
 
     private fun applyPacedStreamText(sBot: String?, resolvedText: String): String {
+        streamPacerJob?.cancel()
         if (sBot == null) {
-            streamPacerJob?.cancel()
             targetStreamFullText = ""
             return ""
         }
-        if (isStreamPlaceholder(resolvedText)) {
-            if (targetStreamFullText.isNotEmpty() && !isStreamPlaceholder(targetStreamFullText)) {
-                return ui.streamText.takeIf { !isStreamPlaceholder(it) && it.isNotBlank() } ?: targetStreamFullText.take(2)
-            }
-            streamPacerJob?.cancel()
-            targetStreamFullText = ""
-            return resolvedText
-        }
-        if (resolvedText.length >= targetStreamFullText.length || !targetStreamFullText.startsWith(resolvedText)) {
+        if (!isStreamPlaceholder(resolvedText)) {
             targetStreamFullText = resolvedText
         }
-        val curShown = if (isStreamPlaceholder(ui.streamText)) "" else ui.streamText
-        val initialLen = curShown.length.coerceAtLeast(minOf(2, targetStreamFullText.length))
-        if (streamPacerJob?.isActive != true) {
-            streamPacerJob = scope.launch {
-                while (isActive && ui.streamBotId != null && targetStreamFullText.isNotEmpty()) {
-                    val cur = if (isStreamPlaceholder(ui.streamText)) 0 else ui.streamText.length
-                    val target = targetStreamFullText
-                    if (cur >= target.length) {
-                        delay(16L)
-                        continue
-                    }
-                    val rem = target.length - cur
-                    val step = when {
-                        rem <= 8 -> 1
-                        rem <= 24 -> 2
-                        rem <= 60 -> 3
-                        else -> minOf(10, rem / 8 + 2)
-                    }
-                    val nextLen = (cur + step).coerceAtMost(target.length)
-                    ui = ui.copy(streamText = target.take(nextLen))
-                    delay(16L)
-                }
-            }
-        }
-        return targetStreamFullText.take(initialLen)
+        return resolvedText
     }
 
     /**
@@ -594,12 +688,17 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                     val frameObj = event.optJSONObject("frame") ?: return@launch
                     val botId = event.optString("bot_id").takeIf { it.isNotBlank() }
                     val op = event.optString("op", "")
-                    applyCloudDesktopPacket(frameObj)
                     ui = ui.copy(
                         cloudDesktopLiveBotId = botId ?: ui.cloudDesktopLiveBotId,
                         cloudDesktopLiveOp = op.ifBlank { ui.cloudDesktopLiveOp },
-                        cloudDesktopPipVisible = true
+                        cloudDesktopUrl = frameObj.optString("url").takeIf { it.isNotBlank() } ?: ui.cloudDesktopUrl,
+                        cloudDesktopTitle = frameObj.optString("title").takeIf { it.isNotBlank() } ?: ui.cloudDesktopTitle
                     )
+                    // Only pull or decode heavy frame bitmaps when the user actually has the Cloud Computer panel open!
+                    if (ui.activePanel == "cloud_desktop") {
+                        if (frameObj.has("image")) applyCloudDesktopPacket(frameObj)
+                        else launch { refreshCloudDesktopFrame(forceFull = false) }
+                    }
                 }
                 "stream" -> {
                     val stream = event.optJSONObject("stream") ?: return@launch
@@ -609,22 +708,42 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                     if (seq in 1 until lastStreamSeq) return@launch
                     if (seq > lastStreamSeq) lastStreamSeq = seq
                     val sBot = stream.optString("bot_id").takeIf { it.isNotBlank() } ?: return@launch
-                    val toolName = stream.optString("tool", "")
-                    val trace = stream.optJSONArray("trace")?.objects() ?: ui.streamTrace
+                    val incomingTrace = stream.optJSONArray("trace")?.objects().orEmpty()
+                    val trace = mergeMonotonicTrace(ui.streamTrace, incomingTrace, ui.streamBotId == sBot || ui.workingBot == sBot)
+                    val rawTool = if (stream.isNull("tool")) "" else stream.optString("tool", "").takeIf { it != "null" }.orEmpty()
+                    val toolName = rawTool.ifBlank {
+                        if (ui.streamBotId == sBot && ui.streamTool.isNotBlank()) ui.streamTool
+                        else if (trace.isNotEmpty()) "已执行 ${trace.size} 步"
+                        else ""
+                    }
                     val usesCloudDesktop = toolName == "cloud_desktop" || trace.any { it.optString("tool") == "cloud_desktop" }
                     if (usesCloudDesktop) {
-                        ui = ui.copy(cloudDesktopLiveBotId = sBot, cloudDesktopPipVisible = true)
-                        launch { refreshCloudDesktopFrame(forceFull = false) }
+                        ui = ui.copy(cloudDesktopLiveBotId = sBot)
+                        if (ui.activePanel == "cloud_desktop") {
+                            launch { refreshCloudDesktopFrame(forceFull = false) }
+                        }
                     }
                     // If user is currently viewing a specific Bot's chat, ignore unrelated background Bot stream events
                     if (ui.chatOpen && sBot != ui.botId && ui.streamBotId == ui.botId) return@launch
-                    val rawText = stream.optString("text", "")
-                    val thought = stream.optString("thought", "")
+                    val delta = stream.optString("delta", "")
+                    val rawText = stream.optString("text", "").ifEmpty {
+                        if (delta.isNotEmpty() && !isStreamPlaceholder(ui.streamText)) ui.streamText + delta else delta
+                    }
+                    val thought = stream.optString("thought", "").ifBlank { ui.streamThought }
+                    val subAgents = stream.optJSONArray("sub_agents")?.objects() ?: ui.streamSubAgents
+                    val todos = stream.optJSONArray("todos")?.objects() ?: ui.streamTodos
+                    val choices = PulseChoice.parseArray(stream.optJSONArray("choices")).ifEmpty {
+                        if (ui.streamBotId == sBot) ui.streamChoices else emptyList()
+                    }
                     val preserved = resolveStreamText(sBot, turnId, rawText)
                     val paced = applyPacedStreamText(sBot, preserved)
                     val startedMs = ui.streamStartedAt.takeIf { it > 0L } ?: System.currentTimeMillis()
+                    sendGuardBotId = sBot
+                    sendGuardUntilUptime = SystemClock.uptimeMillis() + 20_000L
+                    remoteWorkingBot = sBot
                     ui = ui.copy(
                         online = true,
+                        workingBot = sBot,
                         streamBotId = sBot,
                         streamSpeakerId = stream.optString("speaker_id").takeIf { it.isNotBlank() },
                         streamSpeakerName = stream.optString("speaker_name", ""),
@@ -632,23 +751,39 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                         streamThought = thought,
                         streamTool = toolName,
                         streamTrace = trace,
+                        streamChoices = choices,
+                        streamSubAgents = subAgents,
+                        streamTodos = todos,
                         streamStartedAt = startedMs
                     )
                 }
                 "execution" -> {
                     val exec = event.optJSONObject("execution")
                     val working = exec?.optString("bot_id")?.takeIf { it.isNotBlank() }
-                    val tool = exec?.optString("tool").orEmpty()
-                    val trace = exec?.optJSONArray("trace")?.objects() ?: ui.streamTrace
+                    val incomingTrace = exec?.optJSONArray("trace")?.objects().orEmpty()
+                    val sameBot = working == null || ui.workingBot == null || ui.workingBot == working || ui.streamBotId == working
+                    val trace = mergeMonotonicTrace(ui.streamTrace, incomingTrace, sameBot)
+                    val rawTool = if (exec == null || exec.isNull("tool")) "" else exec.optString("tool").takeIf { it != "null" }.orEmpty()
+                    val tool = rawTool.ifBlank {
+                        if (working != null && ui.streamTool.isNotBlank()) ui.streamTool
+                        else if (trace.isNotEmpty()) "已执行 ${trace.size} 步"
+                        else ""
+                    }
                     val usesCloudDesktop = tool == "cloud_desktop" || trace.any { it.optString("tool") == "cloud_desktop" }
                     if (usesCloudDesktop) {
-                        ui = ui.copy(cloudDesktopLiveBotId = working ?: ui.botId, cloudDesktopPipVisible = true)
-                        launch { refreshCloudDesktopFrame(forceFull = false) }
+                        ui = ui.copy(cloudDesktopLiveBotId = working ?: ui.botId)
+                        if (ui.activePanel == "cloud_desktop") {
+                            launch { refreshCloudDesktopFrame(forceFull = false) }
+                        }
                     }
                     if (ui.chatOpen && working != null && working != ui.botId && ui.workingBot == ui.botId) return@launch
-                    remoteWorkingBot = working
-                    remoteWorkingText = if (tool.isNotBlank()) "正在调用 $tool…" else "正在思考…"
                     val activeBot = working ?: ui.workingBot ?: ui.streamBotId ?: sendGuardBotId
+                    if (activeBot != null) {
+                        sendGuardBotId = activeBot
+                        sendGuardUntilUptime = SystemClock.uptimeMillis() + 20_000L
+                    }
+                    remoteWorkingBot = activeBot
+                    remoteWorkingText = if (tool.isNotBlank()) "正在调用 $tool…" else "正在思考…"
                     ui = ui.copy(
                         online = true,
                         workingBot = activeBot,
@@ -665,9 +800,10 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                     val seq = event.optLong("seq", mObj.optLong("seq", 0L))
                     val turnId = mObj.optString("turn_id", "")
                     if (seq > lastStreamSeq) lastStreamSeq = seq
-                    if (turnId.isNotBlank()) markTurnCompleted(turnId)
+                    // Sub-turn delegation bubbles (`isSubTurn`) do NOT terminate the parent turn!
+                    if (turnId.isNotBlank() && !msg.isSubTurn) markTurnCompleted(turnId)
                     mergeRemoteMessages(listOf(msg), fullReplace = false)
-                    val finishedStreamHere = msg.role == "assistant" && (ui.streamBotId == msg.botId || ui.workingBot == msg.botId || sendGuardBotId == msg.botId) &&
+                    val finishedStreamHere = !msg.isSubTurn && msg.role == "assistant" && (ui.streamBotId == msg.botId || ui.workingBot == msg.botId || sendGuardBotId == msg.botId) &&
                         (turnId.isBlank() || currentTurnId.isBlank() || turnId == currentTurnId || msg.kind in listOf("chat", "result", "curiosity", "error", "stopped"))
                     if (finishedStreamHere) {
                         remoteWorkingBot = null
@@ -683,6 +819,9 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                             streamThought = "",
                             streamTool = "",
                             streamTrace = emptyList(),
+                            streamChoices = emptyList(),
+                            streamSubAgents = emptyList(),
+                            streamTodos = emptyList(),
                             streamStartedAt = 0L
                         )
                     } else {
@@ -694,15 +833,21 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
         }
     }
 
+    private fun lastServerMessageId(): String? =
+        remoteMessages.lastOrNull { !it.id.startsWith("stopped-") && !it.id.startsWith("local-") && !it.optimistic }?.id
+
     suspend fun refresh(force: Boolean = false) {
         if (!ui.paired || (!force && refreshLock.isLocked)) return
         refreshLock.withLock {
             val before = revision; val started = SystemClock.uptimeMillis(); val serverScope = scopeOf(prefs)
             try {
+                val afterId = if (force) null else lastServerMessageId()
+                val msgQuery = if (!afterId.isNullOrBlank()) JSONObject().put("after_id", afterId) else null
+                val statusQuery = if (!afterId.isNullOrBlank()) JSONObject().put("after_id", afterId) else null
                 val fetched = coroutineScope {
                     val b = async { request("GET", "/api/bots") }
-                    val h = async { request("GET", "/api/messages") }
-                    val s = async { request("GET", "/api/status") }
+                    val h = async { request("GET", "/api/messages", null, msgQuery) }
+                    val s = async { request("GET", "/api/status", null, statusQuery) }
                     val c = async { runCatching { request("GET", "/api/config") }.getOrNull() }
                     listOf(b.await(), h.await(), s.await(), c.await())
                 }
@@ -713,8 +858,9 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                 val remoteCfg = fetched[3]
                 val pending = history.optJSONObject("pending") ?: JSONObject()
                 val unread = pending.keys().asSequence().toSet()
+                val isDelta = history.optBoolean("delta", false)
                 val messages = history.getJSONArray("messages").objects().map(PulseMessage::from)
-                mergeRemoteMessages(messages, fullReplace = true)
+                mergeRemoteMessages(messages, fullReplace = !isDelta)
                 status.optJSONArray("recent_tail")?.objects()?.mapNotNull { runCatching { PulseMessage.from(it) }.getOrNull() }?.let {
                     mergeRemoteMessages(it, fullReplace = false)
                 }
@@ -756,12 +902,21 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                 val preservedText = if (isStaleStatus) ui.streamText else resolveStreamText(effectiveSBot ?: effectiveWorking, streamTurnId, rawStreamText)
                 val pacedText = if (isStaleStatus) ui.streamText else applyPacedStreamText(effectiveSBot ?: effectiveWorking, preservedText)
                 val thoughtText = if (isStaleStatus) ui.streamThought else stream?.optString("thought").orEmpty()
-                val execTrace = if (isStaleStatus) ui.streamTrace else ((execution?.optJSONArray("trace") ?: stream?.optJSONArray("trace"))?.objects() ?: emptyList())
-                val curTool = if (isStaleStatus) ui.streamTool else (stream?.optString("tool")?.takeIf { it.isNotBlank() } ?: execution?.optString("tool").orEmpty())
+                val execArr = execution?.optJSONArray("trace")?.objects().orEmpty()
+                val streamArr = stream?.optJSONArray("trace")?.objects().orEmpty()
+                val rawExecTrace = if (streamArr.size >= execArr.size && streamArr.isNotEmpty()) streamArr else execArr
+                val sameActiveBot = (effectiveSBot != null || effectiveWorking != null) && (ui.streamBotId == (effectiveSBot ?: effectiveWorking) || ui.workingBot == (effectiveSBot ?: effectiveWorking))
+                val execTrace = if (isStaleStatus) ui.streamTrace else if (effectiveSBot == null && effectiveWorking == null) emptyList() else mergeMonotonicTrace(ui.streamTrace, rawExecTrace, sameActiveBot)
+                val streamChoices = if (isStaleStatus) ui.streamChoices else if (effectiveSBot == null && effectiveWorking == null) emptyList() else PulseChoice.parseArray(stream?.optJSONArray("choices")).ifEmpty { if (sameActiveBot) ui.streamChoices else emptyList() }
+                val sTool = if (stream == null || stream.isNull("tool")) "" else stream.optString("tool").takeIf { it != "null" }.orEmpty()
+                val eTool = if (execution == null || execution.isNull("tool")) "" else execution.optString("tool").takeIf { it != "null" }.orEmpty()
+                val curTool = if (isStaleStatus) ui.streamTool else (sTool.ifBlank { eTool }.ifBlank { if ((effectiveSBot != null || effectiveWorking != null) && execTrace.isNotEmpty()) ui.streamTool.ifBlank { "已执行 ${execTrace.size} 步" } else "" })
                 val usesCloudDesktop = curTool == "cloud_desktop" || execTrace.any { it.optString("tool") == "cloud_desktop" }
                 val startedSec = execution?.optDouble("started_at", 0.0) ?: 0.0
                 val startedMs = if (startedSec > 0) (startedSec * 1000).toLong() else if (effectiveSBot != null || effectiveWorking != null) (ui.streamStartedAt.takeIf { it > 0L } ?: System.currentTimeMillis()) else 0L
                 val routinesCount = (status.optInt("routine_count", -1)).let { if (it >= 0) it else ui.routineCount }
+                val (ctxTokensMap, ctxMsgsMap) = parseContextByBot(status.optJSONObject("context_by_bot"))
+                val remoteCompactThresh = status.optInt("auto_compact_tokens", remoteCfg?.optInt("auto_compact_tokens", 0) ?: 0)
                 ui = ui.copy(
                     bots = if (before == revision) roster.getJSONArray("bots").objects().map(PulseBot::from) else ui.bots,
                     primary = if (before == revision) roster.optString("primary_bot_id", "companion") else ui.primary,
@@ -775,17 +930,20 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                     streamThought = thoughtText,
                     streamTool = curTool,
                     streamTrace = execTrace,
+                    streamChoices = streamChoices,
                     streamStartedAt = startedMs,
                     cloudDesktopTitle = computer?.optString("title")?.takeIf { it.isNotBlank() } ?: ui.cloudDesktopTitle,
                     cloudDesktopUrl = computer?.optString("url")?.takeIf { it.isNotBlank() } ?: ui.cloudDesktopUrl,
                     cloudDesktopLiveBotId = if (usesCloudDesktop) (effectiveSBot ?: effectiveWorking) else ui.cloudDesktopLiveBotId,
-                    cloudDesktopPipVisible = ui.cloudDesktopPipVisible || usesCloudDesktop,
                     routineCount = routinesCount,
+                    contextTokensByBot = if (ctxTokensMap.isNotEmpty()) ctxTokensMap else ui.contextTokensByBot,
+                    contextMsgsByBot = if (ctxMsgsMap.isNotEmpty()) ctxMsgsMap else ui.contextMsgsByBot,
+                    autoCompactTokens = if (remoteCompactThresh >= 8000 && ui.activePanel != "settings") remoteCompactThresh.toString() else ui.autoCompactTokens,
                     snoozed = status.optDouble("snooze_until", 0.0) * 1000 > System.currentTimeMillis(),
                     smallReady = status.optBoolean("small_ready"), bigReady = status.optBoolean("big_ready"),
                     defaultModel = defM, hasApiKey = hasKey
                 )
-                if (ui.activePanel == "cloud_desktop" || usesCloudDesktop || ui.cloudDesktopPipVisible) refreshCloudDesktopFrame()
+                if (ui.activePanel == "cloud_desktop") refreshCloudDesktopFrame()
                 if (before == revision) cacheRoster(ui.bots, ui.primary, serverScope)
                 val requested = pendingOpenBot
                 if (requested != null) { pendingOpenBot = null; if (bot(requested) != null) open(requested) }
@@ -800,7 +958,9 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
         streamLock.withLock {
             runCatching {
                 val started = SystemClock.uptimeMillis()
-                val status = request("GET", "/api/status")
+                val afterId = lastServerMessageId()
+                val statusQuery = if (!afterId.isNullOrBlank()) JSONObject().put("after_id", afterId) else null
+                val status = request("GET", "/api/status", null, statusQuery)
                 val rtt = SystemClock.uptimeMillis() - started
                 // 1. Always merge recent_tail immediately so completed messages appear in 0ms without an extra RTT!
                 status.optJSONArray("recent_tail")?.objects()?.mapNotNull { runCatching { PulseMessage.from(it) }.getOrNull() }?.let {
@@ -844,11 +1004,22 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                 val preservedText = resolveStreamText(effectiveSBot ?: effectiveWorking, streamTurnId, rawStreamText)
                 val pacedText = applyPacedStreamText(effectiveSBot ?: effectiveWorking, preservedText)
                 val thoughtText = stream?.optString("thought").orEmpty().ifBlank { if (effectiveSBot != null && stream == null) ui.streamThought else "" }
-                val execTrace = (execution?.optJSONArray("trace") ?: stream?.optJSONArray("trace"))?.objects() ?: if (effectiveSBot != null || effectiveWorking != null) ui.streamTrace else emptyList()
-                val curTool = stream?.optString("tool")?.takeIf { it.isNotBlank() } ?: execution?.optString("tool").orEmpty()
+                val execArr = execution?.optJSONArray("trace")?.objects().orEmpty()
+                val streamArr = stream?.optJSONArray("trace")?.objects().orEmpty()
+                val rawExecTrace = if (streamArr.size >= execArr.size && streamArr.isNotEmpty()) streamArr else execArr
+                val sameActiveBot = (effectiveSBot != null || effectiveWorking != null) && (ui.streamBotId == (effectiveSBot ?: effectiveWorking) || ui.workingBot == (effectiveSBot ?: effectiveWorking))
+                val execTrace = if (effectiveSBot == null && effectiveWorking == null) emptyList() else mergeMonotonicTrace(ui.streamTrace, rawExecTrace, sameActiveBot)
+                val streamChoices = if (effectiveSBot == null && effectiveWorking == null) emptyList() else PulseChoice.parseArray(stream?.optJSONArray("choices")).ifEmpty { if (sameActiveBot) ui.streamChoices else emptyList() }
+                val subAgents = stream?.optJSONArray("sub_agents")?.objects() ?: if (effectiveSBot != null || effectiveWorking != null) ui.streamSubAgents else emptyList()
+                val todos = stream?.optJSONArray("todos")?.objects() ?: if (effectiveSBot != null || effectiveWorking != null) ui.streamTodos else emptyList()
+                val sTool = if (stream == null || stream.isNull("tool")) "" else stream.optString("tool").takeIf { it != "null" }.orEmpty()
+                val eTool = if (execution == null || execution.isNull("tool")) "" else execution.optString("tool").takeIf { it != "null" }.orEmpty()
+                val curTool = sTool.ifBlank { eTool }.ifBlank { if ((effectiveSBot != null || effectiveWorking != null) && execTrace.isNotEmpty()) ui.streamTool.ifBlank { "已执行 ${execTrace.size} 步" } else "" }
                 val usesCloudDesktop = curTool == "cloud_desktop" || execTrace.any { it.optString("tool") == "cloud_desktop" }
                 val startedSec = execution?.optDouble("started_at", 0.0) ?: 0.0
                 val startedMs = if (startedSec > 0) (startedSec * 1000).toLong() else if (effectiveSBot != null || effectiveWorking != null) (ui.streamStartedAt.takeIf { it > 0L } ?: System.currentTimeMillis()) else 0L
+                val (ctxTokensMap, ctxMsgsMap) = parseContextByBot(status.optJSONObject("context_by_bot"))
+                val remoteCompactThresh = status.optInt("auto_compact_tokens", 0)
                 ui = ui.copy(
                     online = true,
                     latency = rtt,
@@ -862,11 +1033,16 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                     streamThought = thoughtText,
                     streamTool = curTool,
                     streamTrace = execTrace,
+                    streamChoices = streamChoices,
+                    streamSubAgents = subAgents,
+                    streamTodos = todos,
                     streamStartedAt = startedMs,
-                    cloudDesktopLiveBotId = if (usesCloudDesktop) (effectiveSBot ?: effectiveWorking) else ui.cloudDesktopLiveBotId,
-                    cloudDesktopPipVisible = ui.cloudDesktopPipVisible || usesCloudDesktop
+                    contextTokensByBot = if (ctxTokensMap.isNotEmpty()) ctxTokensMap else ui.contextTokensByBot,
+                    contextMsgsByBot = if (ctxMsgsMap.isNotEmpty()) ctxMsgsMap else ui.contextMsgsByBot,
+                    autoCompactTokens = if (remoteCompactThresh >= 8000 && ui.activePanel != "settings") remoteCompactThresh.toString() else ui.autoCompactTokens,
+                    cloudDesktopLiveBotId = if (usesCloudDesktop) (effectiveSBot ?: effectiveWorking) else ui.cloudDesktopLiveBotId
                 )
-                if (ui.activePanel == "cloud_desktop" || usesCloudDesktop || ui.cloudDesktopPipVisible) refreshCloudDesktopFrame()
+                if (ui.activePanel == "cloud_desktop") refreshCloudDesktopFrame()
             }
         }
     }
@@ -897,7 +1073,10 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
     }
 
     // --- Pure Compose Panels (Settings, Bot Editor, Vault) ---
-    fun closePanel() { ui = ui.copy(activePanel = null) }
+    fun closePanel() {
+        cloudStreamJob?.cancel()
+        ui = ui.copy(activePanel = null)
+    }
 
     fun openSettings() {
         dismissMenu()
@@ -916,27 +1095,69 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                 localCfg.optJSONObject("small_brain")?.optString("model").orEmpty()
             }
         }
+        val savedApp = saved.optString("appearance", "dark").let { if (it == "light") "light" else "dark" }
+        val savedCompact = localCfg.optInt("auto_compact_tokens", 0).takeIf { it >= 8000 }?.toString() ?: ui.autoCompactTokens
         ui = ui.copy(
             activePanel = "settings",
             serverUrl = saved.optString("serverUrl", SecureTransport.DEFAULT_SERVER),
             apiBaseUrl = storedUrl,
             apiKeyInput = storedKey,
             defaultModel = storedModel.ifBlank { ui.defaultModel },
+            autoCompactTokens = savedCompact,
             backgroundService = saved.optBoolean("background", true),
-            appearance = saved.optString("appearance", "system")
+            appearance = savedApp,
+            dark = savedApp != "light"
         )
+        checkForUpdates(silent = true)
         perform {
             val remote = request("GET", "/api/config")
             val rUrl = remote.optString("api_base_url").ifBlank { remote.optJSONObject("big_brain")?.optString("base_url").orEmpty() }
             val rModel = remote.optString("default_model").ifBlank { remote.optJSONObject("big_brain")?.optString("model").orEmpty() }
+            val rCompact = remote.optInt("auto_compact_tokens", 120000).coerceIn(8000, 1000000)
             ui = ui.copy(
                 apiBaseUrl = if (ui.apiBaseUrl == "https://api.openai.com/v1" && rUrl.isNotBlank()) rUrl else ui.apiBaseUrl,
                 defaultModel = ui.defaultModel.ifBlank { rModel },
                 hasApiKey = remote.optBoolean("has_api_key", storedKey.isNotBlank()),
                 curiosityEnabledGlobal = remote.optBoolean("enabled", true),
-                curiosityMinutes = remote.optInt("curiosity_interval_minutes", 90).toString()
+                curiosityMinutes = remote.optInt("curiosity_interval_minutes", 90).toString(),
+                autoCompactTokens = rCompact.toString()
             )
         }
+    }
+
+    fun checkForUpdates(silent: Boolean = false) {
+        if (ui.checkingUpdate) return
+        ui = ui.copy(checkingUpdate = true)
+        scope.launch {
+            try {
+                val base = ui.serverUrl.trim().ifBlank { SecureTransport.DEFAULT_SERVER }.trimEnd('/')
+                val releaseObj = withContext(Dispatchers.IO) {
+                    val conn = (java.net.URL("$base/download/release.json").openConnection() as java.net.HttpURLConnection).apply {
+                        connectTimeout = 6000
+                        readTimeout = 6000
+                    }
+                    conn.inputStream.bufferedReader().use { JSONObject(it.readText()) }
+                }
+                val ver = releaseObj.optString("versionName", releaseObj.optString("tag_name", "").removePrefix("v"))
+                val notes = releaseObj.optString("body", releaseObj.optString("notes", ""))
+                val hasNew = ver.isNotBlank() && ver != "2.8.5"
+                ui = ui.copy(latestReleaseVersion = ver, latestReleaseNotes = notes, updateAvailable = hasNew)
+                if (!silent) {
+                    toast(if (hasNew) "发现新版本 v$ver，点击下方按钮即可下载安装" else "当前已是最新版本 v${ver.ifBlank { "2.8.5" }}")
+                }
+            } catch (e: Exception) {
+                if (!silent) toast("正在直接打开最新安装包下载链接…")
+            } finally {
+                ui = ui.copy(checkingUpdate = false)
+            }
+        }
+    }
+
+    fun downloadLatestApk() {
+        val base = ui.serverUrl.trim().ifBlank { SecureTransport.DEFAULT_SERVER }.trimEnd('/')
+        val apkUrl = "$base/download/proactive-agent.apk?t=${System.currentTimeMillis()}"
+        toast("正在启动浏览器下载最新安装包…")
+        openLink(apkUrl)
     }
 
     fun updateSettingsField(
@@ -946,14 +1167,32 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
         defaultModel: String = ui.defaultModel,
         curiosityEnabled: Boolean = ui.curiosityEnabledGlobal,
         curiosityMinutes: String = ui.curiosityMinutes,
+        autoCompactTokens: String = ui.autoCompactTokens,
         backgroundService: Boolean = ui.backgroundService,
-        appearance: String = ui.appearance
+        appearance: String = ui.appearance,
+        motion: Boolean = ui.motion,
+        haptics: Boolean = ui.haptics
     ) {
+        val nextApp = if (appearance == "light") "light" else "dark"
+        val nextDark = nextApp != "light"
+        if (nextDark != ui.dark) {
+            activity.systemBarsFor(nextDark)
+        }
         ui = ui.copy(
             serverUrl = serverUrl, apiBaseUrl = apiBaseUrl, apiKeyInput = apiKeyInput,
             defaultModel = defaultModel, curiosityEnabledGlobal = curiosityEnabled,
-            curiosityMinutes = curiosityMinutes, backgroundService = backgroundService, appearance = appearance
+            curiosityMinutes = curiosityMinutes, autoCompactTokens = autoCompactTokens,
+            backgroundService = backgroundService,
+            appearance = nextApp, dark = nextDark, motion = motion, haptics = haptics
         )
+        draftWriter.submit {
+            synchronized(SecurePrefs::class.java) {
+                val s = SecurePrefs.read(activity)
+                s.put("appearance", nextApp).put("motion", motion).put("haptics", haptics)
+                SecurePrefs.save(activity, s)
+                UiPreferences.update(activity, JSONObject().put("appearance", nextApp).put("motion", motion).put("haptics", haptics))
+            }
+        }
     }
 
     fun fetchModels(forBotEditor: Boolean = false) {
@@ -989,7 +1228,8 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
         val cleanKey = ui.apiKeyInput.trim()
         val cleanModel = ui.defaultModel.trim()
         val minutes = (ui.curiosityMinutes.toIntOrNull() ?: 90).coerceIn(5, 1440)
-        ui = ui.copy(savingSettings = true)
+        val compactTokens = (ui.autoCompactTokens.toIntOrNull() ?: 120000).coerceIn(8000, 1000000)
+        ui = ui.copy(savingSettings = true, autoCompactTokens = compactTokens.toString())
         perform {
             try {
                 withContext(Dispatchers.IO) {
@@ -997,9 +1237,12 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                     s.put("serverUrl", cleanServer)
                     s.put("deviceToken", s.optString("deviceToken").ifBlank { SecureTransport.defaultToken() })
                     s.put("background", ui.backgroundService)
-                    s.put("appearance", ui.appearance)
+                    val normApp = if (ui.appearance == "light") "light" else "dark"
+                    s.put("appearance", normApp)
+                    UiPreferences.update(activity, JSONObject().put("appearance", normApp).put("motion", ui.motion).put("haptics", ui.haptics))
                     val localCfg = s.optJSONObject("config") ?: JSONObject()
                     localCfg.put("api_base_url", cleanBase)
+                    localCfg.put("auto_compact_tokens", compactTokens)
                     if (cleanKey.isNotBlank()) localCfg.put("api_key", cleanKey)
                     if (cleanModel.isNotBlank()) localCfg.put("default_model", cleanModel)
                     val brainObj = JSONObject().put("base_url", cleanBase).put("model", cleanModel)
@@ -1018,13 +1261,11 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                     .put("api_base_url", cleanBase)
                     .put("enabled", ui.curiosityEnabledGlobal)
                     .put("curiosity_interval_minutes", minutes)
+                    .put("auto_compact_tokens", compactTokens)
                 if (cleanKey.isNotBlank()) updatePayload.put("api_key", cleanKey)
                 if (cleanModel.isNotBlank()) updatePayload.put("default_model", cleanModel)
                 request("POST", "/api/config", updatePayload)
-                val dark = when (ui.appearance) {
-                    "dark" -> true; "light" -> false
-                    else -> activity.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK == Configuration.UI_MODE_NIGHT_YES
-                }
+                val dark = ui.appearance != "light"
                 activity.systemBarsFor(dark)
                 RootPhoneHarness.initialize(activity)
                 if (ui.backgroundService && !AgentForegroundService.running) {
@@ -1221,11 +1462,18 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
             try {
                 val rRes = runCatching { request("GET", "/api/routines") }.getOrNull()
                 val dRes = runCatching { request("GET", "/api/deadlines") }.getOrNull()
+                val wRes = runCatching { request("GET", "/api/watchdogs") }.getOrNull()
+                val pRes = runCatching { request("GET", "/api/memories/pins") }.getOrNull()
                 val merged = JSONObject()
                     .put("routines", rRes?.optJSONArray("routines") ?: JSONArray())
                     .put("deadlines", dRes?.optJSONArray("deadlines") ?: JSONArray())
                     .put("timers", rRes?.optJSONArray("timers") ?: JSONArray())
-                ui = ui.copy(schedulesData = merged, schedulesLoading = false)
+                ui = ui.copy(
+                    schedulesData = merged,
+                    watchdogs = wRes?.optJSONArray("watchdogs")?.objects() ?: ui.watchdogs,
+                    pinnedMemories = pRes?.optJSONArray("pins")?.objects() ?: ui.pinnedMemories,
+                    schedulesLoading = false
+                )
             } finally {
                 ui = ui.copy(schedulesLoading = false)
             }
@@ -1253,6 +1501,15 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
         if (prompt.isBlank()) return
         setDraft(prompt)
         send()
+    }
+
+    fun consumeChoiceAndSend(messageId: String, prompt: String) {
+        if (prompt.isBlank()) return
+        ui = ui.copy(
+            consumedChoiceIds = ui.consumedChoiceIds + messageId,
+            streamChoices = emptyList()
+        )
+        sendQuickPrompt(prompt)
     }
 
     fun retryMessage(msg: PulseMessage) {
@@ -1418,6 +1675,7 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
             streamTrace = if (switchingBot && ui.streamBotId != id) emptyList() else ui.streamTrace
         )
         scope.launch { refreshStreamOnly() }
+        loadMemoryPins()
         acknowledge()
     }
     fun requestOpenBot(id: String) { if (id.isBlank()) return; pendingOpenBot = id; if (bot(id) != null) { pendingOpenBot = null; open(id) }; scope.launch { refresh() } }
@@ -1473,12 +1731,21 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
         PulseMenuItem("云端桌面 (Cloud Desktop)", "查看云端浏览器实时画面与触控接管", "cloud") { openCloudDesktop() },
         PulseMenuItem("定时闹钟与例行自动化", "查看和管理每日定点提醒、课表闹钟与巡检", "clock") { openSchedules() },
         PulseMenuItem("透明记忆库 (Obsidian Vault)", "查看或修改 Markdown 记忆与画像", "vault") { openVault("INDEX.md") },
-        PulseMenuItem("API 与模型设置", "填入 API Key，一键拉取 /models 并同步", "settings") { openSettings() }))
+        PulseMenuItem("设置中心与检查更新", "日夜主题切换、API 模型配置与一键更新客户端", "settings") { openSettings() },
+        PulseMenuItem("⬇ 一键下载最新客户端更新", "直接从云端拉取并安装最新 APK (v2.8.3)", "spark") { downloadLatestApk() }))
     fun botMenu(id: String = ui.botId) {
         val b = bot(id) ?: return
+        val (curTok, threshTok, msgCnt) = contextStatsFor(id)
+        val pct = ((curTok.toFloat() / threshTok.coerceAtLeast(1)) * 100).toInt()
         val entries = mutableListOf<PulseMenuItem>()
         if (!ui.chatOpen || ui.botId != id) entries += PulseMenuItem("打开对话", icon = "chat") { open(id) }
         entries += listOf(
+            PulseMenuItem(
+                "📦 立即压缩上下文 (${formatTokenCount(curTok)} / ${formatTokenCount(threshTok)} · $pct%)",
+                "当前已积攒 $msgCnt 条消息，点击将早期对话浓缩归档至记忆库",
+                "spark"
+            ) { compactBotContext(id) },
+            PulseMenuItem("⚙️ 自定义上下文自动压缩阈值", "当前达到 ${formatTokenCount(threshTok)} Tokens 时自动压缩", "settings") { openSettings() },
             PulseMenuItem("编辑 Bot 设定与模型", "当前模型：${b.model.ifBlank { ui.defaultModel.ifBlank { "跟随全局默认" } }}", "settings") { openBotEditor(id) },
             PulseMenuItem(if (ui.primary == id) "当前为主助理" else "设为主助理", icon = "spark") { setPrimaryBot(id) },
             PulseMenuItem(if (b.pinned) "取消置顶" else "置顶到首页", icon = "pin") { placement(id, "pinned", !b.pinned) },
@@ -1491,18 +1758,113 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
         }
         menu(b.name, entries)
     }
-    fun actionsMenu() = menu("工作台与工具", listOf(
-        PulseMenuItem("上传文件到工作区", "供当前 Bot 读取、编辑或运行脚本", "file") { chooseAttachment() },
-        PulseMenuItem("弹出手机虚拟屏悬浮小窗", "在桌面上悬浮独立虚拟屏，点按展开触控", "screen") {
-            val raw = ui.draft.trim()
-            if (raw.isNotBlank()) sendPhone(raw) else launchFloatingVirtualDisplay()
-        },
-        PulseMenuItem("打开云端桌面", "查看云端浏览器实时画面或接管", "cloud") { secondary("computer") },
-        PulseMenuItem("定时闹钟与例行自动化", "管理每日准点提醒与后台巡检", "clock") { openSchedules() },
-        PulseMenuItem("触发好奇心主动搭话", "让主助理结合记忆投递实用情报或追问", "spark") { job("curiosity") },
-        PulseMenuItem("打开透明记忆库", "查看或编辑 memory_vault/*.md", "vault") { openVault("INDEX.md") },
-        PulseMenuItem("编辑当前 Bot 模型与设定", icon = "settings") { openBotEditor(ui.botId) },
-        PulseMenuItem("免打扰 1 小时", icon = "moon") { job("snooze") }))
+
+    internal fun parseContextByBot(obj: JSONObject?): Pair<Map<String, Int>, Map<String, Int>> {
+        if (obj == null) return emptyMap<String, Int>() to emptyMap()
+        val tokMap = mutableMapOf<String, Int>()
+        val msgMap = mutableMapOf<String, Int>()
+        obj.keys().forEach { bid ->
+            val sub = obj.optJSONObject(bid) ?: return@forEach
+            val cur = sub.optInt("current_tokens", 0)
+            val cnt = sub.optInt("message_count", 0)
+            if (cur > 0) tokMap[bid] = cur
+            if (cnt >= 0) msgMap[bid] = cnt
+        }
+        return tokMap to msgMap
+    }
+
+    internal fun estimateLocalTextTokens(text: String): Int {
+        if (text.isEmpty()) return 0
+        var cjk = 0
+        for (ch in text) {
+            if (ch in '\u4e00'..'\u9fff') cjk++
+        }
+        val other = (text.length - cjk).coerceAtLeast(0)
+        return cjk + (other / 3)
+    }
+
+    /** Returns Triple(currentTokens, thresholdTokens, messageCount) for the given bot. */
+    fun contextStatsFor(botId: String = ui.botId): Triple<Int, Int, Int> {
+        val thresh = (ui.autoCompactTokens.toIntOrNull() ?: 120000).coerceIn(8000, 1000000)
+        val localMsgs = ui.messages.filter { it.botId == botId }
+        val localEst = 1800 + localMsgs.sumOf { estimateLocalTextTokens(it.text) + 12 }
+        val serverTok = ui.contextTokensByBot[botId] ?: 0
+        val curTok = maxOf(serverTok, localEst)
+        val msgCnt = ui.contextMsgsByBot[botId] ?: localMsgs.size
+        return Triple(curTok, thresh, msgCnt)
+    }
+
+    fun formatTokenCount(tokens: Int): String {
+        return when {
+            tokens >= 10_000 -> String.format(Locale.US, "%.1fK", tokens / 1000.0).removeSuffix(".0K") + (if (String.format(Locale.US, "%.1fK", tokens / 1000.0).endsWith(".0K")) "K" else "")
+            tokens >= 1_000 -> String.format(Locale.US, "%.1fK", tokens / 1000.0)
+            else -> tokens.toString()
+        }
+    }
+
+    fun compactBotContext(botId: String = ui.botId) {
+        if (ui.compactingContext) return
+        dismissMenu()
+        val thresh = (ui.autoCompactTokens.toIntOrNull() ?: 120000).coerceIn(8000, 1000000)
+        ui = ui.copy(compactingContext = true)
+        toast("正在浓缩并归档上下文…")
+        perform {
+            try {
+                val payload = JSONObject()
+                    .put("bot_id", botId)
+                    .put("auto_compact_tokens", thresh)
+                val res = request("POST", "/api/context/compact", payload)
+                val (ctxTokensMap, ctxMsgsMap) = parseContextByBot(res.optJSONObject("context_by_bot"))
+                if (ctxTokensMap.isNotEmpty()) {
+                    ui = ui.copy(contextTokensByBot = ctxTokensMap, contextMsgsByBot = ctxMsgsMap)
+                }
+                val resultObj = res.optJSONObject("result")
+                if (resultObj != null) {
+                    val cnt = resultObj.optInt("compacted_messages", 0)
+                    val beforeT = resultObj.optInt("before_tokens", 0)
+                    val afterT = resultObj.optInt("after_tokens", 0)
+                    // Full refresh to replace compacted messages with the new compact_summary bubble
+                    val msgResp = request("GET", "/api/messages", null, JSONObject().put("limit", 120))
+                    val freshMsgs = msgResp.getJSONArray("messages").objects().map(PulseMessage::from)
+                    mergeRemoteMessages(freshMsgs, fullReplace = true)
+                    ui = ui.copy(messages = combinedMessages())
+                    toast("已压缩 $cnt 条早期对话：${formatTokenCount(beforeT)} → ${formatTokenCount(afterT)} Tokens")
+                } else {
+                    toast("当前对话条数较少，暂无需压缩")
+                }
+            } finally {
+                ui = ui.copy(compactingContext = false)
+            }
+        }
+    }
+    fun actionsMenu() {
+        val (curTok, threshTok, msgCnt) = contextStatsFor(ui.botId)
+        val pct = ((curTok.toFloat() / threshTok.coerceAtLeast(1)) * 100).toInt()
+        menu("工作台与工具", listOf(
+            PulseMenuItem(
+                "📦 压缩上下文 (${formatTokenCount(curTok)} / ${formatTokenCount(threshTok)} · $pct%)",
+                "已积攒 $msgCnt 条对话，点击浓缩并在对话框生成归档条目",
+                "spark"
+            ) { compactBotContext(ui.botId) },
+            PulseMenuItem(
+                "⚙️ 自定义上下文压缩阈值",
+                "当前满 ${formatTokenCount(threshTok)} 自动压缩，点此修改设置",
+                "settings"
+            ) { openSettings() },
+            PulseMenuItem("上传文件到工作区", "供当前 Bot 读取、编辑或运行脚本", "file") { chooseAttachment() },
+            PulseMenuItem("弹出手机虚拟屏悬浮小窗", "在桌面上悬浮独立虚拟屏，点按展开触控", "screen") {
+                val raw = ui.draft.trim()
+                if (raw.isNotBlank()) sendPhone(raw) else launchFloatingVirtualDisplay()
+            },
+            PulseMenuItem("打开云端桌面", "查看云端浏览器实时画面或接管", "cloud") { secondary("computer") },
+            PulseMenuItem("定时闹钟与例行自动化", "管理每日准点提醒与后台巡检", "clock") { openSchedules() },
+            PulseMenuItem("触发好奇心主动搭话", "让主助理结合记忆投递实用情报或追问", "spark") { job("curiosity") },
+            PulseMenuItem("打开透明记忆库", "查看或编辑 memory_vault/*.md", "vault") { openVault("INDEX.md") },
+            PulseMenuItem("编辑当前 Bot 模型与设定", icon = "settings") { openBotEditor(ui.botId) },
+            PulseMenuItem("设置中心与检查更新", "切换日间/夜间模式、API 配置或更新 APK", "settings") { openSettings() },
+            PulseMenuItem("免打扰 1 小时", icon = "moon") { job("snooze") }
+        ))
+    }
 
     fun launchFloatingVirtualDisplay() {
         dismissMenu()
@@ -1597,6 +1959,9 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
             streamThought = "正在向云端发送指令并建立实时流…",
             streamTool = "",
             streamTrace = emptyList(),
+            streamChoices = emptyList(),
+            streamSubAgents = emptyList(),
+            streamTodos = emptyList(),
             streamStartedAt = System.currentTimeMillis(),
             reply = null,
             messages = combinedMessages()
@@ -1718,8 +2083,125 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
     }
     fun stop() {
         val phone = RootPhoneHarness.changes.value
-        if (phone.active && phone.botId == ui.botId) { RootPhoneHarness.stop(activity); toast("正在停止手机执行…"); return }
-        perform { request("POST", if (ui.computerBot == ui.botId) "/api/computer/stop" else "/api/stop"); toast("正在停止执行…"); refresh() }
+        val targetBot = ui.botId
+        if (phone.active && phone.botId == targetBot) {
+            RootPhoneHarness.stop(activity)
+            if (ui.streamBotId != targetBot && remoteWorkingBot != targetBot) {
+                return
+            }
+        }
+        val partialText = ui.streamText.takeIf { !isStreamPlaceholder(it) && it.isNotBlank() }
+        if (partialText != null && !(phone.active && phone.botId == targetBot)) {
+            val frozenMsg = PulseMessage(
+                "stopped-${System.currentTimeMillis()}",
+                targetBot,
+                "assistant",
+                partialText,
+                "chat",
+                "small",
+                System.currentTimeMillis() / 1000.0,
+                "",
+                JSONArray(ui.streamTrace).toString(),
+                false,
+                targetBot,
+                bot(targetBot)?.name ?: targetBot,
+                ui.streamChoices
+            )
+            mergeRemoteMessages(listOf(frozenMsg), fullReplace = false)
+        }
+        if (currentTurnId.isNotBlank()) markTurnCompleted(currentTurnId)
+        remoteWorkingBot = null
+        sendGuardBotId = null
+        sendGuardUntilUptime = 0L
+        targetStreamFullText = ""
+        ui = ui.copy(
+            messages = combinedMessages(),
+            busyBot = null,
+            workingBot = null,
+            streamBotId = null,
+            streamText = "",
+            streamThought = "",
+            streamTool = "",
+            streamTrace = emptyList(),
+            streamChoices = emptyList(),
+            streamSubAgents = emptyList(),
+            streamTodos = emptyList(),
+            streamStartedAt = 0L
+        )
+        scope.launch {
+            runCatching {
+                if (ui.computerBot == targetBot) {
+                    request("POST", "/api/computer/stop")
+                } else {
+                    request("POST", "/api/stop", JSONObject().put("bot_id", targetBot))
+                }
+                refresh()
+            }
+        }
+    }
+
+    fun startEditingMessage(message: PulseMessage?) {
+        ui = ui.copy(editingMessage = message, draft = message?.text ?: ui.draft)
+    }
+
+    fun editMessageAndResend(message: PulseMessage, newText: String) {
+        val clean = newText.trim()
+        if (clean.isEmpty()) return
+        val id = message.botId
+        ui = ui.copy(editingMessage = null, draft = "", workingBot = id, streamBotId = id, streamText = "正在思考…", streamStartedAt = System.currentTimeMillis())
+        perform {
+            request("POST", "/api/messages/edit", JSONObject().put("message_id", message.id).put("text", clean).put("bot_id", id))
+            refresh(force = true)
+        }
+    }
+
+    fun rerollMessage(message: PulseMessage) {
+        val id = message.botId
+        ui = ui.copy(workingBot = id, streamBotId = id, streamText = "正在重新生成…", streamStartedAt = System.currentTimeMillis())
+        perform {
+            request("POST", "/api/messages/reroll", JSONObject().put("bot_id", id).put("message_id", message.id))
+            refresh(force = true)
+        }
+    }
+
+    fun loadMemoryPins() {
+        perform {
+            val res = request("GET", "/api/memories/pins")
+            ui = ui.copy(pinnedMemories = res.optJSONArray("pins")?.objects() ?: emptyList())
+        }
+    }
+
+    fun addMemoryPin(text: String) {
+        val clean = text.trim()
+        if (clean.isEmpty()) return
+        perform {
+            val res = request("POST", "/api/memories/pins", JSONObject().put("action", "add").put("text", clean))
+            ui = ui.copy(pinnedMemories = res.optJSONArray("pins")?.objects() ?: ui.pinnedMemories)
+            toast("已钉住记忆 📌")
+        }
+    }
+
+    fun removeMemoryPin(pinId: String) {
+        perform {
+            val res = request("POST", "/api/memories/pins", JSONObject().put("action", "remove").put("pin_id", pinId))
+            ui = ui.copy(pinnedMemories = res.optJSONArray("pins")?.objects() ?: emptyList())
+            toast("已取消钉住")
+        }
+    }
+
+    fun loadWatchdogs() {
+        perform {
+            val res = request("GET", "/api/watchdogs")
+            ui = ui.copy(watchdogs = res.optJSONArray("watchdogs")?.objects() ?: emptyList())
+        }
+    }
+
+    fun stopWatchdog(watchdogId: String) {
+        perform {
+            request("POST", "/api/watchdogs/$watchdogId/stop")
+            loadWatchdogs()
+            toast("已停止哨兵监控：$watchdogId")
+        }
     }
     fun reply(message: PulseMessage?) { ui = ui.copy(reply = message) }
     fun copy(text: String) { activity.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("Pulse Bot", text)); toast("已复制。") }

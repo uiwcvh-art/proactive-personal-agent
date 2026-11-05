@@ -9,9 +9,13 @@ public class AgentActionReceiver extends BroadcastReceiver {
         return PendingIntent.getBroadcast(c,(action+id).hashCode(),i,PendingIntent.FLAG_IMMUTABLE|PendingIntent.FLAG_UPDATE_CURRENT);
     }
     @Override public void onReceive(Context c,Intent i){
+        String action=i.getAction(),id=i.getStringExtra("id");
+        AgentForegroundService.stopEmergencyAlarm(c);
+        if("stop_alarm".equals(action)){
+            return;
+        }
         PendingResult pending=goAsync();
         new Thread(()->{try{
-            String action=i.getAction(),id=i.getStringExtra("id");
             JSONObject body=new JSONObject();
             if("ack".equals(action))body.put("ids",new JSONArray().put(id));
             else body.put("minutes",i.getIntExtra("minutes",60));
