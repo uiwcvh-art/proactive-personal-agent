@@ -1,0 +1,4 @@
+nginx: the configuration file /etc/nginx/nginx.conf syntax is ok
+nginx: configuration file /etc/nginx/nginx.conf test is successful
+active
+{"status":"ok","service":"proactive-agent","version":"1.0.0"}Deployed host venv service and isolated nginx path. Protected services were not changed.

@@ -1,0 +1,6 @@
+# Separate venv: these versions never replace the personal-agent API's dependencies.
+browser-use==0.13.14
+fastapi==0.121.0
+uvicorn[standard]==0.38.0
+playwright==1.56.0
+mss==10.1.0

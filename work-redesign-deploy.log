@@ -1,0 +1,16 @@
+curl: (7) Failed to connect to 127.0.0.1 port 18190 after 0 ms: Could not connect to server
+curl: (7) Failed to connect to 127.0.0.1 port 18190 after 0 ms: Could not connect to server
+{"status":"ok","service":"proactive-agent","version":"1.1.0"}
+{
+  "health": {
+    "status": "ok",
+    "service": "proactive-agent",
+    "version": "1.1.0"
+  },
+  "protected_services_unchanged": true,
+  "protected_services_checked": 10,
+  "backup": "/opt/proactive-agent/.deploy/server-before-20261102T103359Z.tgz",
+  "nginx_changes": false,
+  "unit_changes": false,
+  "dependency_changes": false
+}

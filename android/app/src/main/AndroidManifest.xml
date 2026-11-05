@@ -1,0 +1,112 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <queries><intent><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent></queries>
+    <application
+        android:name=".PulseApplication"
+        android:theme="@style/AppTheme"
+        android:label="Pulse Bot"
+        android:icon="@drawable/ic_launcher"
+        android:enableOnBackInvokedCallback="true"
+        android:resizeableActivity="true"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:supportsRtl="true"
+        android:usesCleartextTraffic="true">
+        <meta-data android:name="android.max_aspect" android:value="2.6" />
+        <meta-data android:name="android.supports_size_changes" android:value="true" />
+        <property android:name="android.window.PROPERTY_SUPPORTS_MULTI_INSTANCE_SYSTEM_UI" android:value="true" />
+
+        <activity
+            android:name=".LauncherActivity"
+            android:exported="true"
+            android:theme="@style/AppTheme"
+            android:resizeableActivity="true"
+            android:supportsPictureInPicture="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|uiMode|density">
+            <layout
+                android:defaultWidth="380dp"
+                android:defaultHeight="680dp"
+                android:gravity="top|end"
+                android:minWidth="220dp"
+                android:minHeight="320dp" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.MULTIWINDOW_LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".NativePulseActivity"
+            android:exported="false"
+            android:resizeableActivity="true"
+            android:supportsPictureInPicture="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|uiMode|density"
+            android:windowSoftInputMode="adjustResize">
+            <layout
+                android:defaultWidth="380dp"
+                android:defaultHeight="680dp"
+                android:gravity="top|end"
+                android:minWidth="220dp"
+                android:minHeight="320dp" />
+        </activity>
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="false"
+            android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|uiMode|density"
+            android:windowSoftInputMode="adjustResize" />
+
+        <activity
+            android:name=".NativePhoneActivity"
+            android:exported="false"
+            android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|uiMode|density"
+            android:windowSoftInputMode="adjustResize" />
+
+        <activity
+            android:name=".DisplayTestActivity"
+            android:exported="false"
+            android:theme="@style/AppTheme"
+            android:taskAffinity="dev.bubuki.proactive.cua"
+            android:resizeableActivity="true" />
+
+        <service android:name=".AgentForegroundService" android:exported="false" android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="User-enabled persistent personal assistant encrypted WebSocket for notifications and time-critical reminders" />
+        </service>
+        <service android:name=".RootPhoneService" android:exported="false" android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="User-started Root virtual workspace task; visible progress, explicit stop, and isolated display input" />
+        </service>
+        <service android:name=".AgentNotificationListener" android:exported="true" android:label="共生通知状态监听" android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter><action android:name="android.service.notification.NotificationListenerService" /></intent-filter>
+        </service>
+        <service
+            android:name=".PulseAccessibilityService"
+            android:exported="true"
+            android:label="Pulse 虚拟屏无障碍节点读取"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <receiver android:name=".AgentActionReceiver" android:exported="false" />
+        <receiver android:name=".BootReceiver" android:exported="true">
+            <intent-filter><action android:name="android.intent.action.BOOT_COMPLETED" /></intent-filter>
+        </receiver>
+        <provider android:name="androidx.core.content.FileProvider" android:authorities="${applicationId}.avatar-files" android:exported="false" android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/avatar_paths" />
+        </provider>
+    </application>
+</manifest>

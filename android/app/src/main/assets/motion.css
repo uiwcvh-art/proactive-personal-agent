@@ -1,0 +1,34 @@
+/* Navigation moves as one surface, including its header. No layout animation. */
+.app-shell {background:var(--bg);touch-action:pan-y;isolation:isolate}
+.route-ghost {overflow:hidden;background:var(--bg);contain:layout paint;user-select:none}
+.route-ghost main {min-height:0;overflow:hidden}
+.route-ghost .page.active {display:flex}
+.route-moving::before {content:'';position:absolute;left:0;top:0;bottom:0;width:1px;background:var(--line);pointer-events:none;z-index:1}
+[data-visual-id=markdownPreview] {flex:1;min-height:0;overflow:auto;padding-bottom:15px}
+.message {animation:none}
+button:not(:disabled):active {transform:none;opacity:1}
+.icon-button,.primary,.secondary,.send-button,.stop-button,.account-avatar {transition:transform 160ms cubic-bezier(.2,.8,.2,1),background-color 140ms,opacity 140ms}
+.icon-button:not(:disabled):active,.primary:not(:disabled):active,.secondary:not(:disabled):active,.send-button:not(:disabled):active,.stop-button:not(:disabled):active,.account-avatar:active {transform:scale(.94);opacity:.82}
+.bot-row,.settings-row,.tool-row,.file-row,.routine-card,.sheet-menu button {transition:background-color 130ms}
+.bot-row:active,.settings-row:active,.tool-row:active,.file-row:active,.routine-card:active,.sheet-menu button:active {background:var(--fill)}
+.toggle {transition:background-color 200ms}
+.toggle:after {left:3px;transition:transform 250ms cubic-bezier(.2,.85,.25,1.15),background-color 160ms}
+.toggle.on:after {left:3px;transform:translateX(15px)}
+.bottom-sheet {will-change:auto;backdrop-filter:none;transform-origin:50% 100%;padding-bottom:max(28px,env(safe-area-inset-bottom))}
+.bottom-sheet::backdrop {backdrop-filter:none;background:#0006}
+.bottom-sheet.sheet-preparing::backdrop {opacity:0}
+.bottom-sheet.sheet-entering::backdrop {animation:sheet-scrim-in 280ms ease-out both}
+.bottom-sheet.sheet-leaving::backdrop {animation:sheet-scrim-out 230ms ease-in both}
+.sheet-handle,.sheet-header {touch-action:none;user-select:none}
+.sheet-handle {padding:0;position:relative}
+.sheet-handle:before {content:'';position:absolute;inset:-12px -65px}
+.sheet-dragging {will-change:transform}
+.composer {transition:none}
+.send-button svg {transition:transform 180ms cubic-bezier(.2,.85,.25,1.1),opacity 140ms}
+.send-button:disabled svg {transform:translateY(1px);opacity:.6}
+.filter-pills button,.segmented button {transition:color 150ms,background-color 180ms}
+.toast {transition:opacity 180ms ease,transform 260ms cubic-bezier(.16,1,.3,1);box-shadow:0 5px 22px #0002}
+@keyframes sheet-scrim-in {from{opacity:0}to{opacity:1}}
+@keyframes sheet-scrim-out {from{opacity:1}to{opacity:0}}
+@media(prefers-reduced-motion:reduce) {.route-moving{box-shadow:none}}
+:root[data-motion=off] *, :root[data-motion=off] *::before, :root[data-motion=off] *::after, :root[data-motion=off] dialog::backdrop {animation:none!important;transition:none!important;scroll-behavior:auto!important}

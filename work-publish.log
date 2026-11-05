@@ -1,0 +1,9 @@
+{
+  "url": "http://216.23.82.196/proactive-agent/download/proactive-agent.apk",
+  "head_status": 200,
+  "content_length": 3108668,
+  "local_bytes": 3108668,
+  "download_bytes": 3108668,
+  "sha256": "f9ccbe11f1afe93662c8c6f3be9a660a3f320734ee8d0ce543b23ca580814d15",
+  "download_sha256": "f9ccbe11f1afe93662c8c6f3be9a660a3f320734ee8d0ce543b23ca580814d15"
+}

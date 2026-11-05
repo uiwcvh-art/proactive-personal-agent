@@ -1,0 +1,36 @@
+{
+  "health": {
+    "status": "ok",
+    "service": "proactive-agent",
+    "version": "1.1.0"
+  },
+  "encrypted_endpoints": {
+    "/api/status": {
+      "status": 200,
+      "online": true,
+      "small_ready": false,
+      "big_ready": false
+    },
+    "/api/bots": {
+      "status": 200,
+      "count": 2
+    },
+    "/api/tools": {
+      "status": 200,
+      "names": [
+        "read_file",
+        "write_file",
+        "edit_file",
+        "run_bash",
+        "web_fetch",
+        "web_search"
+      ]
+    },
+    "/api/routines": {
+      "status": 200,
+      "count": 0
+    }
+  },
+  "external_model_calls": 0,
+  "smtp_calls": 0
+}

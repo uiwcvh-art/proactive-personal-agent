@@ -1,0 +1,8 @@
+Collecting tzdata==2025.2
+  Downloading tzdata-2025.2-py2.py3-none-any.whl.metadata (1.4 kB)
+Downloading tzdata-2025.2-py2.py3-none-any.whl (347 kB)
+Installing collected packages: tzdata
+Successfully installed tzdata-2025.2
+
+[notice] A new release of pip is available: 26.0.1 -> 26.2.2
+[notice] To update, run: D:\bubuki\proactive-personal-agent\server\.venv\Scripts\python.exe -m pip install --upgrade pip
