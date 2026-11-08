@@ -20,9 +20,9 @@ final class SecureTransport {
     static final String DEFAULT_SERVER="http://216.23.82.196/proactive-agent";
     private static final String TOKEN_A="";
     private static final String TOKEN_B="";
-    static String defaultToken(){return TOKEN_A+TOKEN_B;}
+    static String defaultToken(){return BuildConfig.DEFAULT_DEVICE_TOKEN;}
     static final OkHttpClient HTTP=new OkHttpClient.Builder().connectTimeout(30,TimeUnit.SECONDS)
-        .readTimeout(300,TimeUnit.SECONDS).writeTimeout(60,TimeUnit.SECONDS).retryOnConnectionFailure(true).build();
+        .readTimeout(300,TimeUnit.SECONDS).writeTimeout(60,TimeUnit.SECONDS).connectionPool(new ConnectionPool(5,25,TimeUnit.SECONDS)).retryOnConnectionFailure(true).build();
     static final MediaType JSON=MediaType.get("application/json; charset=utf-8");
     private static final SecureRandom RNG=new SecureRandom();
     private static volatile String cachedBase=null;
@@ -36,6 +36,20 @@ final class SecureTransport {
         cachedAesKey=null;
         cachedWrappedKeyB64=null;
         cachedAtMs=0L;
+    }
+
+    static String getNodeSource(Context context){
+        try{
+            JSONObject settings=SecurePrefs.read(context);
+            String saved=settings.optString("nodeSource","").trim().toLowerCase();
+            if(!saved.isEmpty())return saved;
+        }catch(Exception ignored){}
+        try{
+            if(context.getResources().getConfiguration().smallestScreenWidthDp>=600){
+                return "phone2";
+            }
+        }catch(Exception ignored){}
+        return "phone";
     }
 
     private final Context context;
@@ -87,6 +101,8 @@ final class SecureTransport {
         Session result=new Session();
         result.key=aesKey;
         result.base=base;
+        String nodeSource=getNodeSource(context);
+        if(!inner.has("source"))inner.put("source",nodeSource);
         inner.put("token",token).put("timestamp",now/1000.0);
         result.packet=encrypt(result.key,inner);
         result.packet.put("key",wrappedKey);
@@ -109,8 +125,12 @@ final class SecureTransport {
 
     JSONObject request(String method,String path,JSONObject body,JSONObject query) throws Exception {
         if(!path.startsWith("/api/")||path.equals("/api/secure"))throw new Exception("不支持的 API 路径");
+        String nodeSource=getNodeSource(context);
+        if(query==null)query=new JSONObject();
+        if(!query.has("source"))query.put("source",nodeSource);
+        if(body!=null&&!body.has("source"))body.put("source",nodeSource);
         JSONObject inner=new JSONObject().put("method",method).put("path",path);
-        if(body!=null)inner.put("body",body);if(query!=null)inner.put("query",query);
+        if(body!=null)inner.put("body",body);inner.put("query",query);
         Session s=session(inner, false);
         Request req=new Request.Builder().url(s.base+"/api/secure").post(RequestBody.create(s.packet.toString(),JSON)).build();
         try(Response response=HTTP.newCall(req).execute()){

@@ -9,11 +9,16 @@ import androidx.compose.animation.core.keyframes
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
@@ -31,11 +36,22 @@ import androidx.core.graphics.PathParser
 private val nativePaths = mapOf(
     "back" to "M15 5L8 12L15 19",
     "next" to "M9 6L15 12L9 18",
+    "chevron_down" to "M6 9L12 15L18 9",
+    "chevron_up" to "M6 15L12 9L18 15",
     "plus" to "M12 5V19M5 12H19",
     "close" to "M6.5 6.5L17.5 17.5M17.5 6.5L6.5 17.5",
     "search" to "M16.5 10.5A6 6 0 1 1 4.5 10.5A6 6 0 1 1 16.5 10.5M15.5 15.5L20 20",
     "send" to "M12 19V5M6 11L12 5L18 11",
     "more" to "M5 12h0.1M12 12h0.1M19 12h0.1",
+    "reply" to "M9 14L4 9L9 4M4 9H14.5A5.5 5.5 0 0 1 20 14.5V19",
+    "check" to "M4.5 12.5L9.2 17L19.5 6.5",
+    "check_double" to "M2.5 12.5L6.8 16.8L15.5 7.5M9.5 12.5L13.8 16.8L22 8",
+    "attach" to "M21.4 11.1L12.2 20.3A6 6 0 0 1 3.7 11.8L12.9 2.6A4 4 0 0 1 18.6 8.3L9.4 17.5A2 2 0 0 1 6.6 14.7L15.1 6.2",
+    "sticker" to "M12 3A9 9 0 1 0 21 12C21 10.5 20.5 9 19.5 8M15 20.5C15 16.5 16.5 15 20.5 15M9 10H9.1M15 10H15.1M9.5 15C10.8 16.3 13.2 16.3 14.5 15",
+    "edit" to "M16.5 3.5A2.1 2.1 0 0 1 19.5 6.5L7 19L3 20L4 16L16.5 3.5Z",
+    "broom" to "M19 5L14 10M4 20L9 15M14.5 6.5L17.5 9.5L9 18L5 19L6 15L14.5 6.5Z",
+    "stop" to "M6.5 6.5H17.5V17.5H6.5Z",
+    "user" to "M12 11A4 4 0 1 0 12 3A4 4 0 1 0 12 11ZM5 20C5 16.5 8.1 14 12 14C15.9 14 19 16.5 19 20",
     "cloud" to "M6.5 18H17.5A4 4 0 0 0 18 10A5.5 5.5 0 0 0 7.5 8.5A4.5 4.5 0 0 0 6.5 18Z",
     "screen" to "M4 5A2 2 0 0 1 6 3H18A2 2 0 0 1 20 5V15A2 2 0 0 1 18 17H6A2 2 0 0 1 4 15V5ZM9 21H15M12 17V21",
     "spark" to "M12 3L14.2 9.8L21 12L14.2 14.2L12 21L9.8 14.2L3 12L9.8 9.8Z",
@@ -50,8 +66,7 @@ private val nativePaths = mapOf(
     "hide" to "M3.5 3.5L20.5 20.5M10.6 5.2L12 5C18 5 21.5 12 21.5 12L18.8 15.3M6.6 6.6C4.2 8.9 2.5 12 2.5 12C2.5 12 6 19 12 19C14.7 19 17 17.7 17 17.7",
     "vault" to "M12 3.5L20.5 8L12 12.5L3.5 8L12 3.5ZM3.5 12L12 16.5L20.5 12M3.5 16L12 20.5L20.5 16",
     "moon" to "M20.2 13.4C16.5 14.3 10.2 10.5 11.1 3.8C2.4 4.7 1.4 19.2 12.2 20.4C18.5 20.4 19.8 15.5 20.2 13.4Z",
-    "bell" to "M5.5 10C5.5 2 18.5 2 18.5 10C18.5 16.2 21 16.8 21 16.8H3C3 16.8 5.5 16.2 5.5 10M9.5 19.5C9.5 22.5 14.5 22.5 14.5 19.5",
-    "check" to "M5 12.5L9.2 16.5L19 6.5"
+    "bell" to "M5.5 10C5.5 2 18.5 2 18.5 10C18.5 16.2 21 16.8 21 16.8H3C3 16.8 5.5 16.2 5.5 10M9.5 19.5C9.5 22.5 14.5 22.5 14.5 19.5"
 )
 
 @Composable
@@ -74,8 +89,8 @@ internal fun PulseIcon(name: String, color: Color, modifier: Modifier = Modifier
         )
         paint.strokeWidth = when (name) {
             "more" -> 3.0f
-            "send", "plus", "back" -> 2.0f
-            else -> 1.75f
+            "send", "plus", "back", "reply", "check_double" -> 2.1f
+            else -> 1.8f
         }
         drawIntoCanvas { canvas ->
             val native = canvas.nativeCanvas
@@ -99,84 +114,124 @@ private val shapePaths = mapOf(
 )
 
 @Composable
-internal fun PulseAvatar(bot: PulseBot, state: NativePulseState, diameter: Dp = 44.dp) {
-    val radius = diameter * 0.34f
+internal fun PulseAvatar(
+    bot: PulseBot,
+    state: NativePulseState,
+    diameter: Dp = 44.dp,
+    showStatusDot: Boolean = false,
+    ringColor: Color = Color(0xFF1C1C1E)
+) {
+    val radius = diameter * 0.36f
     val image = state.avatars[bot.id]
-    if (image != null && bot.avatarVersion.isNotBlank()) {
-        Image(image, null, Modifier.size(diameter).clip(RoundedCornerShape(radius)), contentScale = ContentScale.Crop)
-        return
-    }
-    val shapeKey = remember(bot.shape, bot.id) {
-        if (bot.shape in shapePaths) bot.shape
-        else if (bot.id == "research") "circle"
-        else "flower"
-    }
-    val fill = remember(shapeKey) { PathParser.createPathFromPathData(shapePaths[shapeKey] ?: shapePaths.getValue("flower")) }
-    val fillPaint = remember { Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL } }
-    val baseColor = remember(bot.color) {
-        runCatching { Color(android.graphics.Color.parseColor(bot.color)) }.getOrDefault(Color(0xFF7B61FF))
-    }
-    val infinite = rememberInfiniteTransition(label = "avatar_${bot.id}")
-    val eyeScaleY by infinite.animateFloat(
-        initialValue = 1f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = keyframes {
-                durationMillis = 4200
-                1f at 0
-                1f at 3750
-                0.15f at 3880 using FastOutSlowInEasing
-                1f at 4020 using FastOutSlowInEasing
-                1f at 4200
-            },
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "blink"
-    )
-    val isSpeaking = state.streamSpeakerId == bot.id
-    val eyeShiftX by infinite.animateFloat(
-        initialValue = 0f,
-        targetValue = if (isSpeaking) 3.5f else 1.2f,
-        animationSpec = infiniteRepeatable(
-            animation = keyframes {
-                durationMillis = if (isSpeaking) 1200 else 3600
-                0f at 0
-                (if (isSpeaking) 3.5f else 1.2f) at (if (isSpeaking) 600 else 1800) using FastOutSlowInEasing
-                0f at (if (isSpeaking) 1200 else 3600)
-            },
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "glance"
-    )
-    Canvas(Modifier.size(diameter)) {
-        val s = size.minDimension / 100f
-        fillPaint.color = android.graphics.Color.argb(
-            (baseColor.alpha * 255).toInt(),
-            (baseColor.red * 255).toInt(),
-            (baseColor.green * 255).toInt(),
-            (baseColor.blue * 255).toInt()
-        )
-        drawIntoCanvas {
-            val native = it.nativeCanvas
-            native.save()
-            native.scale(s, s)
-            native.drawPath(fill, fillPaint)
-            native.restore()
+    val isBusy = state.streamBotId == bot.id || state.workingBot == bot.id || state.busyBot == bot.id
+    val dotSize = (diameter * 0.26f).coerceIn(10.dp, 15.dp)
+
+    Box(Modifier.size(diameter)) {
+        if (image != null && bot.avatarVersion.isNotBlank()) {
+            Image(image, null, Modifier.size(diameter).clip(RoundedCornerShape(radius)), contentScale = ContentScale.Crop)
+        } else {
+            val isPrimaryCompanion = bot.id == "companion" || bot.shape == "flower"
+            val shapeKey = remember(bot.shape, bot.id) {
+                when {
+                    bot.id == "companion" -> "flower"
+                    bot.shape in shapePaths -> bot.shape
+                    bot.id == "research" -> "circle"
+                    else -> "flower"
+                }
+            }
+            val fill = remember(shapeKey) { PathParser.createPathFromPathData(shapePaths[shapeKey] ?: shapePaths.getValue("flower")) }
+            val fillPaint = remember { Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL } }
+            val baseColor = remember(bot.color, bot.id, isPrimaryCompanion) {
+                if (bot.id == "companion" && (bot.color.isBlank() || bot.color.equals("#4D6BFE", ignoreCase = true) || bot.color.equals("#2B6EF6", ignoreCase = true) || bot.color.equals("#7C5CFF", ignoreCase = true))) {
+                    Color(0xFFB568F7)
+                } else if (isPrimaryCompanion && bot.color.isBlank()) {
+                    Color(0xFFB568F7)
+                } else {
+                    runCatching { Color(android.graphics.Color.parseColor(bot.color)) }.getOrDefault(Color(0xFFB568F7))
+                }
+            }
+            val isSpeaking = state.streamSpeakerId == bot.id || isBusy
+            val animateEyes = state.motion && isSpeaking
+            val eyeScaleY: Float
+            val eyeShiftX: Float
+            if (animateEyes) {
+                val infinite = rememberInfiniteTransition(label = "avatar_${bot.id}")
+                val blinkVal by infinite.animateFloat(
+                    initialValue = 1f,
+                    targetValue = 1f,
+                    animationSpec = infiniteRepeatable(
+                        animation = keyframes {
+                            durationMillis = 4200
+                            1f at 0
+                            1f at 3750
+                            0.15f at 3880 using FastOutSlowInEasing
+                            1f at 4020 using FastOutSlowInEasing
+                            1f at 4200
+                        },
+                        repeatMode = RepeatMode.Restart
+                    ),
+                    label = "blink"
+                )
+                val shiftVal by infinite.animateFloat(
+                    initialValue = 0f,
+                    targetValue = 3.5f,
+                    animationSpec = infiniteRepeatable(
+                        animation = keyframes {
+                            durationMillis = 1200
+                            0f at 0
+                            3.5f at 600 using FastOutSlowInEasing
+                            0f at 1200
+                        },
+                        repeatMode = RepeatMode.Restart
+                    ),
+                    label = "glance"
+                )
+                eyeScaleY = blinkVal
+                eyeShiftX = shiftVal
+            } else {
+                eyeScaleY = 1f
+                eyeShiftX = 0f
+            }
+            Canvas(Modifier.size(diameter)) {
+                val s = size.minDimension / 100f
+                fillPaint.color = android.graphics.Color.argb(
+                    (baseColor.alpha * 255).toInt(),
+                    (baseColor.red * 255).toInt(),
+                    (baseColor.green * 255).toInt(),
+                    (baseColor.blue * 255).toInt()
+                )
+                drawIntoCanvas {
+                    val native = it.nativeCanvas
+                    native.save()
+                    native.scale(s, s)
+                    native.drawPath(fill, fillPaint)
+                    native.restore()
+                }
+                val eyeH = (23f * eyeScaleY).coerceAtLeast(3.5f) * s
+                val eyeYOffset = (23f * s - eyeH) / 2f
+                rotate(-26f, Offset((58f + eyeShiftX) * s, 44f * s)) {
+                    drawRoundRect(
+                        Color.White,
+                        Offset((44.5f + eyeShiftX) * s, 32.5f * s + eyeYOffset),
+                        Size(8.6f * s, eyeH),
+                        CornerRadius(5f * s, 5f * s)
+                    )
+                    drawRoundRect(
+                        Color.White,
+                        Offset((59.5f + eyeShiftX) * s, 32.5f * s + eyeYOffset),
+                        Size(8.6f * s, eyeH),
+                        CornerRadius(5f * s, 5f * s)
+                    )
+                }
+            }
         }
-        val eyeH = (23f * eyeScaleY).coerceAtLeast(3.5f) * s
-        val eyeYOffset = (23f * s - eyeH) / 2f
-        rotate(-26f, Offset((58f + eyeShiftX) * s, 44f * s)) {
-            drawRoundRect(
-                Color.White,
-                Offset((46.5f + eyeShiftX) * s, 32.5f * s + eyeYOffset),
-                Size(8.2f * s, eyeH),
-                CornerRadius(5f * s, 5f * s)
-            )
-            drawRoundRect(
-                Color.White,
-                Offset((60.5f + eyeShiftX) * s, 32.5f * s + eyeYOffset),
-                Size(8.2f * s, eyeH),
-                CornerRadius(5f * s, 5f * s)
+        if (showStatusDot && (state.online || isBusy)) {
+            Box(
+                Modifier.align(Alignment.BottomEnd)
+                    .size(dotSize)
+                    .clip(CircleShape)
+                    .background(if (isBusy) Color(0xFF0A84FF) else Color(0xFF30D158))
+                    .border(2.dp, ringColor, CircleShape)
             )
         }
     }

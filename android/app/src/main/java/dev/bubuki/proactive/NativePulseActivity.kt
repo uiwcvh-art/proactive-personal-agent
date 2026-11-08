@@ -50,6 +50,9 @@ class NativePulseActivity : ComponentActivity() {
         }
         model = NativePulseModel(this, savedInstanceState?.getString("chat_bot") ?: intent.getStringExtra("openBot"))
         model.restorePicker(savedInstanceState)
+        if (savedInstanceState == null) {
+            model.handleIncomingShareIntent(intent)
+        }
         setContent { NativePulseScreen(model) }
         if (android.os.Build.VERSION.SDK_INT >= 33) {
             val callback = if (android.os.Build.VERSION.SDK_INT >= 34) object : OnBackAnimationCallback {
@@ -65,7 +68,13 @@ class NativePulseActivity : ComponentActivity() {
         })
     }
     fun pickDocument() { documentPicker.launch(arrayOf("*/*")) }
-    override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); setIntent(intent); intent.getStringExtra("openBot")?.let(model::requestOpenBot) }
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        intent.getStringExtra("openBot")?.let(model::requestOpenBot)
+        if (intent.getStringExtra("entryRoute") == "settings") model.openSettings()
+        model.handleIncomingShareIntent(intent)
+    }
     @Deprecated("Legacy detail-page result bridge")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
@@ -88,22 +97,21 @@ class NativePulseActivity : ComponentActivity() {
         poll?.cancel()
         poll = model.scope.launch {
             var tick = 0
-            while (isActive && resumed) {
+            while (isActive && (resumed || model.hasInFlightWork())) {
                 val wsOnline = AgentForegroundService.connected
-                val fast = model.ui.busyBot != null || model.ui.workingBot != null || model.ui.streamBotId != null || model.ui.activePanel == "cloud_desktop"
-                if (model.ui.activePanel == "cloud_desktop") {
+                val fast = model.hasInFlightWork() || (resumed && model.ui.activePanel == "cloud_desktop")
+                if (resumed && model.ui.activePanel == "cloud_desktop") {
                     if (!wsOnline) {
                         model.refreshStreamOnly()
-                    } else {
-                        model.refreshCloudDesktopFrame(forceFull = false)
                     }
-                    delay(if (wsOnline) 1800L else 900L)
+                    delay(if (wsOnline) 3000L else 1100L)
                 } else if (fast) {
                     if (!wsOnline) {
                         model.refreshStreamOnly()
                     }
-                    delay(if (wsOnline) 8000L else 650L)
+                    delay(if (wsOnline) 12_000L else if (!resumed) 4500L else 800L)
                 } else {
+                    if (!resumed) break
                     if (!wsOnline) {
                         if (tick % 4 == 0) {
                             model.refresh()
@@ -111,11 +119,11 @@ class NativePulseActivity : ComponentActivity() {
                             model.refreshStreamOnly()
                         }
                         tick++
-                        delay(4500L)
+                        delay(5500L)
                     } else {
                         // When WebSocket is connected, all stream/message/execution events are pushed in 0ms;
-                        // only run a tiny delta heartbeat every 25s!
-                        delay(25_000L)
+                        // only run a lightweight delta check every 45s while the Activity is actively resumed!
+                        delay(45_000L)
                         if (isActive && resumed) {
                             model.refreshStreamOnly()
                         }
@@ -125,7 +133,8 @@ class NativePulseActivity : ComponentActivity() {
         }
     }
 
-    override fun onPause() { resumed = false; poll?.cancel(); model.pause(); model.persistDrafts(); super.onPause() }
+    override fun onPause() { resumed = false; if (!model.hasInFlightWork()) poll?.cancel(); model.pause(); model.persistDrafts(); super.onPause() }
+    override fun onStop() { resumed = false; if (!model.hasInFlightWork()) poll?.cancel(); model.pause(); super.onStop() }
     override fun onSaveInstanceState(outState: Bundle) { if (model.ui.chatOpen) outState.putString("chat_bot", model.ui.botId); model.savePicker(outState); super.onSaveInstanceState(outState) }
     override fun onDestroy() {
         if (android.os.Build.VERSION.SDK_INT >= 33) backHandler?.let { getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(it) }
@@ -142,13 +151,23 @@ internal data class PulseBot(
         .put("engine", engine).put("pinned", pinned).put("hidden", hidden).put("pinned_at", pinnedAt).put("avatar_version", avatarVersion)
         .put("instructions", instructions).put("model", model).put("curiosity_enabled", curiosityEnabled).put("notify", notify)
     companion object {
-        fun from(j: JSONObject) = PulseBot(
-            j.getString("id"), j.optString("name"), j.optString("description"),
-            j.optString("color", "#7C5CFF"), j.optString("shape", "circle"), j.optString("engine", "small"),
-            j.optBoolean("pinned"), j.optBoolean("hidden"), j.optDouble("pinned_at", 0.0), j.optString("avatar_version"),
-            j.optString("instructions", ""), j.optString("model", ""), j.optBoolean("curiosity_enabled", j.optString("id") == "companion"),
-            j.optBoolean("notify", true)
-        )
+        fun from(j: JSONObject, source: String = "phone"): PulseBot {
+            val normSrc = source.trim().lowercase().ifBlank { "phone" }
+            val nodeCfg = j.optJSONObject("node_settings")?.optJSONObject(normSrc)
+            val id = j.getString("id")
+            return PulseBot(
+                id, j.optString("name"), j.optString("description"),
+                j.optString("color", "#B568F7"), j.optString("shape", if (id == "companion") "flower" else "circle"), j.optString("engine", "small"),
+                nodeCfg?.optBoolean("pinned", j.optBoolean("pinned")) ?: j.optBoolean("pinned"),
+                nodeCfg?.optBoolean("hidden", j.optBoolean("hidden")) ?: j.optBoolean("hidden"),
+                nodeCfg?.optDouble("pinned_at", j.optDouble("pinned_at", 0.0)) ?: j.optDouble("pinned_at", 0.0),
+                j.optString("avatar_version"),
+                j.optString("instructions", ""),
+                nodeCfg?.optString("model", j.optString("model", "")) ?: j.optString("model", ""),
+                nodeCfg?.optBoolean("curiosity_enabled", j.optBoolean("curiosity_enabled", id == "companion")) ?: j.optBoolean("curiosity_enabled", id == "companion"),
+                nodeCfg?.optBoolean("notify", j.optBoolean("notify", true)) ?: j.optBoolean("notify", true)
+            )
+        }
     }
 }
 
@@ -180,18 +199,46 @@ internal data class PulseMessage(
     val created: Double, val decision: String, val trace: String, val optimistic: Boolean = false,
     val fromBotId: String = "", val fromBotName: String = "",
     val choices: List<PulseChoice> = emptyList(),
-    val isSubTurn: Boolean = false
+    val isSubTurn: Boolean = false,
+    val thought: String = "",
+    val sticker: String = "",
+    val apiCalls: Int = 0,
+    val ttftMs: Int = 0,
+    val tps: Double = 0.0,
+    val promptTokens: Int = 0,
+    val cachedTokens: Int = 0,
+    val cacheHitPct: Int = 0,
+    val completionTokens: Int = 0,
+    val totalMs: Int = 0,
+    val toBotId: String = "",
+    val toBotName: String = "",
+    val direction: String = ""
 ) {
     companion object {
         fun from(j: JSONObject): PulseMessage {
             val parsedChoices = PulseChoice.parseArray(j.optJSONArray("choices"))
+            val m = j.optJSONObject("metrics")
+            val apiCalls = j.optInt("api_calls", m?.optInt("api_calls", 0) ?: 0)
             return PulseMessage(
                 j.getString("id"), j.optString("bot_id", "companion"), j.optString("role"),
                 j.optString("text"), j.optString("kind"), j.optString("engine"), j.optDouble("created_at"),
                 j.optString("decision"), (j.optJSONArray("trace") ?: JSONArray()).toString(), false,
                 j.optString("from_bot_id", ""), j.optString("from_bot_name", ""),
                 parsedChoices,
-                j.optBoolean("is_sub_turn", false) || j.optString("kind") in listOf("bot_message", "bot_reply")
+                j.optBoolean("is_sub_turn", false) || j.optString("kind") == "bot_message",
+                j.optString("thought", ""),
+                j.optString("sticker", ""),
+                apiCalls,
+                m?.optInt("ttft_ms", 0) ?: 0,
+                m?.optDouble("tps", 0.0)?.let { if (it.isNaN()) 0.0 else it } ?: 0.0,
+                m?.optInt("prompt_tokens", 0) ?: 0,
+                m?.optInt("cached_tokens", 0) ?: 0,
+                m?.optInt("cache_hit_pct", 0) ?: 0,
+                m?.optInt("completion_tokens", 0) ?: 0,
+                m?.optInt("total_ms", 0) ?: 0,
+                j.optString("to_bot_id", ""),
+                j.optString("to_bot_name", ""),
+                j.optString("direction", "")
             )
         }
     }
@@ -218,6 +265,10 @@ internal data class NativePulseState(
     val apiBaseUrl: String = "https://api.openai.com/v1",
     val apiKeyInput: String = "",
     val hasApiKey: Boolean = false,
+    val fallbackBaseUrl: String = "http://149.104.25.8:3000/v1",
+    val fallbackApiKeyInput: String = "",
+    val fallbackModel: String = "commandcode/deepseek/deepseek-v4.1-flash",
+    val hasFallbackApiKey: Boolean = false,
     val availableModels: List<String> = emptyList(),
     val fetchingModels: Boolean = false,
     val savingSettings: Boolean = false,
@@ -225,7 +276,11 @@ internal data class NativePulseState(
     val curiosityMinutes: String = "90",
     val autoCompactTokens: String = "120000",
     val contextTokensByBot: Map<String, Int> = emptyMap(),
+    val contextCachedByBot: Map<String, Int> = emptyMap(),
     val contextMsgsByBot: Map<String, Int> = emptyMap(),
+    val contextTtftByBot: Map<String, Int> = emptyMap(),
+    val contextTpsByBot: Map<String, Double> = emptyMap(),
+    val contextCompTokensByBot: Map<String, Int> = emptyMap(),
     val compactingContext: Boolean = false,
     val backgroundService: Boolean = true,
     val appearance: String = "dark",
@@ -233,13 +288,15 @@ internal data class NativePulseState(
     val latestReleaseNotes: String = "",
     val updateAvailable: Boolean = false,
     val checkingUpdate: Boolean = false,
+    val downloadingApk: Boolean = false,
+    val downloadProgress: Int = 0,
     // Bot Editor state
     val editingBotId: String? = null,
     val editBotName: String = "",
     val editBotDesc: String = "",
     val editBotModel: String = "",
     val editBotInstructions: String = "",
-    val editBotColor: String = "#7C5CFF",
+    val editBotColor: String = "#B568F7",
     val editBotShape: String = "flower",
     val editBotCuriosity: Boolean = false,
     val editBotNotify: Boolean = true,
@@ -281,7 +338,15 @@ internal data class NativePulseState(
     val streamTodos: List<JSONObject> = emptyList(),
     val pinnedMemories: List<JSONObject> = emptyList(),
     val watchdogs: List<JSONObject> = emptyList(),
-    val editingMessage: PulseMessage? = null
+    val stickerPacks: List<JSONObject> = emptyList(),
+    val editingMessage: PulseMessage? = null,
+    val lastSwitchDir: Int = 1,
+    // Welcome / Onboarding Wizard & DSH Peer state
+    val onboardingStep: Int = 1,
+    val dshPeers: List<JSONObject> = emptyList(),
+    val testingConnection: Boolean = false,
+    val connectionTestOk: Boolean? = null,
+    val connectionTestMsg: String = ""
 )
 
 internal class NativePulseModel(private val activity: NativePulseActivity, restoredBot: String?) {
@@ -306,6 +371,7 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
     private val refreshLock = Mutex()
     private val streamLock = Mutex()
     private var lastStreamSeq: Long = 0L
+    private var lastMessagesEpoch: Long = 0L
     private var currentTurnId: String = ""
     private val completedTurnIds = LinkedHashSet<String>()
     private var sendGuardUntilUptime: Long = 0L
@@ -328,6 +394,17 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
         @JvmStatic fun dispatchRealtimeEvent(event: JSONObject) {
             activeInstance?.onRealtimeEvent(event)
         }
+        @JvmStatic fun isForeground(): Boolean = activeInstance?.active == true
+        @JvmStatic fun syncOnReconnect() {
+            activeInstance?.let { inst ->
+                inst.scope.launch { runCatching { inst.refreshStreamOnly() } }
+            }
+        }
+    }
+
+    internal fun hasInFlightWork(): Boolean {
+        return inFlightSends > 0 || ui.busyBot != null || ui.workingBot != null || ui.streamBotId != null ||
+            (sendGuardBotId != null && SystemClock.uptimeMillis() < sendGuardUntilUptime)
     }
 
     init {
@@ -348,7 +425,8 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
             bots = cached.first, primary = cached.second, botId = initialBot,
             messages = combinedMessages(),
             chatOpen = restoredBot != null && cached.first.any { it.id == restoredBot },
-            dark = dark, paired = prefs.optString("deviceToken", SecureTransport.defaultToken()).isNotBlank(),
+            activePanel = null,
+            dark = dark, paired = prefs.optString("deviceToken", SecureTransport.defaultToken()).ifBlank { SecureTransport.defaultToken() }.isNotBlank(),
             draft = draft(initialBot), attachments = attachments(initialBot), mode = draftMode(initialBot),
             defaultModel = defModel, apiBaseUrl = defUrl, serverUrl = prefs.optString("serverUrl", SecureTransport.DEFAULT_SERVER),
             backgroundService = prefs.optBoolean("background", true), appearance = savedAppearance,
@@ -356,7 +434,16 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
         )
         activity.systemBarsFor(dark)
         RootPhoneHarness.initialize(activity)
-        scope.launch { RootPhoneHarness.changes.collect { applyPhoneState() } }
+        scope.launch {
+            var lastPhoneSig = ""
+            RootPhoneHarness.changes.collect { st ->
+                val sig = "${st.active}|${st.botId}|${st.phase}|${st.messages.size}|${st.messages.lastOrNull()?.id}|${st.messages.lastOrNull()?.text?.length}"
+                if (sig != lastPhoneSig) {
+                    lastPhoneSig = sig
+                    applyPhoneState()
+                }
+            }
+        }
     }
 
     /**
@@ -364,16 +451,10 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
      * replies (e.g. when stopping/pausing a chat or phone workspace turn), and appends in-flight optimisticList
      * items at the tail so clock skew between phone and VPS NEVER causes AI messages to jump above user messages.
      */
-    private fun combinedMessages(): List<PulseMessage> {
-        val phoneMsgs = RootPhoneHarness.changes.value.messages.filter { it.role != "user" && it.kind != "phone_task" }
-        val rawMerged = if (phoneMsgs.isEmpty()) {
-            remoteMessages
-        } else {
-            (remoteMessages + phoneMsgs).distinctBy { it.id }.sortedBy { it.created }
-        }
-        val baseList = ArrayList<PulseMessage>(rawMerged.size)
+    private fun deduplicateAssistantList(rawMerged: List<PulseMessage>): ArrayList<PulseMessage> {
+        val out = ArrayList<PulseMessage>(rawMerged.size)
         for (msg in rawMerged) {
-            val prev = baseList.lastOrNull()
+            val prev = out.lastOrNull()
             if (prev != null &&
                 prev.botId == msg.botId &&
                 prev.role == msg.role &&
@@ -388,14 +469,23 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                     msg.trace.length > prev.trace.length || msg.choices.size > prev.choices.size -> msg
                     else -> prev
                 }
-                baseList[baseList.lastIndex] = keepMsg.copy(
+                out[out.lastIndex] = keepMsg.copy(
                     trace = if (msg.trace.length > prev.trace.length) msg.trace else prev.trace,
-                    choices = if (msg.choices.isNotEmpty()) msg.choices else prev.choices
+                    choices = if (msg.choices.isNotEmpty()) msg.choices else prev.choices,
+                    thought = if (msg.thought.isNotBlank()) msg.thought else prev.thought,
+                    sticker = if (msg.sticker.isNotBlank()) msg.sticker else prev.sticker
                 )
             } else {
-                baseList.add(msg)
+                out.add(msg)
             }
         }
+        return out
+    }
+
+    private fun combinedMessages(): List<PulseMessage> {
+        val phoneMsgs = RootPhoneHarness.changes.value.messages.filter { it.role != "user" && it.kind != "phone_task" }
+        val rawMerged = if (phoneMsgs.isEmpty()) remoteMessages else (remoteMessages + phoneMsgs).distinctBy { it.id }.sortedBy { it.created }
+        val baseList = deduplicateAssistantList(rawMerged)
         if (optimisticList.isEmpty()) return baseList
         val existingIds = baseList.asSequence().map { it.id }.toHashSet()
         val tailOptimistic = optimisticList.filter { opt ->
@@ -411,7 +501,7 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
         val activeWorking = if (phone.active) {
             phone.botId
         } else {
-            remoteWorkingBot ?: (if (sendGuardBotId != null && SystemClock.uptimeMillis() < sendGuardUntilUptime) sendGuardBotId else null)
+            remoteWorkingBot ?: ui.streamBotId ?: (if (sendGuardBotId != null && SystemClock.uptimeMillis() < sendGuardUntilUptime) sendGuardBotId else null)
         }
         ui = ui.copy(
             messages = combinedMessages(),
@@ -425,20 +515,34 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
     }
 
     private fun scopeOf(settings: JSONObject): String {
-        val value = settings.optString("serverUrl", SecureTransport.DEFAULT_SERVER).trim().trimEnd('/') + "\u0000" + settings.optString("publicKey") + "\u0000" + settings.optString("deviceToken", SecureTransport.defaultToken())
+        val value = settings.optString("serverUrl", SecureTransport.DEFAULT_SERVER).trim().trimEnd('/') + "\u0000" + settings.optString("publicKey") + "\u0000" + settings.optString("deviceToken", SecureTransport.defaultToken()).ifBlank { SecureTransport.defaultToken() } + "\u0000" + SecureTransport.getNodeSource(activity)
         return java.security.MessageDigest.getInstance("SHA-256").digest(value.toByteArray()).joinToString("") { "%02x".format(it.toInt() and 255) }
     }
     private fun homeCache(settings: JSONObject): Triple<List<PulseBot>, String, List<PulseMessage>> {
         val cache = settings.optJSONObject("nativeHomeCache")
         if (cache?.optString("scope") == scopeOf(settings)) runCatching {
-            val bots = cache.getJSONArray("bots").objects().map(PulseBot::from)
+            val myNodeSource = SecureTransport.getNodeSource(activity)
+            val bots = cache.getJSONArray("bots").objects().map { PulseBot.from(it, myNodeSource) }
             val primary = cache.getString("primary")
             val msgs = (cache.optJSONArray("messages") ?: JSONArray()).objects().map(PulseMessage::from)
             return Triple(bots, primary, msgs)
         }
         return Triple(
             listOf(
-                PulseBot("companion", "白kawa", "主助理 · 聊聊近况、把关全局，并统筹安排其它 Bot 干活。", "#7C5CFF", "flower", "small", false, false, 0.0, "", curiosityEnabled = true),
+                PulseBot(
+                    "companion",
+                    "白kawa",
+                    "聊聊近况，把挂心的事理清楚。",
+                    "#B568F7",
+                    "flower",
+                    "small",
+                    false,
+                    false,
+                    0.0,
+                    "",
+                    instructions = "",
+                    curiosityEnabled = true
+                ),
                 PulseBot("research", "研究助手", "负责查资料、跑脚本、写文件，带着可验收成果汇报。", "#FF8A3D", "circle", "big", false, false, 0.0, "", curiosityEnabled = false)
             ),
             "companion",
@@ -456,6 +560,7 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                     .put("trace", runCatching { JSONArray(m.trace) }.getOrDefault(JSONArray()))
                     .put("choices", JSONArray(m.choices.map { it.json() }))
                     .put("from_bot_id", m.fromBotId).put("from_bot_name", m.fromBotName)
+                    .put("thought", m.thought).put("sticker", m.sticker)
             )
         }
         val cache = JSONObject().put("scope", serverScope).put("primary", primary)
@@ -500,7 +605,7 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
             val bigM = config.optJSONObject("big_brain")?.optString("model") ?: ""
             val defM = config.optString("default_model").ifBlank { bigM.ifBlank { smallM } }
             ui = ui.copy(
-                paired = settings.optString("deviceToken", SecureTransport.defaultToken()).isNotBlank(), dark = dark, appearance = savedApp,
+                paired = settings.optString("deviceToken", SecureTransport.defaultToken()).ifBlank { SecureTransport.defaultToken() }.isNotBlank(), dark = dark, appearance = savedApp,
                 motion = settings.optBoolean("motion", true) && !animationsOff(activity), haptics = settings.optBoolean("haptics", true),
                 smallModel = smallM, bigModel = bigM, defaultModel = defM,
                 draft = draft(ui.botId), attachments = attachments(ui.botId),
@@ -511,13 +616,16 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                 if (settings.optBoolean("background", true) && ui.paired && !AgentForegroundService.running) {
                     try { activity.startForegroundService(Intent(activity, AgentForegroundService::class.java)) } catch (e: Exception) { toast(MainActivity.safeError(e)) }
                 } else if (!settings.optBoolean("background", true)) activity.stopService(Intent(activity, AgentForegroundService::class.java))
+                if (ui.activePanel == "cloud_desktop" && cloudStreamJob?.isActive != true) {
+                    startCloudDesktopStreamLoop(forceFull = false)
+                }
             }
             refresh()
         }
     }
 
     private fun isStreamPlaceholder(t: String): Boolean {
-        return t.isBlank() || t == "正在思考…" || t == "正在思考与执行任务…" || t == "正在整理回复…" || t.startsWith("正在调用 ") || t.startsWith("⏰ 正在执行") || t.startsWith("📦 ")
+        return t.isBlank() || t == "正在思考…" || t == "正在思考与执行任务…" || t == "正在整理回复…" || t == "正在重新生成…" || t.startsWith("正在调用 ") || t.startsWith("正在并行执行 ") || t.startsWith("⏳ ") || t.startsWith("⏰ 正在执行") || t.startsWith("📦 ")
     }
 
     private fun markTurnCompleted(turnId: String) {
@@ -574,15 +682,7 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
         if (incoming.isEmpty() && !fullReplace) return
         val oldIds = remoteMessages.asSequence().map { it.id }.toHashSet()
         val rawMerged = if (fullReplace) {
-            val incomingIds = incoming.asSequence().map { it.id }.toHashSet()
-            val maxIncomingCreated = incoming.maxOfOrNull { it.created } ?: 0.0
-            val newerLocal = remoteMessages.filter { local ->
-                !local.id.startsWith("stopped-") &&
-                    local.id !in incomingIds &&
-                    local.created >= maxIncomingCreated - 1.0 &&
-                    incoming.takeLast(12).none { it.botId == local.botId && it.role == local.role && it.text.trim() == local.text.trim() }
-            }
-            incoming + newerLocal
+            incoming
         } else {
             val byId = LinkedHashMap<String, PulseMessage>(remoteMessages.size + incoming.size)
             remoteMessages.forEach { local ->
@@ -597,26 +697,7 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
             incoming.forEach { byId[it.id] = it }
             byId.values.toList()
         }
-        val merged = ArrayList<PulseMessage>(rawMerged.size)
-        for (msg in rawMerged) {
-            val prev = merged.lastOrNull()
-            if (prev != null &&
-                prev.botId == msg.botId &&
-                prev.role == msg.role &&
-                prev.role == "assistant" &&
-                prev.text.trim().isNotEmpty() &&
-                prev.text.trim() == msg.text.trim() &&
-                abs(prev.created - msg.created) < 20.0
-            ) {
-                val keep = if (prev.id.startsWith("stopped-") && !msg.id.startsWith("stopped-")) msg else if (msg.trace.length > prev.trace.length) msg else prev
-                merged[merged.lastIndex] = keep.copy(
-                    trace = if (msg.trace.length > prev.trace.length) msg.trace else prev.trace,
-                    choices = if (msg.choices.isNotEmpty()) msg.choices else prev.choices
-                )
-            } else {
-                merged.add(msg)
-            }
-        }
+        val merged = deduplicateAssistantList(rawMerged)
         remoteMessages = merged
         optimisticList.removeAll { opt ->
             merged.takeLast(18).any { it.role == "user" && it.botId == opt.botId && it.text.trim() == opt.text.trim() }
@@ -641,15 +722,51 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
     }
 
     private fun applyPacedStreamText(sBot: String?, resolvedText: String): String {
-        streamPacerJob?.cancel()
         if (sBot == null) {
+            streamPacerJob?.cancel()
             targetStreamFullText = ""
             return ""
         }
-        if (!isStreamPlaceholder(resolvedText)) {
-            targetStreamFullText = resolvedText
+        if (isStreamPlaceholder(resolvedText)) {
+            streamPacerJob?.cancel()
+            return resolvedText
         }
-        return resolvedText
+        targetStreamFullText = resolvedText; streamPacerJob?.cancel(); if (true) return resolvedText
+        if (!ui.motion) {
+            streamPacerJob?.cancel()
+            return resolvedText
+        }
+        val curShown = ui.streamText.takeIf { !isStreamPlaceholder(it) && ui.streamBotId == sBot }.orEmpty()
+        val initialShown = when {
+            curShown.isEmpty() && resolvedText.length > 6 -> resolvedText.take(3)
+            curShown.isNotEmpty() && resolvedText.startsWith(curShown) && (resolvedText.length - curShown.length) > 6 ->
+                resolvedText.take((curShown.length + 2).coerceAtMost(resolvedText.length))
+            else -> {
+                streamPacerJob?.cancel()
+                return resolvedText
+            }
+        }
+        if (streamPacerJob?.isActive != true) {
+            streamPacerJob = scope.launch {
+                while (true) {
+                    delay(18L)
+                    val target = targetStreamFullText
+                    val current = ui.streamText.takeIf { !isStreamPlaceholder(it) }.orEmpty()
+                    if (target.isBlank() || ui.streamBotId == null || current.length >= target.length || !target.startsWith(current)) {
+                        if (target.isNotBlank() && ui.streamBotId != null && current != target) {
+                            ui = ui.copy(streamText = target)
+                        }
+                        break
+                    }
+                    val backlog = target.length - current.length
+                    val step = (backlog / 6).coerceIn(2, 16)
+                    val nextLen = (current.length + step).coerceAtMost(target.length)
+                    ui = ui.copy(streamText = target.take(nextLen))
+                    if (nextLen >= target.length) break
+                }
+            }
+        }
+        return initialShown
     }
 
     /**
@@ -683,7 +800,32 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
     fun onRealtimeEvent(event: JSONObject) {
         scope.launch {
             val type = event.optString("type")
+            val mySource = SecureTransport.getNodeSource(activity)
+            val evSource = event.optString("source").ifBlank {
+                event.optJSONObject("message")?.optString("source")
+                    ?: event.optJSONObject("stream")?.optString("source")
+                    ?: event.optJSONObject("execution")?.optString("source")
+                    ?: ""
+            }.trim()
+            if (evSource.isNotEmpty() && evSource != mySource && type in listOf("message", "stream", "execution", "stopped")) {
+                return@launch
+            }
             when (type) {
+                "bots_changed" -> { val botsArr = event.optJSONArray("bots"); val primaryId = event.optString("primary_bot_id", ui.primary).ifBlank { "companion" }; if (botsArr != null && botsArr.length() > 0) { val nextBots = botsArr.objects().mapNotNull { runCatching { PulseBot.from(it, mySource) }.getOrNull() }; if (nextBots.isNotEmpty()) { revision++; val deletedId = event.optString("deleted_bot_id", ""); val needCloseChat = (deletedId.isNotBlank() && ui.botId == deletedId) || nextBots.none { it.id == ui.botId }; ui = ui.copy(bots = nextBots, primary = primaryId, botId = if (needCloseChat) primaryId else ui.botId, chatOpen = if (needCloseChat) false else ui.chatOpen); cacheRoster(nextBots, primaryId); loadAvatars(); return@launch } }; launch { refresh(force = true) } }
+                "messages_truncated" -> {
+                    val newEpoch = event.optLong("messages_epoch", 0L)
+                    if (newEpoch > 0L) lastMessagesEpoch = newEpoch
+                    val removedIds = event.optJSONArray("removed_message_ids")?.let { arr ->
+                        (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { s -> s.isNotBlank() } }.toHashSet()
+                    }.orEmpty()
+                    val editedMsg = event.optJSONObject("edited_message")?.let { runCatching { PulseMessage.from(it) }.getOrNull() }
+                    remoteMessages = remoteMessages.mapNotNull { m ->
+                        if (m.id in removedIds) null
+                        else if (editedMsg != null && m.id == editedMsg.id) editedMsg
+                        else m
+                    }
+                    ui = ui.copy(messages = combinedMessages())
+                }
                 "cloud_desktop_frame" -> {
                     val frameObj = event.optJSONObject("frame") ?: return@launch
                     val botId = event.optString("bot_id").takeIf { it.isNotBlank() }
@@ -700,7 +842,56 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                         else launch { refreshCloudDesktopFrame(forceFull = false) }
                     }
                 }
+                "stopped" -> {
+                    val stoppedBot = event.optString("bot_id").takeIf { it.isNotBlank() }
+                    val stoppedTurn = event.optString("turn_id", "")
+                    if (stoppedTurn.isNotBlank()) markTurnCompleted(stoppedTurn)
+                    if (stoppedBot == null || ui.streamBotId == stoppedBot || ui.workingBot == stoppedBot) {
+                        streamPacerJob?.cancel()
+                        targetStreamFullText = ""
+                        remoteWorkingBot = null
+                        sendGuardBotId = null
+                        sendGuardUntilUptime = 0L
+                        ui = ui.copy(
+                            busyBot = null,
+                            workingBot = null,
+                            streamBotId = null,
+                            streamText = "",
+                            streamThought = "",
+                            streamTool = "",
+                            streamTrace = emptyList(),
+                            streamChoices = emptyList(),
+                            streamSubAgents = emptyList(),
+                            streamTodos = emptyList(),
+                            streamStartedAt = 0L
+                        )
+                    }
+                }
                 "stream" -> {
+                    if (event.isNull("stream")) {
+                        val clearedBot = event.optString("bot_id", "")
+                        if (clearedBot.isBlank() || ui.chatOpen.not() || clearedBot == ui.botId || clearedBot == ui.streamBotId || clearedBot == ui.workingBot) {
+                            streamPacerJob?.cancel()
+                            targetStreamFullText = ""
+                            remoteWorkingBot = null
+                            sendGuardBotId = null
+                            sendGuardUntilUptime = 0L
+                            ui = ui.copy(
+                                busyBot = null,
+                                workingBot = null,
+                                streamBotId = null,
+                                streamText = "",
+                                streamThought = "",
+                                streamTool = "",
+                                streamTrace = emptyList(),
+                                streamChoices = emptyList(),
+                                streamSubAgents = emptyList(),
+                                streamTodos = emptyList(),
+                                streamStartedAt = 0L
+                            )
+                        }
+                        return@launch
+                    }
                     val stream = event.optJSONObject("stream") ?: return@launch
                     val seq = stream.optLong("seq", 0L)
                     val turnId = stream.optString("turn_id", "")
@@ -739,12 +930,28 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                     val paced = applyPacedStreamText(sBot, preserved)
                     val startedMs = ui.streamStartedAt.takeIf { it > 0L } ?: System.currentTimeMillis()
                     sendGuardBotId = sBot
-                    sendGuardUntilUptime = SystemClock.uptimeMillis() + 20_000L
+                    sendGuardUntilUptime = SystemClock.uptimeMillis() + 3_000L
                     remoteWorkingBot = sBot
+                    val liveCtx = stream.optJSONObject("context_stats")
+                    val liveCurTok = liveCtx?.optInt("current_tokens", 0) ?: 0
+                    val liveCachedTok = liveCtx?.optInt("cached_tokens", 0) ?: 0
+                    val liveTtft = liveCtx?.optInt("ttft_ms", 0) ?: 0
+                    val liveTps = liveCtx?.optDouble("tps", 0.0)?.let { if (it.isNaN()) 0.0 else it } ?: 0.0
+                    val liveCompTok = liveCtx?.optInt("completion_tokens", 0) ?: 0
+                    val nextCtxTokens = if (liveCurTok > 0) (ui.contextTokensByBot + (sBot to liveCurTok)) else ui.contextTokensByBot
+                    val nextCtxCached = if (liveCurTok > 0) (ui.contextCachedByBot + (sBot to liveCachedTok)) else ui.contextCachedByBot
+                    val nextTtft = if (liveTtft > 0) (ui.contextTtftByBot + (sBot to liveTtft)) else ui.contextTtftByBot
+                    val nextTps = if (liveTps > 0.0) (ui.contextTpsByBot + (sBot to liveTps)) else ui.contextTpsByBot
+                    val nextComp = if (liveCompTok > 0) (ui.contextCompTokensByBot + (sBot to liveCompTok)) else ui.contextCompTokensByBot
                     ui = ui.copy(
                         online = true,
                         workingBot = sBot,
                         streamBotId = sBot,
+                        contextTokensByBot = nextCtxTokens,
+                        contextCachedByBot = nextCtxCached,
+                        contextTtftByBot = nextTtft,
+                        contextTpsByBot = nextTps,
+                        contextCompTokensByBot = nextComp,
                         streamSpeakerId = stream.optString("speaker_id").takeIf { it.isNotBlank() },
                         streamSpeakerName = stream.optString("speaker_name", ""),
                         streamText = paced,
@@ -780,7 +987,7 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                     val activeBot = working ?: ui.workingBot ?: ui.streamBotId ?: sendGuardBotId
                     if (activeBot != null) {
                         sendGuardBotId = activeBot
-                        sendGuardUntilUptime = SystemClock.uptimeMillis() + 20_000L
+                        sendGuardUntilUptime = SystemClock.uptimeMillis() + 3_000L
                     }
                     remoteWorkingBot = activeBot
                     remoteWorkingText = if (tool.isNotBlank()) "正在调用 $tool…" else "正在思考…"
@@ -800,11 +1007,30 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                     val seq = event.optLong("seq", mObj.optLong("seq", 0L))
                     val turnId = mObj.optString("turn_id", "")
                     if (seq > lastStreamSeq) lastStreamSeq = seq
-                    // Sub-turn delegation bubbles (`isSubTurn`) do NOT terminate the parent turn!
-                    if (turnId.isNotBlank() && !msg.isSubTurn) markTurnCompleted(turnId)
+                    // Final assistant replies (`chat`, `bot_reply`, `error`, `stopped`) terminate the turn immediately!
+                    val isFinalAssistantMsg = msg.role == "assistant" && !msg.isSubTurn && msg.kind != "bot_message"
+                    if (turnId.isNotBlank() && isFinalAssistantMsg) {
+                        markTurnCompleted(turnId)
+                    }
                     mergeRemoteMessages(listOf(msg), fullReplace = false)
-                    val finishedStreamHere = !msg.isSubTurn && msg.role == "assistant" && (ui.streamBotId == msg.botId || ui.workingBot == msg.botId || sendGuardBotId == msg.botId) &&
-                        (turnId.isBlank() || currentTurnId.isBlank() || turnId == currentTurnId || msg.kind in listOf("chat", "result", "curiosity", "error", "stopped"))
+                    val sameOrMatchingTurn = turnId.isBlank() || currentTurnId.isBlank() || turnId == currentTurnId || currentTurnId.startsWith("pending-") || msg.kind == "stopped" || msg.kind == "bot_reply"
+                    val finishedStreamHere = isFinalAssistantMsg && (ui.streamBotId == msg.botId || ui.workingBot == msg.botId || sendGuardBotId == msg.botId || ui.busyBot == msg.botId) &&
+                        sameOrMatchingTurn
+                    val updatedTokensByBot = if (msg.role == "assistant" && msg.promptTokens > 0) {
+                        ui.contextTokensByBot + (msg.botId to msg.promptTokens)
+                    } else ui.contextTokensByBot
+                    val updatedCachedByBot = if (msg.role == "assistant" && msg.promptTokens > 0) {
+                        ui.contextCachedByBot + (msg.botId to msg.cachedTokens)
+                    } else ui.contextCachedByBot
+                    val updatedTtftByBot = if (msg.role == "assistant" && msg.ttftMs > 0) {
+                        ui.contextTtftByBot + (msg.botId to msg.ttftMs)
+                    } else ui.contextTtftByBot
+                    val updatedTpsByBot = if (msg.role == "assistant" && msg.tps > 0f) {
+                        ui.contextTpsByBot + (msg.botId to msg.tps)
+                    } else ui.contextTpsByBot
+                    val updatedCompByBot = if (msg.role == "assistant" && msg.completionTokens > 0) {
+                        ui.contextCompTokensByBot + (msg.botId to msg.completionTokens)
+                    } else ui.contextCompTokensByBot
                     if (finishedStreamHere) {
                         remoteWorkingBot = null
                         sendGuardBotId = null
@@ -813,6 +1039,7 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                         targetStreamFullText = ""
                         ui = ui.copy(
                             messages = combinedMessages(),
+                            busyBot = null,
                             workingBot = null,
                             streamBotId = null,
                             streamText = "",
@@ -822,10 +1049,25 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                             streamChoices = emptyList(),
                             streamSubAgents = emptyList(),
                             streamTodos = emptyList(),
-                            streamStartedAt = 0L
+                            streamStartedAt = 0L,
+                            contextTokensByBot = updatedTokensByBot,
+                            contextCachedByBot = updatedCachedByBot,
+                            contextTtftByBot = updatedTtftByBot,
+                            contextTpsByBot = updatedTpsByBot,
+                            contextCompTokensByBot = updatedCompByBot
                         )
                     } else {
-                        ui = ui.copy(messages = combinedMessages())
+                        ui = ui.copy(
+                            messages = combinedMessages(),
+                            contextTokensByBot = updatedTokensByBot,
+                            contextCachedByBot = updatedCachedByBot,
+                            contextTtftByBot = updatedTtftByBot,
+                            contextTpsByBot = updatedTpsByBot,
+                            contextCompTokensByBot = updatedCompByBot
+                        )
+                    }
+                    if (!active) {
+                        cacheRoster(ui.bots, ui.primary)
                     }
                     acknowledge()
                 }
@@ -842,8 +1084,14 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
             val before = revision; val started = SystemClock.uptimeMillis(); val serverScope = scopeOf(prefs)
             try {
                 val afterId = if (force) null else lastServerMessageId()
-                val msgQuery = if (!afterId.isNullOrBlank()) JSONObject().put("after_id", afterId) else null
-                val statusQuery = if (!afterId.isNullOrBlank()) JSONObject().put("after_id", afterId) else null
+                val msgQuery = JSONObject().apply {
+                    if (!afterId.isNullOrBlank()) put("after_id", afterId)
+                    if (lastMessagesEpoch > 0L) put("messages_epoch", lastMessagesEpoch)
+                }.takeIf { it.length() > 0 }
+                val statusQuery = JSONObject().apply {
+                    if (!afterId.isNullOrBlank()) put("after_id", afterId)
+                    if (lastMessagesEpoch > 0L) put("messages_epoch", lastMessagesEpoch)
+                }.takeIf { it.length() > 0 }
                 val fetched = coroutineScope {
                     val b = async { request("GET", "/api/bots") }
                     val h = async { request("GET", "/api/messages", null, msgQuery) }
@@ -858,11 +1106,17 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                 val remoteCfg = fetched[3]
                 val pending = history.optJSONObject("pending") ?: JSONObject()
                 val unread = pending.keys().asSequence().toSet()
-                val isDelta = history.optBoolean("delta", false)
+                val incomingEpoch = history.optLong("messages_epoch", status.optLong("messages_epoch", 0L))
+                val epochChanged = (incomingEpoch > 0L && lastMessagesEpoch > 0L && incomingEpoch != lastMessagesEpoch) ||
+                    history.optBoolean("epoch_reset", false) || status.optBoolean("epoch_reset", false)
+                if (incomingEpoch > 0L) lastMessagesEpoch = incomingEpoch
+                val isDelta = history.optBoolean("delta", false) && !epochChanged
                 val messages = history.getJSONArray("messages").objects().map(PulseMessage::from)
                 mergeRemoteMessages(messages, fullReplace = !isDelta)
-                status.optJSONArray("recent_tail")?.objects()?.mapNotNull { runCatching { PulseMessage.from(it) }.getOrNull() }?.let {
-                    mergeRemoteMessages(it, fullReplace = false)
+                if (!epochChanged) {
+                    status.optJSONArray("recent_tail")?.objects()?.mapNotNull { runCatching { PulseMessage.from(it) }.getOrNull() }?.let {
+                        mergeRemoteMessages(it, fullReplace = false)
+                    }
                 }
                 val lastDone = status.optJSONObject("last_completed_stream")
                 val lastDoneTurn = lastDone?.optString("turn_id").orEmpty()
@@ -877,7 +1131,8 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                 val execution = if (isStaleStatus) null else (if (ui.chatOpen && execsByBot != null) execsByBot.optJSONObject(ui.botId) else status.optJSONObject("execution"))
                 val stream = if (isStaleStatus) null else (if (ui.chatOpen && streamsByBot != null) streamsByBot.optJSONObject(ui.botId) else status.optJSONObject("stream"))
                 val streamTurnId = stream?.optString("turn_id").orEmpty()
-                val streamAlreadyDone = streamTurnId.isNotBlank() && streamTurnId in completedTurnIds
+                val hasLiveExec = execution?.optString("bot_id")?.isNotBlank() == true
+                val streamAlreadyDone = !hasLiveExec && streamTurnId.isNotBlank() && streamTurnId in completedTurnIds
 
                 val computer = status.optJSONObject("computer")
                 val rawWorking = if (streamAlreadyDone) null else execution?.optString("bot_id")?.takeIf { it.isNotBlank() }
@@ -887,6 +1142,11 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                 val finalMsgId = lastDone?.optString("final_message_id").orEmpty()
                 val holdDoneStream = rawSBot == null && rawWorking == null && finalMsgId.isNotBlank() && remoteMessages.none { it.id == finalMsgId } &&
                     (!ui.chatOpen || lastDone?.optString("bot_id") == ui.botId)
+                val lastRoomMsg = sendGuardBotId?.let { gBot -> remoteMessages.lastOrNull { it.botId == gBot } }
+                if (rawSBot == null && rawWorking == null && lastRoomMsg != null && lastRoomMsg.role == "assistant" && !lastRoomMsg.isSubTurn && lastRoomMsg.kind != "bot_message") {
+                    sendGuardBotId = null
+                    sendGuardUntilUptime = 0L
+                }
                 val inSendGuard = sendGuardBotId != null && SystemClock.uptimeMillis() < sendGuardUntilUptime &&
                     (lastDoneTurn.isBlank() || currentTurnId.isBlank() || lastDoneTurn != currentTurnId) &&
                     (!ui.chatOpen || sendGuardBotId == ui.botId)
@@ -915,10 +1175,11 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                 val startedSec = execution?.optDouble("started_at", 0.0) ?: 0.0
                 val startedMs = if (startedSec > 0) (startedSec * 1000).toLong() else if (effectiveSBot != null || effectiveWorking != null) (ui.streamStartedAt.takeIf { it > 0L } ?: System.currentTimeMillis()) else 0L
                 val routinesCount = (status.optInt("routine_count", -1)).let { if (it >= 0) it else ui.routineCount }
-                val (ctxTokensMap, ctxMsgsMap) = parseContextByBot(status.optJSONObject("context_by_bot"))
+                val (ctxTokensMap, ctxMsgsMap, ctxCachedMap) = parseContextByBot(status.optJSONObject("context_by_bot"))
                 val remoteCompactThresh = status.optInt("auto_compact_tokens", remoteCfg?.optInt("auto_compact_tokens", 0) ?: 0)
+                val myNodeSource = SecureTransport.getNodeSource(activity)
                 ui = ui.copy(
-                    bots = if (before == revision) roster.getJSONArray("bots").objects().map(PulseBot::from) else ui.bots,
+                    bots = if (before == revision) roster.getJSONArray("bots").objects().map { PulseBot.from(it, myNodeSource) } else ui.bots,
                     primary = if (before == revision) roster.optString("primary_bot_id", "companion") else ui.primary,
                     messages = combinedMessages(), unread = unread,
                     online = true, latency = SystemClock.uptimeMillis() - started, workingBot = effectiveWorking, computerBot = null,
@@ -937,6 +1198,7 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                     cloudDesktopLiveBotId = if (usesCloudDesktop) (effectiveSBot ?: effectiveWorking) else ui.cloudDesktopLiveBotId,
                     routineCount = routinesCount,
                     contextTokensByBot = if (ctxTokensMap.isNotEmpty()) ctxTokensMap else ui.contextTokensByBot,
+                    contextCachedByBot = if (ctxCachedMap.isNotEmpty()) ctxCachedMap else ui.contextCachedByBot,
                     contextMsgsByBot = if (ctxMsgsMap.isNotEmpty()) ctxMsgsMap else ui.contextMsgsByBot,
                     autoCompactTokens = if (remoteCompactThresh >= 8000 && ui.activePanel != "settings") remoteCompactThresh.toString() else ui.autoCompactTokens,
                     snoozed = status.optDouble("snooze_until", 0.0) * 1000 > System.currentTimeMillis(),
@@ -959,12 +1221,24 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
             runCatching {
                 val started = SystemClock.uptimeMillis()
                 val afterId = lastServerMessageId()
-                val statusQuery = if (!afterId.isNullOrBlank()) JSONObject().put("after_id", afterId) else null
+                val statusQuery = JSONObject().apply {
+                    if (!afterId.isNullOrBlank()) put("after_id", afterId)
+                    if (lastMessagesEpoch > 0L) put("messages_epoch", lastMessagesEpoch)
+                }.takeIf { it.length() > 0 }
                 val status = request("GET", "/api/status", null, statusQuery)
                 val rtt = SystemClock.uptimeMillis() - started
-                // 1. Always merge recent_tail immediately so completed messages appear in 0ms without an extra RTT!
-                status.optJSONArray("recent_tail")?.objects()?.mapNotNull { runCatching { PulseMessage.from(it) }.getOrNull() }?.let {
-                    mergeRemoteMessages(it, fullReplace = false)
+                val incomingEpoch = status.optLong("messages_epoch", 0L)
+                val epochReset = status.optBoolean("epoch_reset", false) ||
+                    (incomingEpoch > 0L && lastMessagesEpoch > 0L && incomingEpoch != lastMessagesEpoch)
+                if (incomingEpoch > 0L) lastMessagesEpoch = incomingEpoch
+                if (epochReset && status.has("messages")) {
+                    val fullMsgs = status.optJSONArray("messages")?.objects()?.mapNotNull { runCatching { PulseMessage.from(it) }.getOrNull() }.orEmpty()
+                    mergeRemoteMessages(fullMsgs, fullReplace = true)
+                } else {
+                    // 1. Always merge recent_tail immediately so completed messages appear in 0ms without an extra RTT!
+                    status.optJSONArray("recent_tail")?.objects()?.mapNotNull { runCatching { PulseMessage.from(it) }.getOrNull() }?.let {
+                        mergeRemoteMessages(it, fullReplace = false)
+                    }
                 }
                 val lastDone = status.optJSONObject("last_completed_stream")
                 val lastDoneTurn = lastDone?.optString("turn_id").orEmpty()
@@ -983,7 +1257,8 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                 val execution = if (ui.chatOpen && execsByBot != null) execsByBot.optJSONObject(ui.botId) else status.optJSONObject("execution")
                 val stream = if (ui.chatOpen && streamsByBot != null) streamsByBot.optJSONObject(ui.botId) else status.optJSONObject("stream")
                 val streamTurnId = stream?.optString("turn_id").orEmpty()
-                val streamAlreadyDone = streamTurnId.isNotBlank() && streamTurnId in completedTurnIds
+                val hasLiveExec = execution?.optString("bot_id")?.isNotBlank() == true
+                val streamAlreadyDone = !hasLiveExec && streamTurnId.isNotBlank() && streamTurnId in completedTurnIds
 
                 val working = if (streamAlreadyDone) null else execution?.optString("bot_id")?.takeIf { it.isNotBlank() }
                 val sBot = if (streamAlreadyDone) null else stream?.optString("bot_id")?.takeIf { it.isNotBlank() }
@@ -991,6 +1266,11 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                 val finalMsgId = lastDone?.optString("final_message_id").orEmpty()
                 val holdDoneStream = sBot == null && working == null && finalMsgId.isNotBlank() && remoteMessages.none { it.id == finalMsgId } &&
                     (!ui.chatOpen || lastDone?.optString("bot_id") == ui.botId)
+                val lastRoomMsg = sendGuardBotId?.let { gBot -> remoteMessages.lastOrNull { it.botId == gBot } }
+                if (sBot == null && working == null && lastRoomMsg != null && lastRoomMsg.role == "assistant" && !lastRoomMsg.isSubTurn && lastRoomMsg.kind != "bot_message") {
+                    sendGuardBotId = null
+                    sendGuardUntilUptime = 0L
+                }
                 val inSendGuard = sendGuardBotId != null && SystemClock.uptimeMillis() < sendGuardUntilUptime &&
                     (lastDoneTurn.isBlank() || currentTurnId.isBlank() || lastDoneTurn != currentTurnId) &&
                     (!ui.chatOpen || sendGuardBotId == ui.botId)
@@ -1018,7 +1298,7 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                 val usesCloudDesktop = curTool == "cloud_desktop" || execTrace.any { it.optString("tool") == "cloud_desktop" }
                 val startedSec = execution?.optDouble("started_at", 0.0) ?: 0.0
                 val startedMs = if (startedSec > 0) (startedSec * 1000).toLong() else if (effectiveSBot != null || effectiveWorking != null) (ui.streamStartedAt.takeIf { it > 0L } ?: System.currentTimeMillis()) else 0L
-                val (ctxTokensMap, ctxMsgsMap) = parseContextByBot(status.optJSONObject("context_by_bot"))
+                val (ctxTokensMap, ctxMsgsMap, ctxCachedMap) = parseContextByBot(status.optJSONObject("context_by_bot"))
                 val remoteCompactThresh = status.optInt("auto_compact_tokens", 0)
                 ui = ui.copy(
                     online = true,
@@ -1038,6 +1318,7 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                     streamTodos = todos,
                     streamStartedAt = startedMs,
                     contextTokensByBot = if (ctxTokensMap.isNotEmpty()) ctxTokensMap else ui.contextTokensByBot,
+                    contextCachedByBot = if (ctxCachedMap.isNotEmpty()) ctxCachedMap else ui.contextCachedByBot,
                     contextMsgsByBot = if (ctxMsgsMap.isNotEmpty()) ctxMsgsMap else ui.contextMsgsByBot,
                     autoCompactTokens = if (remoteCompactThresh >= 8000 && ui.activePanel != "settings") remoteCompactThresh.toString() else ui.autoCompactTokens,
                     cloudDesktopLiveBotId = if (usesCloudDesktop) (effectiveSBot ?: effectiveWorking) else ui.cloudDesktopLiveBotId
@@ -1095,6 +1376,9 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                 localCfg.optJSONObject("small_brain")?.optString("model").orEmpty()
             }
         }
+        val storedFbUrl = localCfg.optString("fallback_base_url", "http://149.104.25.8:3000/v1")
+        val storedFbKey = localCfg.optString("fallback_api_key", "")
+        val storedFbModel = localCfg.optString("fallback_model", "commandcode/deepseek/deepseek-v4.1-flash")
         val savedApp = saved.optString("appearance", "dark").let { if (it == "light") "light" else "dark" }
         val savedCompact = localCfg.optInt("auto_compact_tokens", 0).takeIf { it >= 8000 }?.toString() ?: ui.autoCompactTokens
         ui = ui.copy(
@@ -1103,6 +1387,9 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
             apiBaseUrl = storedUrl,
             apiKeyInput = storedKey,
             defaultModel = storedModel.ifBlank { ui.defaultModel },
+            fallbackBaseUrl = storedFbUrl.ifBlank { ui.fallbackBaseUrl },
+            fallbackApiKeyInput = storedFbKey,
+            fallbackModel = storedFbModel.ifBlank { ui.fallbackModel },
             autoCompactTokens = savedCompact,
             backgroundService = saved.optBoolean("background", true),
             appearance = savedApp,
@@ -1113,11 +1400,16 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
             val remote = request("GET", "/api/config")
             val rUrl = remote.optString("api_base_url").ifBlank { remote.optJSONObject("big_brain")?.optString("base_url").orEmpty() }
             val rModel = remote.optString("default_model").ifBlank { remote.optJSONObject("big_brain")?.optString("model").orEmpty() }
+            val rFbUrl = remote.optString("fallback_base_url", "")
+            val rFbModel = remote.optString("fallback_model", "")
             val rCompact = remote.optInt("auto_compact_tokens", 120000).coerceIn(8000, 1000000)
             ui = ui.copy(
                 apiBaseUrl = if (ui.apiBaseUrl == "https://api.openai.com/v1" && rUrl.isNotBlank()) rUrl else ui.apiBaseUrl,
                 defaultModel = ui.defaultModel.ifBlank { rModel },
                 hasApiKey = remote.optBoolean("has_api_key", storedKey.isNotBlank()),
+                fallbackBaseUrl = rFbUrl.ifBlank { ui.fallbackBaseUrl },
+                fallbackModel = rFbModel.ifBlank { ui.fallbackModel },
+                hasFallbackApiKey = remote.optBoolean("has_fallback_api_key", storedFbKey.isNotBlank()),
                 curiosityEnabledGlobal = remote.optBoolean("enabled", true),
                 curiosityMinutes = remote.optInt("curiosity_interval_minutes", 90).toString(),
                 autoCompactTokens = rCompact.toString()
@@ -1132,21 +1424,40 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
             try {
                 val base = ui.serverUrl.trim().ifBlank { SecureTransport.DEFAULT_SERVER }.trimEnd('/')
                 val releaseObj = withContext(Dispatchers.IO) {
-                    val conn = (java.net.URL("$base/download/release.json").openConnection() as java.net.HttpURLConnection).apply {
-                        connectTimeout = 6000
-                        readTimeout = 6000
+                    val conn = (java.net.URL("$base/download/release.json?t=${System.currentTimeMillis()}").openConnection() as java.net.HttpURLConnection).apply {
+                        connectTimeout = 8000
+                        readTimeout = 8000
+                        useCaches = false
                     }
-                    conn.inputStream.bufferedReader().use { JSONObject(it.readText()) }
+                    try {
+                        conn.inputStream.bufferedReader().use { JSONObject(it.readText()) }
+                    } finally {
+                        conn.disconnect()
+                    }
                 }
-                val ver = releaseObj.optString("versionName", releaseObj.optString("tag_name", "").removePrefix("v"))
-                val notes = releaseObj.optString("body", releaseObj.optString("notes", ""))
-                val hasNew = ver.isNotBlank() && ver != "2.8.5"
-                ui = ui.copy(latestReleaseVersion = ver, latestReleaseNotes = notes, updateAvailable = hasNew)
+                val ver = releaseObj.optString("versionName")
+                    .ifBlank { releaseObj.optString("version_name") }
+                    .ifBlank { releaseObj.optString("version") }
+                    .ifBlank { releaseObj.optString("tag_name") }
+                    .removePrefix("v")
+                    .trim()
+                val remoteCode = releaseObj.optInt(
+                    "versionCode",
+                    releaseObj.optInt("version_code", releaseObj.optInt("build", 0))
+                )
+                val notes = releaseObj.optString("notes").ifBlank { releaseObj.optString("body") }
+                val curVer = BuildConfig.VERSION_NAME
+                val curCode = BuildConfig.VERSION_CODE
+                val hasNew = (remoteCode > curCode) || (ver.isNotBlank() && ver != curVer && (remoteCode <= 0 || remoteCode >= curCode))
+                ui = ui.copy(latestReleaseVersion = ver.ifBlank { curVer }, latestReleaseNotes = notes, updateAvailable = hasNew)
                 if (!silent) {
-                    toast(if (hasNew) "发现新版本 v$ver，点击下方按钮即可下载安装" else "当前已是最新版本 v${ver.ifBlank { "2.8.5" }}")
+                    toast(
+                        if (hasNew) "发现新版本 v$ver (Build $remoteCode)，点击下方按钮即可一键下载安装"
+                        else "当前已是最新版本 v$curVer (Build $curCode)"
+                    )
                 }
             } catch (e: Exception) {
-                if (!silent) toast("正在直接打开最新安装包下载链接…")
+                if (!silent) toast("检查更新失败 (${e.message ?: "网络异常"})，可直接点击下方按钮下载最新安装包")
             } finally {
                 ui = ui.copy(checkingUpdate = false)
             }
@@ -1154,10 +1465,94 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
     }
 
     fun downloadLatestApk() {
+        if (ui.downloadingApk) {
+            toast("正在下载安装包 (${ui.downloadProgress}%)，请稍候…")
+            return
+        }
         val base = ui.serverUrl.trim().ifBlank { SecureTransport.DEFAULT_SERVER }.trimEnd('/')
         val apkUrl = "$base/download/proactive-agent.apk?t=${System.currentTimeMillis()}"
-        toast("正在启动浏览器下载最新安装包…")
-        openLink(apkUrl)
+        ui = ui.copy(downloadingApk = true, downloadProgress = 0)
+        toast("正在应用内高速下载最新 APK…")
+        scope.launch {
+            try {
+                val apkFile = withContext(Dispatchers.IO) {
+                    val dir = java.io.File(activity.cacheDir, "avatar-capture").apply { mkdirs() }
+                    val target = java.io.File(dir, "proactive-agent-update.apk")
+                    val part = java.io.File(dir, "proactive-agent-update.apk.part")
+                    val conn = (java.net.URL(apkUrl).openConnection() as java.net.HttpURLConnection).apply {
+                        connectTimeout = 15000
+                        readTimeout = 60000
+                        useCaches = false
+                    }
+                    try {
+                        val total = conn.contentLengthLong
+                        conn.inputStream.use { input ->
+                            part.outputStream().use { out ->
+                                val buf = ByteArray(32 * 1024)
+                                var downloaded = 0L
+                                var lastPct = -1
+                                while (true) {
+                                    val n = input.read(buf)
+                                    if (n <= 0) break
+                                    out.write(buf, 0, n)
+                                    downloaded += n
+                                    if (total > 0) {
+                                        val pct = ((downloaded * 100L) / total).toInt().coerceIn(0, 99)
+                                        if (pct != lastPct) {
+                                            lastPct = pct
+                                            withContext(Dispatchers.Main) {
+                                                ui = ui.copy(downloadProgress = pct)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } finally {
+                        conn.disconnect()
+                    }
+                    if (part.length() < 1_000_000L) {
+                        throw IllegalStateException("安装包体积异常 (${part.length()} B)")
+                    }
+                    if (target.exists()) target.delete()
+                    part.renameTo(target)
+                    target
+                }
+                ui = ui.copy(downloadProgress = 100)
+                // 1. Try silent Root install if Root is available, else fallback to standard Android package installer
+                val rootInstalled = withContext(Dispatchers.IO) {
+                    try {
+                        val tmpPath = "/data/local/tmp/proactive-agent-update.apk"
+                        val p = ProcessBuilder(
+                            "su", "-c",
+                            "cp '${apkFile.absolutePath}' $tmpPath && chmod 644 $tmpPath && pm install -r -d $tmpPath && rm -f $tmpPath"
+                        ).redirectErrorStream(true).start()
+                        val finished = p.waitFor(45, java.util.concurrent.TimeUnit.SECONDS)
+                        val out = if (finished) p.inputStream.bufferedReader().readText() else ""
+                        if (!finished) p.destroyForcibly()
+                        finished && p.exitValue() == 0 && out.contains("Success", ignoreCase = true)
+                    } catch (_: Throwable) {
+                        false
+                    }
+                }
+                if (rootInstalled) {
+                    toast("Root 静默覆盖安装成功！")
+                    return@launch
+                }
+                val uri = androidx.core.content.FileProvider.getUriForFile(activity, "${activity.packageName}.avatar-files", apkFile)
+                val installIntent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, "application/vnd.android.package-archive")
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                toast("下载完成，正在拉起系统安装器…")
+                activity.startActivity(installIntent)
+            } catch (e: Exception) {
+                toast("应用内下载受阻，正在用浏览器打开下载链接…")
+                openLink(apkUrl)
+            } finally {
+                ui = ui.copy(downloadingApk = false, downloadProgress = 0)
+            }
+        }
     }
 
     fun updateSettingsField(
@@ -1165,6 +1560,9 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
         apiBaseUrl: String = ui.apiBaseUrl,
         apiKeyInput: String = ui.apiKeyInput,
         defaultModel: String = ui.defaultModel,
+        fallbackBaseUrl: String = ui.fallbackBaseUrl,
+        fallbackApiKeyInput: String = ui.fallbackApiKeyInput,
+        fallbackModel: String = ui.fallbackModel,
         curiosityEnabled: Boolean = ui.curiosityEnabledGlobal,
         curiosityMinutes: String = ui.curiosityMinutes,
         autoCompactTokens: String = ui.autoCompactTokens,
@@ -1180,7 +1578,9 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
         }
         ui = ui.copy(
             serverUrl = serverUrl, apiBaseUrl = apiBaseUrl, apiKeyInput = apiKeyInput,
-            defaultModel = defaultModel, curiosityEnabledGlobal = curiosityEnabled,
+            defaultModel = defaultModel,
+            fallbackBaseUrl = fallbackBaseUrl, fallbackApiKeyInput = fallbackApiKeyInput, fallbackModel = fallbackModel,
+            curiosityEnabledGlobal = curiosityEnabled,
             curiosityMinutes = curiosityMinutes, autoCompactTokens = autoCompactTokens,
             backgroundService = backgroundService,
             appearance = nextApp, dark = nextDark, motion = motion, haptics = haptics
@@ -1227,6 +1627,9 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
         val cleanBase = ui.apiBaseUrl.trim().ifBlank { "https://api.openai.com/v1" }.trimEnd('/')
         val cleanKey = ui.apiKeyInput.trim()
         val cleanModel = ui.defaultModel.trim()
+        val cleanFbBase = ui.fallbackBaseUrl.trim().trimEnd('/')
+        val cleanFbKey = ui.fallbackApiKeyInput.trim()
+        val cleanFbModel = ui.fallbackModel.trim()
         val minutes = (ui.curiosityMinutes.toIntOrNull() ?: 90).coerceIn(5, 1440)
         val compactTokens = (ui.autoCompactTokens.toIntOrNull() ?: 120000).coerceIn(8000, 1000000)
         ui = ui.copy(savingSettings = true, autoCompactTokens = compactTokens.toString())
@@ -1245,6 +1648,9 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                     localCfg.put("auto_compact_tokens", compactTokens)
                     if (cleanKey.isNotBlank()) localCfg.put("api_key", cleanKey)
                     if (cleanModel.isNotBlank()) localCfg.put("default_model", cleanModel)
+                    localCfg.put("fallback_base_url", cleanFbBase)
+                    if (cleanFbKey.isNotBlank()) localCfg.put("fallback_api_key", cleanFbKey)
+                    localCfg.put("fallback_model", cleanFbModel)
                     val brainObj = JSONObject().put("base_url", cleanBase).put("model", cleanModel)
                     if (cleanKey.isNotBlank()) brainObj.put("api_key", cleanKey)
                     else {
@@ -1259,11 +1665,14 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                 }
                 val updatePayload = JSONObject()
                     .put("api_base_url", cleanBase)
+                    .put("fallback_base_url", cleanFbBase)
+                    .put("fallback_model", cleanFbModel)
                     .put("enabled", ui.curiosityEnabledGlobal)
                     .put("curiosity_interval_minutes", minutes)
                     .put("auto_compact_tokens", compactTokens)
                 if (cleanKey.isNotBlank()) updatePayload.put("api_key", cleanKey)
                 if (cleanModel.isNotBlank()) updatePayload.put("default_model", cleanModel)
+                if (cleanFbKey.isNotBlank()) updatePayload.put("fallback_api_key", cleanFbKey)
                 request("POST", "/api/config", updatePayload)
                 val dark = ui.appearance != "light"
                 activity.systemBarsFor(dark)
@@ -1273,7 +1682,17 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                 } else if (!ui.backgroundService) {
                     activity.stopService(Intent(activity, AgentForegroundService::class.java))
                 }
-                ui = ui.copy(dark = dark, smallModel = cleanModel, bigModel = cleanModel, defaultModel = cleanModel, hasApiKey = cleanKey.isNotBlank() || ui.hasApiKey, activePanel = null)
+                ui = ui.copy(
+                    dark = dark,
+                    smallModel = cleanModel,
+                    bigModel = cleanModel,
+                    defaultModel = cleanModel,
+                    fallbackBaseUrl = cleanFbBase,
+                    fallbackModel = cleanFbModel,
+                    hasApiKey = cleanKey.isNotBlank() || ui.hasApiKey,
+                    hasFallbackApiKey = cleanFbKey.isNotBlank() || ui.hasFallbackApiKey,
+                    activePanel = null
+                )
                 refresh()
                 toast("已保存并同步到云端！Harness 已就绪。")
             } finally {
@@ -1291,12 +1710,14 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
             editBotName = existing?.name ?: "",
             editBotDesc = existing?.description ?: "",
             editBotModel = existing?.model ?: "",
-            editBotInstructions = existing?.instructions ?: "你是一位专业、直接的协作 Bot。使用工作区工具完成任务并汇报。",
-            editBotColor = existing?.color ?: "#7C5CFF",
-            editBotShape = existing?.shape ?: "circle",
+            editBotInstructions = existing?.instructions ?: "",
+            editBotColor = existing?.color ?: "#B568F7",
+            editBotShape = existing?.shape ?: "flower",
             editBotCuriosity = existing?.curiosityEnabled ?: false,
             editBotNotify = existing?.notify ?: true
         )
+        loadMemoryPins()
+        fetchStickerPacks()
     }
 
     fun updateBotEditField(
@@ -1323,6 +1744,7 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
         ui = ui.copy(savingBot = true)
         perform {
             try {
+                val myNodeSource = SecureTransport.getNodeSource(activity)
                 val payload = JSONObject()
                     .put("name", name)
                     .put("description", ui.editBotDesc.trim())
@@ -1332,12 +1754,13 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                     .put("shape", ui.editBotShape)
                     .put("curiosity_enabled", ui.editBotCuriosity)
                     .put("notify", ui.editBotNotify)
+                    .put("source", myNodeSource)
                     .put("engine", "small")
                 val editingId = ui.editingBotId
                 val savedBot = if (editingId == null) {
-                    PulseBot.from(request("POST", "/api/bots", payload))
+                    PulseBot.from(request("POST", "/api/bots", payload), myNodeSource)
                 } else {
-                    PulseBot.from(request("PUT", "/api/bots/$editingId", payload))
+                    PulseBot.from(request("PUT", "/api/bots/$editingId", payload), myNodeSource)
                 }
                 revision++
                 val nextBots = if (editingId == null) ui.bots + savedBot else ui.bots.map { if (it.id == editingId) savedBot else it }
@@ -1443,12 +1866,17 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
     fun openCloudDesktop() {
         dismissMenu()
         ui = ui.copy(activePanel = "cloud_desktop", cloudDesktopLoading = ui.cloudDesktopFrame == null)
+        startCloudDesktopStreamLoop(forceFull = true)
+    }
+
+    private fun startCloudDesktopStreamLoop(forceFull: Boolean = false) {
         cloudStreamJob?.cancel()
         cloudStreamJob = scope.launch {
-            refreshCloudDesktopFrame(forceFull = true)
-            while (isActive && ui.activePanel == "cloud_desktop") {
-                delay(850)
-                if (ui.activePanel == "cloud_desktop" && !ui.cloudDesktopLoading) {
+            refreshCloudDesktopFrame(forceFull = forceFull)
+            while (isActive && active && ui.activePanel == "cloud_desktop") {
+                val isBusy = ui.workingBot != null || ui.streamBotId != null || ui.busyBot != null
+                delay(if (isBusy) 1000L else 2200L)
+                if (active && ui.activePanel == "cloud_desktop" && !ui.cloudDesktopLoading) {
                     refreshCloudDesktopFrame(forceFull = false)
                 }
             }
@@ -1513,21 +1941,7 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
     }
 
     fun retryMessage(msg: PulseMessage) {
-        if (msg.role == "user") {
-            setDraft(msg.text)
-            send()
-        } else {
-            val botMsgs = ui.messages.filter { it.botId == ui.botId }
-            val idx = botMsgs.indexOfFirst { it.id == msg.id }
-            val prevUser = if (idx > 0) botMsgs.subList(0, idx).lastOrNull { it.role == "user" } else botMsgs.lastOrNull { it.role == "user" }
-            if (prevUser != null) {
-                setDraft(prevUser.text)
-                send()
-            } else {
-                setDraft("请重新执行并回答上一条请求。")
-                send()
-            }
-        }
+        rerollMessage(msg)
     }
 
     private suspend fun applyCloudDesktopPacket(res: JSONObject) {
@@ -1676,6 +2090,7 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
         )
         scope.launch { refreshStreamOnly() }
         loadMemoryPins()
+        fetchStickerPacks()
         acknowledge()
     }
     fun requestOpenBot(id: String) { if (id.isBlank()) return; pendingOpenBot = id; if (bot(id) != null) { pendingOpenBot = null; open(id) }; scope.launch { refresh() } }
@@ -1690,6 +2105,7 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
         draftJob?.cancel(); draftJob = scope.launch { delay(600); persistDrafts() }
     }
     private fun draft(id: String) = synchronized(draftLock) { drafts[id] ?: "" }
+    fun draftOf(id: String): String = draft(id)
     fun persistDrafts(): Future<*> {
         val snapshot = synchronized(draftLock) { drafts.toMap() }
         val files = synchronized(draftLock) { attachmentDrafts.toMap() }
@@ -1725,27 +2141,59 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
     }
     fun dismissMenu() { ui = ui.copy(menu = null) }
     private fun menu(title: String, items: List<PulseMenuItem>) { ui = ui.copy(menu = PulseMenu(title, items)) }
-    fun newMenu() = menu("工作台", listOf(
-        PulseMenuItem("创建新 Bot", "创建专属角色、指令与独立模型", "plus") { openBotEditor(null) },
-        PulseMenuItem("手机虚拟屏 (桌面悬浮小窗)", "创建并弹出浮在系统桌面上的独立小窗", "screen") { launchFloatingVirtualDisplay() },
-        PulseMenuItem("云端桌面 (Cloud Desktop)", "查看云端浏览器实时画面与触控接管", "cloud") { openCloudDesktop() },
-        PulseMenuItem("定时闹钟与例行自动化", "查看和管理每日定点提醒、课表闹钟与巡检", "clock") { openSchedules() },
-        PulseMenuItem("透明记忆库 (Obsidian Vault)", "查看或修改 Markdown 记忆与画像", "vault") { openVault("INDEX.md") },
-        PulseMenuItem("设置中心与检查更新", "日夜主题切换、API 模型配置与一键更新客户端", "settings") { openSettings() },
-        PulseMenuItem("⬇ 一键下载最新客户端更新", "直接从云端拉取并安装最新 APK (v2.8.3)", "spark") { downloadLatestApk() }))
+    fun toggleNodeSource() {
+        dismissMenu()
+        val cur = SecureTransport.getNodeSource(activity)
+        val next = if (cur == "phone2") "phone" else "phone2"
+        val label = if (next == "phone2") "安卓二 (phone2)" else "安卓一 (phone)"
+        perform {
+            withContext(Dispatchers.IO) {
+                val s = SecurePrefs.read(activity)
+                s.put("nodeSource", next)
+                SecurePrefs.save(activity, s)
+                prefs = s
+                SecureTransport.invalidateCache()
+            }
+            remoteMessages = emptyList()
+            optimisticList.clear()
+            ui = ui.copy(messages = emptyList(), streamBotId = null, workingBot = null, streamText = "", streamThought = "")
+            runCatching {
+                activity.stopService(Intent(activity, AgentForegroundService::class.java))
+                if (ui.backgroundService) {
+                    activity.startForegroundService(Intent(activity, AgentForegroundService::class.java))
+                }
+            }
+            toast("已切换当前端标识为：$label（多端对话完全独立隔离）")
+            refresh(force = true)
+        }
+    }
+    fun newMenu() {
+        val curSrc = SecureTransport.getNodeSource(activity)
+        val nodeLabel = if (curSrc == "phone2") "安卓二 (平板/副机)" else "安卓一 (主力手机)"
+        menu("DSB 工作台 · $nodeLabel", listOf(
+            PulseMenuItem("创建新 Bot", "创建专属角色、指令与独立模型", "plus") { openBotEditor(null) },
+            PulseMenuItem("切换多端节点身份 (当前：$nodeLabel)", "点击在「安卓一」与「安卓二」之间切换，各端对话独立不串台", "spark") { toggleNodeSource() },
+            PulseMenuItem("手机虚拟屏 (桌面悬浮小窗)", "创建并弹出浮在系统桌面上的独立小窗", "screen") { launchFloatingVirtualDisplay() },
+            PulseMenuItem("云端桌面 (Cloud Desktop)", "查看云端浏览器实时画面与触控接管", "cloud") { openCloudDesktop() },
+            PulseMenuItem("定时闹钟与例行自动化", "查看和管理每日定点提醒、课表闹钟与巡检", "clock") { openSchedules() },
+            PulseMenuItem("透明记忆库 (Obsidian Vault)", "查看或修改 Markdown 记忆与画像", "vault") { openVault("INDEX.md") },
+            PulseMenuItem("设置中心与检查更新", "日夜主题切换、API 模型配置与一键更新客户端", "settings") { openSettings() },
+            PulseMenuItem("一键下载最新客户端更新", "直接从云端拉取并安装最新 APK (当前 v${BuildConfig.VERSION_NAME})", "spark") { downloadLatestApk() }))
+    }
     fun botMenu(id: String = ui.botId) {
         val b = bot(id) ?: return
         val (curTok, threshTok, msgCnt) = contextStatsFor(id)
+        val (cachedTok, cachePct) = contextCacheFor(id)
         val pct = ((curTok.toFloat() / threshTok.coerceAtLeast(1)) * 100).toInt()
         val entries = mutableListOf<PulseMenuItem>()
         if (!ui.chatOpen || ui.botId != id) entries += PulseMenuItem("打开对话", icon = "chat") { open(id) }
         entries += listOf(
             PulseMenuItem(
-                "📦 立即压缩上下文 (${formatTokenCount(curTok)} / ${formatTokenCount(threshTok)} · $pct%)",
-                "当前已积攒 $msgCnt 条消息，点击将早期对话浓缩归档至记忆库",
+                "立即压缩上下文 (${formatTokenCount(curTok)} / ${formatTokenCount(threshTok)} · $pct%)",
+                "缓存命中 ${formatTokenCount(cachedTok)} ($cachePct%) · 已积攒 $msgCnt 条消息，点击浓缩归档",
                 "spark"
             ) { compactBotContext(id) },
-            PulseMenuItem("⚙️ 自定义上下文自动压缩阈值", "当前达到 ${formatTokenCount(threshTok)} Tokens 时自动压缩", "settings") { openSettings() },
+            PulseMenuItem("自定义上下文自动压缩阈值", "当前达到 ${formatTokenCount(threshTok)} Tokens 时自动压缩", "settings") { openSettings() },
             PulseMenuItem("编辑 Bot 设定与模型", "当前模型：${b.model.ifBlank { ui.defaultModel.ifBlank { "跟随全局默认" } }}", "settings") { openBotEditor(id) },
             PulseMenuItem(if (ui.primary == id) "当前为主助理" else "设为主助理", icon = "spark") { setPrimaryBot(id) },
             PulseMenuItem(if (b.pinned) "取消置顶" else "置顶到首页", icon = "pin") { placement(id, "pinned", !b.pinned) },
@@ -1759,18 +2207,46 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
         menu(b.name, entries)
     }
 
-    internal fun parseContextByBot(obj: JSONObject?): Pair<Map<String, Int>, Map<String, Int>> {
-        if (obj == null) return emptyMap<String, Int>() to emptyMap()
+    internal fun parseContextByBot(obj: JSONObject?): Triple<Map<String, Int>, Map<String, Int>, Map<String, Int>> {
+        if (obj == null) return Triple(emptyMap(), emptyMap(), emptyMap())
         val tokMap = mutableMapOf<String, Int>()
         val msgMap = mutableMapOf<String, Int>()
+        val cacheMap = mutableMapOf<String, Int>()
+        val ttftMap = mutableMapOf<String, Int>()
+        val tpsMap = mutableMapOf<String, Double>()
+        val compMap = mutableMapOf<String, Int>()
         obj.keys().forEach { bid ->
             val sub = obj.optJSONObject(bid) ?: return@forEach
             val cur = sub.optInt("current_tokens", 0)
             val cnt = sub.optInt("message_count", 0)
+            val cached = sub.optInt("cached_tokens", 0)
+            val ttft = sub.optInt("ttft_ms", 0)
+            val tps = sub.optDouble("tps", 0.0).let { if (it.isNaN()) 0.0 else it }
+            val comp = sub.optInt("completion_tokens", 0)
             if (cur > 0) tokMap[bid] = cur
             if (cnt >= 0) msgMap[bid] = cnt
+            if (cached >= 0) cacheMap[bid] = cached
+            if (ttft > 0) ttftMap[bid] = ttft
+            if (tps > 0.0) tpsMap[bid] = tps
+            if (comp > 0) compMap[bid] = comp
         }
-        return tokMap to msgMap
+        if (ttftMap.isNotEmpty() || tpsMap.isNotEmpty() || compMap.isNotEmpty()) {
+            ui = ui.copy(
+                contextTtftByBot = ui.contextTtftByBot + ttftMap,
+                contextTpsByBot = ui.contextTpsByBot + tpsMap,
+                contextCompTokensByBot = ui.contextCompTokensByBot + compMap
+            )
+        }
+        return Triple(tokMap, msgMap, cacheMap)
+    }
+
+    /** Returns Triple(ttftMs, tps, lastCompletionTokens) for the given bot. */
+    fun contextPerfFor(botId: String = ui.botId): Triple<Int, Double, Int> {
+        val lastBotMsg = ui.messages.lastOrNull { it.botId == botId && it.role == "assistant" && (it.ttftMs > 0 || it.tps > 0.0) }
+        val ttft = (ui.contextTtftByBot[botId] ?: lastBotMsg?.ttftMs ?: 0).coerceAtLeast(0)
+        val tps = (ui.contextTpsByBot[botId] ?: lastBotMsg?.tps ?: 0.0).coerceAtLeast(0.0)
+        val comp = (ui.contextCompTokensByBot[botId] ?: lastBotMsg?.completionTokens ?: 0).coerceAtLeast(0)
+        return Triple(ttft, tps, comp)
     }
 
     internal fun estimateLocalTextTokens(text: String): Int {
@@ -1787,11 +2263,19 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
     fun contextStatsFor(botId: String = ui.botId): Triple<Int, Int, Int> {
         val thresh = (ui.autoCompactTokens.toIntOrNull() ?: 120000).coerceIn(8000, 1000000)
         val localMsgs = ui.messages.filter { it.botId == botId }
-        val localEst = 1800 + localMsgs.sumOf { estimateLocalTextTokens(it.text) + 12 }
+        val localEst = 14800 + localMsgs.sumOf { estimateLocalTextTokens(it.text) + 12 }
         val serverTok = ui.contextTokensByBot[botId] ?: 0
-        val curTok = maxOf(serverTok, localEst)
+        val curTok = if (serverTok > 0) serverTok else localEst
         val msgCnt = ui.contextMsgsByBot[botId] ?: localMsgs.size
         return Triple(curTok, thresh, msgCnt)
+    }
+
+    /** Returns Pair(cachedTokens, cacheHitPercent 0..100) for the given bot. */
+    fun contextCacheFor(botId: String = ui.botId): Pair<Int, Int> {
+        val (curTok, _, _) = contextStatsFor(botId)
+        val cachedTok = (ui.contextCachedByBot[botId] ?: 0).coerceIn(0, curTok.coerceAtLeast(0))
+        val pct = if (curTok > 0 && cachedTok > 0) ((cachedTok.toDouble() / curTok.toDouble()) * 100.0).toInt().coerceIn(0, 100) else 0
+        return cachedTok to pct
     }
 
     fun formatTokenCount(tokens: Int): String {
@@ -1814,9 +2298,9 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
                     .put("bot_id", botId)
                     .put("auto_compact_tokens", thresh)
                 val res = request("POST", "/api/context/compact", payload)
-                val (ctxTokensMap, ctxMsgsMap) = parseContextByBot(res.optJSONObject("context_by_bot"))
+                val (ctxTokensMap, ctxMsgsMap, ctxCachedMap) = parseContextByBot(res.optJSONObject("context_by_bot"))
                 if (ctxTokensMap.isNotEmpty()) {
-                    ui = ui.copy(contextTokensByBot = ctxTokensMap, contextMsgsByBot = ctxMsgsMap)
+                    ui = ui.copy(contextTokensByBot = ctxTokensMap, contextCachedByBot = ctxCachedMap, contextMsgsByBot = ctxMsgsMap)
                 }
                 val resultObj = res.optJSONObject("result")
                 if (resultObj != null) {
@@ -1839,15 +2323,16 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
     }
     fun actionsMenu() {
         val (curTok, threshTok, msgCnt) = contextStatsFor(ui.botId)
+        val (cachedTok, cachePct) = contextCacheFor(ui.botId)
         val pct = ((curTok.toFloat() / threshTok.coerceAtLeast(1)) * 100).toInt()
         menu("工作台与工具", listOf(
             PulseMenuItem(
-                "📦 压缩上下文 (${formatTokenCount(curTok)} / ${formatTokenCount(threshTok)} · $pct%)",
-                "已积攒 $msgCnt 条对话，点击浓缩并在对话框生成归档条目",
+                "压缩上下文 (${formatTokenCount(curTok)} / ${formatTokenCount(threshTok)} · $pct%)",
+                "缓存命中 ${formatTokenCount(cachedTok)} ($cachePct%) · 已积攒 $msgCnt 条对话，点击浓缩归档",
                 "spark"
             ) { compactBotContext(ui.botId) },
             PulseMenuItem(
-                "⚙️ 自定义上下文压缩阈值",
+                "自定义上下文压缩阈值",
                 "当前满 ${formatTokenCount(threshTok)} 自动压缩，点此修改设置",
                 "settings"
             ) { openSettings() },
@@ -1899,7 +2384,8 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
     private fun placement(id: String, key: String, value: Boolean) {
         dismissMenu(); if (!ensurePaired()) return
         perform {
-            val updated = PulseBot.from(request("PATCH", "/api/bots/$id/placement", JSONObject().put(key, value)))
+            val myNodeSource = SecureTransport.getNodeSource(activity)
+            val updated = PulseBot.from(request("PATCH", "/api/bots/$id/placement", JSONObject().put(key, value).put("source", myNodeSource)), myNodeSource)
             revision++; ui = ui.copy(bots = ui.bots.map { if (it.id == id) updated else it }, chatOpen = if (key == "hidden" && value && ui.botId == id) false else ui.chatOpen)
             cacheRoster(ui.bots, ui.primary)
             toast(if (key == "hidden") if (value) "已隐藏。" else "已恢复显示。" else if (value) "已置顶到首页。" else "已取消置顶。")
@@ -1911,7 +2397,11 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
         if (ids.isEmpty()) return
         perform { request("POST", "/api/ack", JSONObject().put("ids", JSONArray(ids))); ui = ui.copy(unread = ui.unread - ids.toSet()) }
     }
-    fun pause() { active = false }
+    fun pause() {
+        active = false
+        cloudStreamJob?.cancel()
+        streamPacerJob?.cancel()
+    }
     fun job(kind: String) {
         dismissMenu(); if (!ensurePaired() || ui.busyBot != null) return
         val id = if (kind == "curiosity") ui.primary else ui.botId
@@ -1928,6 +2418,10 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
         }
     }
     fun send() {
+        ui.editingMessage?.let { editing ->
+            editMessageAndResend(editing, ui.draft)
+            return
+        }
         val raw = ui.draft.trim().ifEmpty { if (ui.attachments.isNotEmpty()) "请查看这些附件。" else "" }
         if (raw.isEmpty() || ui.uploading) return
         if (!ensurePaired()) return
@@ -1968,16 +2462,19 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
         )
         perform {
             try {
-                val res = request("POST", "/api/chat", JSONObject().put("text", text).put("bot_id", id).put("mode", "auto").put("async_ack", true))
+                val res = request("POST", "/api/chat", JSONObject().put("text", text).put("bot_id", id).put("mode", "auto").put("async_ack", true).put("client_msg_id", pending.id))
+                val respEpoch = res.optLong("messages_epoch", 0L)
+                if (respEpoch > 0L) lastMessagesEpoch = respEpoch
                 val seq = res.optLong("seq", 0L)
                 if (seq > lastStreamSeq) lastStreamSeq = seq
                 val turnId = res.optString("turn_id", "")
                 val isQueued = res.optBoolean("queued", false)
                 if (turnId.isNotBlank()) {
                     if (isQueued) {
+                        completedTurnIds.remove(turnId)
                         currentTurnId = turnId
                         sendGuardBotId = id
-                        sendGuardUntilUptime = SystemClock.uptimeMillis() + 10_000L
+                        sendGuardUntilUptime = SystemClock.uptimeMillis() + 30_000L
                     } else {
                         markTurnCompleted(turnId)
                         sendGuardBotId = null
@@ -2054,6 +2551,65 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
             withContext(Dispatchers.IO) { persistDrafts().get() }; toast("已上传：${file.name}")
         } finally { ui = ui.copy(uploading = false) } }
     }
+
+    @Suppress("DEPRECATION")
+    fun handleIncomingShareIntent(intent: Intent?) {
+        if (intent == null) return
+        val act = intent.action ?: return
+        if (act != Intent.ACTION_SEND && act != Intent.ACTION_SEND_MULTIPLE && act != Intent.ACTION_PROCESS_TEXT) return
+        intent.action = Intent.ACTION_MAIN
+        val targetBot = ui.primary.ifBlank { "companion" }
+        open(targetBot)
+        val sharedTexts = mutableListOf<String>()
+        if (act == Intent.ACTION_PROCESS_TEXT) {
+            intent.getCharSequenceExtra(Intent.EXTRA_PROCESS_TEXT)?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { sharedTexts.add(it) }
+        }
+        intent.getStringExtra(Intent.EXTRA_SUBJECT)?.trim()?.takeIf { it.isNotEmpty() }?.let { sharedTexts.add(it) }
+        intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { sharedTexts.add(it) }
+        if (sharedTexts.isNotEmpty()) {
+            val joined = sharedTexts.distinct().joinToString("\n")
+            val cur = draft(targetBot).trim()
+            setDraft(if (cur.isEmpty()) joined else "$cur\n$joined")
+        }
+        val uris = mutableListOf<Uri>()
+        if (act == Intent.ACTION_SEND) {
+            (intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM))?.let { uris.add(it) }
+        } else if (act == Intent.ACTION_SEND_MULTIPLE) {
+            intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)?.let { uris.addAll(it) }
+        }
+        if (uris.isEmpty() && intent.clipData != null) {
+            val cd = intent.clipData!!
+            for (i in 0 until cd.itemCount) {
+                cd.getItemAt(i)?.uri?.let { uris.add(it) }
+            }
+        }
+        val distinctUris = uris.distinct().take(6)
+        if (distinctUris.isNotEmpty()) {
+            ui = ui.copy(uploading = true)
+            perform {
+                try {
+                    val uploaded = mutableListOf<PulseAttachment>()
+                    for (u in distinctUris) {
+                        runCatching {
+                            val res = withContext(Dispatchers.IO) { CloudFiles.upload(activity, u, "workspace") }
+                            uploaded.add(PulseAttachment.from(res.put("source", "workspace")))
+                        }
+                    }
+                    if (uploaded.isNotEmpty()) {
+                        synchronized(draftLock) { attachmentDrafts[targetBot] = attachments(targetBot) + uploaded }
+                        localRevision++
+                        if (ui.botId == targetBot) ui = ui.copy(attachments = attachments(targetBot))
+                        withContext(Dispatchers.IO) { persistDrafts().get() }
+                        toast("已接收分享文件 (${uploaded.size})，可直接发送")
+                    }
+                } finally {
+                    ui = ui.copy(uploading = false)
+                }
+            }
+        } else if (sharedTexts.isNotEmpty()) {
+            toast("已接收分享内容，可直接发送")
+        }
+    }
     fun clearAttachments() { synchronized(draftLock) { attachmentDrafts[ui.botId] = emptyList() }; localRevision++; ui = ui.copy(attachments = emptyList()); persistDrafts() }
     fun openLink(value: String) {
         if (value.startsWith("#vault:")) {
@@ -2081,16 +2637,25 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
             } finally { ui = ui.copy(busyBot = null) }
         }
     }
-    fun stop() {
+    fun stop(targetBot: String = ui.botId) {
         val phone = RootPhoneHarness.changes.value
-        val targetBot = ui.botId
+        val hasPhoneToolInTurn = (phone.active && phone.botId == targetBot) ||
+            (ui.streamBotId == targetBot && (ui.streamTool == "phone_workspace" ||
+                ui.streamTrace.any { it.optString("tool") == "phone_workspace" }))
+        if (hasPhoneToolInTurn) {
+            if (phone.active) {
+                RootPhoneHarness.stop(activity)
+            }
+            FloatingVirtualDisplay.hide()
+            AgentForegroundService.abortPhoneCommands(activity)
+        }
         if (phone.active && phone.botId == targetBot) {
-            RootPhoneHarness.stop(activity)
             if (ui.streamBotId != targetBot && remoteWorkingBot != targetBot) {
                 return
             }
         }
-        val partialText = ui.streamText.takeIf { !isStreamPlaceholder(it) && it.isNotBlank() }
+        val isStreamingTarget = ui.streamBotId == null || ui.streamBotId == targetBot
+        val partialText = if (isStreamingTarget) ui.streamText.takeIf { !isStreamPlaceholder(it) && it.isNotBlank() } else null
         if (partialText != null && !(phone.active && phone.botId == targetBot)) {
             val frozenMsg = PulseMessage(
                 "stopped-${System.currentTimeMillis()}",
@@ -2109,31 +2674,36 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
             )
             mergeRemoteMessages(listOf(frozenMsg), fullReplace = false)
         }
-        if (currentTurnId.isNotBlank()) markTurnCompleted(currentTurnId)
-        remoteWorkingBot = null
-        sendGuardBotId = null
-        sendGuardUntilUptime = 0L
-        targetStreamFullText = ""
+        if (isStreamingTarget) {
+            if (currentTurnId.isNotBlank()) markTurnCompleted(currentTurnId)
+            streamPacerJob?.cancel()
+            targetStreamFullText = ""
+        }
+        if (remoteWorkingBot == targetBot) remoteWorkingBot = null
+        if (sendGuardBotId == targetBot) {
+            sendGuardBotId = null
+            sendGuardUntilUptime = 0L
+        }
         ui = ui.copy(
             messages = combinedMessages(),
-            busyBot = null,
-            workingBot = null,
-            streamBotId = null,
-            streamText = "",
-            streamThought = "",
-            streamTool = "",
-            streamTrace = emptyList(),
-            streamChoices = emptyList(),
-            streamSubAgents = emptyList(),
-            streamTodos = emptyList(),
-            streamStartedAt = 0L
+            busyBot = if (ui.busyBot == targetBot) null else ui.busyBot,
+            workingBot = if (ui.workingBot == targetBot) null else ui.workingBot,
+            streamBotId = if (isStreamingTarget) null else ui.streamBotId,
+            streamText = if (isStreamingTarget) "" else ui.streamText,
+            streamThought = if (isStreamingTarget) "" else ui.streamThought,
+            streamTool = if (isStreamingTarget) "" else ui.streamTool,
+            streamTrace = if (isStreamingTarget) emptyList() else ui.streamTrace,
+            streamChoices = if (isStreamingTarget) emptyList() else ui.streamChoices,
+            streamSubAgents = if (isStreamingTarget) emptyList() else ui.streamSubAgents,
+            streamTodos = if (isStreamingTarget) emptyList() else ui.streamTodos,
+            streamStartedAt = if (isStreamingTarget) 0L else ui.streamStartedAt
         )
+        val stopComputerToo = ui.computerBot == targetBot || ui.cloudDesktopLiveBotId == targetBot
         scope.launch {
             runCatching {
-                if (ui.computerBot == targetBot) {
-                    request("POST", "/api/computer/stop")
-                } else {
-                    request("POST", "/api/stop", JSONObject().put("bot_id", targetBot))
+                request("POST", "/api/stop", JSONObject().put("bot_id", targetBot))
+                if (stopComputerToo) {
+                    runCatching { request("POST", "/api/computer/stop") }
                 }
                 refresh()
             }
@@ -2141,26 +2711,156 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
     }
 
     fun startEditingMessage(message: PulseMessage?) {
-        ui = ui.copy(editingMessage = message, draft = message?.text ?: ui.draft)
+        val id = ui.botId
+        if (message != null) {
+            synchronized(draftLock) { drafts[id] = message.text }
+            ui = ui.copy(editingMessage = message, draft = message.text)
+        } else {
+            ui = ui.copy(editingMessage = null)
+        }
     }
 
     fun editMessageAndResend(message: PulseMessage, newText: String) {
         val clean = newText.trim()
         if (clean.isEmpty()) return
+        if (!ensurePaired()) return
         val id = message.botId
-        ui = ui.copy(editingMessage = null, draft = "", workingBot = id, streamBotId = id, streamText = "正在思考…", streamStartedAt = System.currentTimeMillis())
+        draftJob?.cancel()
+        synchronized(draftLock) { drafts[id] = "" }
+        localRevision++
+        persistDrafts()
+        // Optimistically update the edited user message IN-PLACE and truncate subsequent messages of the same bot
+        val targetIdx = remoteMessages.indexOfFirst { it.id == message.id }
+        if (targetIdx >= 0) {
+            val updatedList = ArrayList<PulseMessage>(remoteMessages.size)
+            for (i in remoteMessages.indices) {
+                val cur = remoteMessages[i]
+                if (i == targetIdx) {
+                    updatedList.add(cur.copy(text = clean))
+                } else if (i > targetIdx && cur.botId == id) {
+                    // Truncated subsequent message in same bot conversation
+                    continue
+                } else {
+                    updatedList.add(cur)
+                }
+            }
+            remoteMessages = updatedList
+        }
+        optimisticList.removeAll { it.botId == id }
+        streamPacerJob?.cancel()
+        targetStreamFullText = ""
+        currentTurnId = "pending-${System.currentTimeMillis()}"
+        sendGuardBotId = id
+        sendGuardUntilUptime = SystemClock.uptimeMillis() + 15_000L
+        ui = ui.copy(
+            editingMessage = null,
+            draft = if (ui.botId == id) "" else ui.draft,
+            busyBot = id,
+            workingBot = id,
+            workingText = "正在思考…",
+            streamBotId = id,
+            streamText = "正在思考…",
+            streamThought = "",
+            streamTool = "",
+            streamTrace = emptyList(),
+            streamChoices = emptyList(),
+            streamSubAgents = emptyList(),
+            streamTodos = emptyList(),
+            streamStartedAt = System.currentTimeMillis(),
+            messages = combinedMessages()
+        )
         perform {
-            request("POST", "/api/messages/edit", JSONObject().put("message_id", message.id).put("text", clean).put("bot_id", id))
-            refresh(force = true)
+            try {
+                val res = request(
+                    "POST",
+                    "/api/messages/edit",
+                    JSONObject()
+                        .put("message_id", message.id)
+                        .put("text", clean)
+                        .put("bot_id", id)
+                        .put("source", SecureTransport.getNodeSource(activity))
+                )
+                val newEpoch = res.optLong("messages_epoch", 0L)
+                if (newEpoch > 0L) lastMessagesEpoch = newEpoch
+                val removedIds = res.optJSONArray("removed_message_ids")?.let { arr ->
+                    (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { s -> s.isNotBlank() } }.toHashSet()
+                }.orEmpty()
+                val editedMsg = res.optJSONObject("edited_message")?.let { runCatching { PulseMessage.from(it) }.getOrNull() }
+                if (removedIds.isNotEmpty() || editedMsg != null) {
+                    remoteMessages = remoteMessages.mapNotNull { m ->
+                        if (m.id in removedIds) null
+                        else if (editedMsg != null && m.id == editedMsg.id) editedMsg
+                        else m
+                    }
+                    ui = ui.copy(messages = combinedMessages())
+                }
+                refresh(force = true)
+            } finally {
+                if (inFlightSends == 0) ui = ui.copy(busyBot = null)
+            }
         }
     }
 
     fun rerollMessage(message: PulseMessage) {
+        if (!ensurePaired()) return
         val id = message.botId
-        ui = ui.copy(workingBot = id, streamBotId = id, streamText = "正在重新生成…", streamStartedAt = System.currentTimeMillis())
+        // Optimistically keep the user message in-place and truncate only assistant replies after it
+        val msgIdx = remoteMessages.indexOfFirst { it.id == message.id }
+        val userIdx = if (msgIdx >= 0) {
+            if (remoteMessages[msgIdx].role == "user") msgIdx
+            else (msgIdx downTo 0).firstOrNull { remoteMessages[it].botId == id && remoteMessages[it].role == "user" } ?: -1
+        } else {
+            remoteMessages.indexOfLast { it.botId == id && it.role == "user" }
+        }
+        if (userIdx >= 0) {
+            remoteMessages = remoteMessages.filterIndexed { idx, cur ->
+                !(idx > userIdx && cur.botId == id)
+            }
+        }
+        optimisticList.removeAll { it.botId == id }
+        streamPacerJob?.cancel()
+        targetStreamFullText = ""
+        currentTurnId = "pending-${System.currentTimeMillis()}"
+        sendGuardBotId = id
+        sendGuardUntilUptime = SystemClock.uptimeMillis() + 15_000L
+        ui = ui.copy(
+            busyBot = id,
+            workingBot = id,
+            workingText = "正在重新生成…",
+            streamBotId = id,
+            streamText = "正在重新生成…",
+            streamThought = "",
+            streamTool = "",
+            streamTrace = emptyList(),
+            streamChoices = emptyList(),
+            streamSubAgents = emptyList(),
+            streamTodos = emptyList(),
+            streamStartedAt = System.currentTimeMillis(),
+            messages = combinedMessages()
+        )
         perform {
-            request("POST", "/api/messages/reroll", JSONObject().put("bot_id", id).put("message_id", message.id))
-            refresh(force = true)
+            try {
+                val res = request(
+                    "POST",
+                    "/api/messages/reroll",
+                    JSONObject()
+                        .put("bot_id", id)
+                        .put("message_id", message.id)
+                        .put("source", SecureTransport.getNodeSource(activity))
+                )
+                val newEpoch = res.optLong("messages_epoch", 0L)
+                if (newEpoch > 0L) lastMessagesEpoch = newEpoch
+                val removedIds = res.optJSONArray("removed_message_ids")?.let { arr ->
+                    (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { s -> s.isNotBlank() } }.toHashSet()
+                }.orEmpty()
+                if (removedIds.isNotEmpty()) {
+                    remoteMessages = remoteMessages.filterNot { it.id in removedIds }
+                    ui = ui.copy(messages = combinedMessages())
+                }
+                refresh(force = true)
+            } finally {
+                if (inFlightSends == 0) ui = ui.copy(busyBot = null)
+            }
         }
     }
 
@@ -2177,7 +2877,7 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
         perform {
             val res = request("POST", "/api/memories/pins", JSONObject().put("action", "add").put("text", clean))
             ui = ui.copy(pinnedMemories = res.optJSONArray("pins")?.objects() ?: ui.pinnedMemories)
-            toast("已钉住记忆 📌")
+            toast("已钉住记忆")
         }
     }
 
@@ -2204,11 +2904,112 @@ internal class NativePulseModel(private val activity: NativePulseActivity, resto
         }
     }
     fun reply(message: PulseMessage?) { ui = ui.copy(reply = message) }
-    fun copy(text: String) { activity.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("Pulse Bot", text)); toast("已复制。") }
+    fun copy(text: String) { activity.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("DSB", text)); toast("已复制。") }
+
+    fun openAccessibilitySettings() {
+        runCatching {
+            activity.startActivity(Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            toast("请在无障碍列表中找到「DSB」并开启")
+        }.onFailure {
+            toast("无法打开系统无障碍设置，请手动前往系统设置 -> 无障碍")
+        }
+    }
+
+    fun connectRootVirtualDisplay() {
+        perform {
+            withContext(Dispatchers.IO) {
+                RootPhoneHarness.initialize(activity)
+                RootPhoneHarness.command(activity, JSONObject().put("op", "connect").put("manual", true))
+                RootPhoneHarness.status(activity)
+            }
+            val st = RootPhoneHarness.changes.value
+            toast(if (st.root) "Root 后台虚拟屏权限已就绪 (uid 0)" else "请在 Root 管理器（KernelSU / Magisk）中授予 DSB 超级用户权限")
+        }
+    }
+
+    fun requestPhonePermission(op: String) {
+        perform {
+            withContext(Dispatchers.IO) {
+                RootPhoneHarness.command(activity, JSONObject().put("op", op))
+                RootPhoneHarness.status(activity)
+            }
+        }
+    }
     fun confirm(message: PulseMessage, accepted: Boolean) = perform {
         request("POST", "/api/confirm", JSONObject().put("id", message.id).put("accepted", accepted)); refresh()
     }
     fun ackDemo(message: PulseMessage) = perform { request("POST", "/api/ack", JSONObject().put("ids", JSONArray().put(message.id))); refresh(); toast("演练已结束。") }
+    private val stickerCache = android.util.LruCache<String, ImageBitmap>(48)
+
+    fun loadStickerBitmap(stickerPath: String, onLoaded: (ImageBitmap) -> Unit) {
+        val clean = stickerPath.trim()
+        if (clean.isEmpty()) return
+        synchronized(stickerCache) { stickerCache.get(clean) }?.let { onLoaded(it); return }
+        scope.launch(Dispatchers.IO) {
+            runCatching {
+                val base = ui.serverUrl.trimEnd('/')
+                val rel = if (clean.startsWith("/")) clean else "/$clean"
+                val fullUrl = if (clean.startsWith("http")) clean else "$base$rel"
+                val conn = (java.net.URL(fullUrl).openConnection() as java.net.HttpURLConnection).apply {
+                    connectTimeout = 8000
+                    readTimeout = 8000
+                }
+                try {
+                    conn.inputStream.use { ins ->
+                        val bmp = BitmapFactory.decodeStream(ins)?.asImageBitmap()
+                        if (bmp != null) {
+                            synchronized(stickerCache) { stickerCache.put(clean, bmp) }
+                            withContext(Dispatchers.Main) { onLoaded(bmp) }
+                        }
+                    }
+                } finally {
+                    conn.disconnect()
+                }
+            }
+        }
+    }
+
+    fun fetchStickerPacks() {
+        perform {
+            runCatching {
+                val res = request("GET", "/api/plugins/stickers")
+                ui = ui.copy(stickerPacks = res.optJSONArray("packs")?.objects() ?: emptyList())
+            }
+        }
+    }
+
+    fun toggleStickerPack(packId: String, enabled: Boolean) {
+        perform {
+            val res = request("POST", "/api/plugins/stickers/toggle", JSONObject().put("pack_id", packId).put("enabled", enabled))
+            ui = ui.copy(stickerPacks = res.optJSONArray("packs")?.objects() ?: ui.stickerPacks)
+            toast(if (enabled) "已启用表情包插件" else "已关闭表情包插件")
+        }
+    }
+
+    fun switchAdjacentBot(delta: Int) {
+        val list = visibleBots().ifEmpty { ui.bots.filter { !it.hidden } }
+        if (list.size <= 1) return
+        val curIdx = list.indexOfFirst { it.id == ui.botId }.coerceAtLeast(0)
+        val nextIdx = (curIdx + delta + list.size) % list.size
+        val nextBot = list[nextIdx]
+        ui = ui.copy(lastSwitchDir = if (delta >= 0) 1 else -1)
+        open(nextBot.id)
+    }
+
+    fun togglePinBot(targetBotId: String) {
+        val target = bot(targetBotId) ?: return
+        placement(target.id, "pinned", !target.pinned)
+    }
+
+    fun toggleAppearanceQuick() {
+        val next = if (ui.appearance == "light") "dark" else "light"
+        updateSettingsField(appearance = next)
+    }
+
+    fun stopBotById(targetBotId: String) {
+        stop(targetBotId)
+    }
+
     fun close() { if (activeInstance === this) activeInstance = null; draftJob?.cancel(); persistDrafts(); draftWriter.shutdown(); scope.cancel() }
 }
 

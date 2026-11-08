@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">DSB</string>
+    <string name="accessibility_service_label">DSB 无障碍与手机操控</string>
+    <string name="accessibility_service_description">DSB 免 Root 标准无障碍自动化与虚拟屏节点服务：支持读取屏幕控件树、点击、滑动、输入文字与 Android 11+ 免授权截图，让 AI 助手在大众免 Root 机型与 Root 虚拟屏上均可流畅操控手机。</string>
+</resources>

@@ -44,8 +44,8 @@ final class DisplayRuntime {
     private static final int FLAG_SUPPORTS_TOUCH = 1 << 6;
     private static final int FLAG_ROTATES_WITH_CONTENT = 1 << 7;
     private static final int FLAG_DESTROY_CONTENT_ON_REMOVAL = 1 << 8;
+    private static final int FLAG_OWN_DISPLAY_GROUP = 1 << 9;
     private static final int FLAG_TRUSTED = 1 << 10;
-    private static final int FLAG_OWN_DISPLAY_GROUP = 1 << 11;
     private static final int FLAG_ALWAYS_UNLOCKED = 1 << 12;
     private static final int FLAG_TOUCH_FEEDBACK_DISABLED = 1 << 13;
     private static final int FLAG_OWN_FOCUS = 1 << 14;
@@ -100,9 +100,17 @@ final class DisplayRuntime {
     private volatile PreviewSnapshot latestPreview = null;
 
     private volatile boolean trustedDisplay = true;
+    private volatile boolean releasedToBackground = false;
     private RootClipboard clipboard;
     private volatile int width = 720, height = 1600, densityDpi = 320;
     private volatile String activeTier = "balanced";
+
+    // Sandbox task containment & main-display anti-jump state
+    private final java.util.Set<String> managedVirtualPackages = java.util.Collections.synchronizedSet(new java.util.HashSet<>());
+    private volatile int baselineMainTaskId = -1;
+    private volatile String baselineMainPkg = "";
+    private volatile boolean baselineMainIsHome = true;
+    private volatile long lastVirtualActionUptime = 0L;
 
     // Cached reflection handles for zero-overhead touch injection & keep-awake
     private static Object sInputManager;
@@ -226,9 +234,12 @@ final class DisplayRuntime {
             return state().put("ok", false);
         }
         final int displayId = vd.getDisplay().getDisplayId();
+        final int rot = vd.getDisplay().getRotation();
+        final int lw = (rot % 2 == 0) ? width : height;
+        final int lh = (rot % 2 == 0) ? height : width;
         final String actionStr = cmd.optString("action", "move").trim().toLowerCase();
-        final float x = (float) Math.max(0, Math.min(Math.max(width, height) - 1, cmd.optInt("x", 0)));
-        final float y = (float) Math.max(0, Math.min(Math.max(width, height) - 1, cmd.optInt("y", 0)));
+        final float x = (float) Math.max(0, Math.min(Math.max(1, lw) - 1, cmd.optInt("x", 0)));
+        final float y = (float) Math.max(0, Math.min(Math.max(1, lh) - 1, cmd.optInt("y", 0)));
         inputHandler.post(() -> {
             try {
                 long now = SystemClock.uptimeMillis();
@@ -236,6 +247,7 @@ final class DisplayRuntime {
                 if ("down".equals(actionStr)) {
                     liveTouchDownTime = now;
                     action = MotionEvent.ACTION_DOWN;
+                    onBeforeVirtualInteraction(displayId);
                 } else if ("up".equals(actionStr)) {
                     action = MotionEvent.ACTION_UP;
                 } else if ("cancel".equals(actionStr)) {
@@ -260,6 +272,7 @@ final class DisplayRuntime {
                 }
                 if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
                     liveTouchDownTime = 0L;
+                    scheduleEscapeContainment(displayId);
                 }
                 scheduleFrameProcess();
             } catch (Throwable ignored) {}
@@ -325,15 +338,22 @@ final class DisplayRuntime {
         } catch (Throwable ignored) {}
     }
 
-    private static int displayFlags(int sdk, boolean trusted) {
+    private static int displayFlags(int sdk, boolean trusted, boolean ownDisplayGroup) {
+        // Always include FLAG_DESTROY_CONTENT_ON_REMOVAL so that if the virtual display is ever
+        // destroyed or the root daemon dies, Android WindowManagerService NEVER reparents virtual
+        // display tasks onto Display 0 (the user's main screen foreground)!
+        // Include FLAG_OWN_DISPLAY_GROUP when supported so apps inside the virtual display (e.g.
+        // WeChat payment/repayment/QR code screens setting WindowManager.LayoutParams.screenBrightness)
+        // stay in an isolated DisplayGroup and NEVER boost the physical main screen's brightness!
         int flags = FLAG_PUBLIC | FLAG_OWN_CONTENT_ONLY | FLAG_SUPPORTS_TOUCH
             | FLAG_ROTATES_WITH_CONTENT | FLAG_DESTROY_CONTENT_ON_REMOVAL;
         if (sdk >= Build.VERSION_CODES.TIRAMISU) {
             flags |= FLAG_TOUCH_FEEDBACK_DISABLED;
             if (trusted) {
-                // Deliberately omit FLAG_OWN_DISPLAY_GROUP so OEM ROMs (OriginOS / HyperOS / ColorOS)
-                // do not create a separate display group that independently times out or locks with Keyguard.
                 flags |= FLAG_TRUSTED | FLAG_ALWAYS_UNLOCKED;
+                if (ownDisplayGroup) {
+                    flags |= FLAG_OWN_DISPLAY_GROUP;
+                }
             }
         }
         if (sdk >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && trusted) {
@@ -385,20 +405,20 @@ final class DisplayRuntime {
             resScale = 0.58f;
             minShortPx = 544;
             maxShortPx = 704;
-            targetSwDp = Math.max(320f, Math.min(344f, hostSwDp * 0.86f));
+            targetSwDp = Math.max(384f, Math.min(411f, hostSwDp));
             targetPreviewShort = 460;
         } else if ("large".equals(tier) || "hd".equals(tier) || "full".equals(tier)) {
             resScale = 0.78f;
             minShortPx = 768;
             maxShortPx = 1088;
-            targetSwDp = Math.max(368f, Math.min(404f, hostSwDp * 0.98f));
+            targetSwDp = Math.max(392f, Math.min(420f, hostSwDp));
             targetPreviewShort = 640;
         } else {
-            // "balanced" (default): 720x1600 on 1080p, 768x1712 on 1.5K, 832x1856 on 2K
+            // "balanced" (default): matches host straight-bar phone swDp (~392-411dp) so apps never render giant text or tablet split-pane
             resScale = 0.667f;
             minShortPx = 640;
             maxShortPx = 864;
-            targetSwDp = Math.max(344f, Math.min(368f, hostSwDp * 0.92f));
+            targetSwDp = Math.max(388f, Math.min(412f, hostSwDp));
             targetPreviewShort = 540;
         }
 
@@ -417,10 +437,18 @@ final class DisplayRuntime {
             String requestedTier = cmd.optString("tier", activeTier).trim().toLowerCase();
             if (requestedTier.isEmpty()) requestedTier = "balanced";
             if (display != null && display.getDisplay() != null && display.getDisplay().getDisplayId() > 0 && !cmd.optBoolean("recreate", false)) {
-                pokeDisplayAwake(display.getDisplay().getDisplayId());
+                releasedToBackground = false;
+                int existingId = display.getDisplay().getDisplayId();
+                ensureAwakeAndUnlocked(existingId);
+                startKeepAwake(existingId);
+                if (reader != null) {
+                    reader.setOnImageAvailableListener(source -> scheduleFrameProcess(), frameHandler);
+                    frameHandler.post(this::scheduleFrameProcess);
+                }
                 return state();
             }
-            release();
+            release(true);
+            releasedToBackground = false;
             Constructor<DisplayManager> ctor = DisplayManager.class.getDeclaredConstructor(Context.class);
             ctor.setAccessible(true);
             DisplayManager dm = ctor.newInstance(context);
@@ -438,15 +466,20 @@ final class DisplayRuntime {
             Surface surface = reader.getSurface();
             try {
                 trustedDisplay = true;
-                display = dm.createVirtualDisplay("Pulse-Agent", width, height, densityDpi, surface, displayFlags(Build.VERSION.SDK_INT, true));
+                display = dm.createVirtualDisplay("Pulse-Agent", width, height, densityDpi, surface, displayFlags(Build.VERSION.SDK_INT, true, true));
             } catch (Throwable firstErr) {
-                // Retry without trusted display flags if ROM blocks ADD_TRUSTED_DISPLAY
                 try {
-                    trustedDisplay = false;
-                    display = dm.createVirtualDisplay("Pulse-Agent", width, height, densityDpi, surface, displayFlags(Build.VERSION.SDK_INT, false));
-                } catch (Exception secondErr) {
-                    release();
-                    throw secondErr;
+                    trustedDisplay = true;
+                    display = dm.createVirtualDisplay("Pulse-Agent", width, height, densityDpi, surface, displayFlags(Build.VERSION.SDK_INT, true, false));
+                } catch (Throwable secondErr) {
+                    // Retry without trusted display flags if ROM blocks ADD_TRUSTED_DISPLAY
+                    try {
+                        trustedDisplay = false;
+                        display = dm.createVirtualDisplay("Pulse-Agent", width, height, densityDpi, surface, displayFlags(Build.VERSION.SDK_INT, false, false));
+                    } catch (Exception thirdErr) {
+                        release();
+                        throw thirdErr;
+                    }
                 }
             }
             if (display == null || display.getDisplay().getDisplayId() <= 0) {
@@ -497,8 +530,13 @@ final class DisplayRuntime {
             }
             scheduleFrameProcess();
             return state().put("resized", true).put("tier", activeTier);
-        } else if (op.equals("release")) {
-            release();
+        } else if (op.equals("release") || op.equals("promote") || op.equals("expand_to_foreground")) {
+            if (display == null) {
+                return state().put("ok", true).put("noop", true).put("released_to_background", true);
+            }
+            boolean destroy = cmd.optBoolean("destroy", true);
+            release(destroy);
+            return state().put("ok", true).put("released_to_background", true).put("destroyed", destroy);
         } else if (op.equals("preview")) {
             return fastPreview(cmd);
         } else if (op.equals("shell")) {
@@ -506,11 +544,6 @@ final class DisplayRuntime {
             if (rawCmd.isEmpty()) throw new Exception("shell 操作需要提供 command");
             String out = shell("sh", "-c", rawCmd);
             return state().put("output", out.length() > 24000 ? out.substring(0, 24000) + "\n...[truncated]" : out);
-        } else if (op.equals("ui_tree_xml")) {
-            int id = requireDisplay();
-            String topPkg = topPackageOnDisplay(id);
-            String xml = dumpTopViewHierarchyXml(topPkg);
-            return state().put("xml", xml).put("topPackage", topPkg);
         } else if (op.equals("capture")) {
             requireDisplay();
             Bitmap upright = null;
@@ -548,9 +581,11 @@ final class DisplayRuntime {
             int id = requireDisplay(), x = cmd.getInt("x"), y = cmd.getInt("y");
             checkTarget(cmd, id);
             checkPoint(x, y);
+            onBeforeVirtualInteraction(id);
             if (!injectTap(id, x, y)) {
                 shell("input", "-d", String.valueOf(id), "tap", String.valueOf(x), String.valueOf(y));
             }
+            scheduleEscapeContainment(id);
             return state().put("clicked", true).put("x", x).put("y", y);
         } else if (op.equals("swipe")) {
             int id = requireDisplay();
@@ -562,40 +597,83 @@ final class DisplayRuntime {
             checkPoint(x2, y2);
             int duration = cmd.optInt("duration_ms", 220);
             if (duration < 40 || duration > 2500) throw new Exception("滑动时长须为 40–2500 ms");
+            onBeforeVirtualInteraction(id);
             if (!injectSwipe(id, x1, y1, x2, y2, duration)) {
                 shell("input", "-d", String.valueOf(id), "swipe", String.valueOf(x1), String.valueOf(y1), String.valueOf(x2), String.valueOf(y2), String.valueOf(duration));
             }
+            scheduleEscapeContainment(id);
             return state().put("swiped", true).put("x1", x1).put("y1", y1).put("x2", x2).put("y2", y2);
         } else if (op.equals("text")) {
             int id = requireDisplay();
             checkTarget(cmd, id);
             String text = cmd.getString("text");
             if (text.isEmpty() || text.length() > 4000) throw new Exception("一次输入 1–4000 字");
+            onBeforeVirtualInteraction(id);
             if (clipboard == null) clipboard = new RootClipboard(context);
             clipboard.paste(id, text);
+            scheduleEscapeContainment(id);
             return state().put("typed", true).put("characters", text.length());
         } else if (op.equals("key")) {
             int id = requireDisplay();
             checkTarget(cmd, id);
-            String key = cmd.getString("key").toLowerCase();
+            String key = cmd.optString("key", "").trim().toLowerCase();
+            int explicitCode = cmd.optInt("keycode", cmd.optInt("key_code", -1));
             int keyCode;
-            switch (key) {
-                case "home": keyCode = KeyEvent.KEYCODE_HOME; break;
-                case "back": keyCode = KeyEvent.KEYCODE_BACK; break;
-                case "enter": keyCode = KeyEvent.KEYCODE_ENTER; break;
-                case "tab": keyCode = KeyEvent.KEYCODE_TAB; break;
-                case "delete":
-                case "backspace": keyCode = KeyEvent.KEYCODE_DEL; break;
-                case "up": keyCode = KeyEvent.KEYCODE_DPAD_UP; break;
-                case "down": keyCode = KeyEvent.KEYCODE_DPAD_DOWN; break;
-                case "left": keyCode = KeyEvent.KEYCODE_DPAD_LEFT; break;
-                case "right": keyCode = KeyEvent.KEYCODE_DPAD_RIGHT; break;
-                default: throw new Exception("不支持此工作区按键");
+            if (explicitCode > 0 && key.isEmpty()) {
+                keyCode = explicitCode;
+                key = String.valueOf(explicitCode);
+            } else {
+                switch (key) {
+                    case "home": keyCode = KeyEvent.KEYCODE_BACK; break;
+                    case "back": keyCode = KeyEvent.KEYCODE_BACK; break;
+                    case "enter":
+                    case "66": keyCode = KeyEvent.KEYCODE_ENTER; break;
+                    case "search":
+                    case "84": keyCode = KeyEvent.KEYCODE_SEARCH; break;
+                    case "tab": keyCode = KeyEvent.KEYCODE_TAB; break;
+                    case "delete":
+                    case "backspace": keyCode = KeyEvent.KEYCODE_DEL; break;
+                    case "up": keyCode = KeyEvent.KEYCODE_DPAD_UP; break;
+                    case "down": keyCode = KeyEvent.KEYCODE_DPAD_DOWN; break;
+                    case "left": keyCode = KeyEvent.KEYCODE_DPAD_LEFT; break;
+                    case "right": keyCode = KeyEvent.KEYCODE_DPAD_RIGHT; break;
+                    default:
+                        if (explicitCode > 0) {
+                            keyCode = explicitCode;
+                        } else {
+                            throw new Exception("不支持此工作区按键: " + key);
+                        }
+                }
             }
+            // Never inject KEYCODE_HOME (3) or KEYCODE_APP_SWITCH (187) on a virtual display because Android PhoneWindowManager routes them to Display 0's Home Launcher!
+            if (keyCode == KeyEvent.KEYCODE_HOME || keyCode == KeyEvent.KEYCODE_APP_SWITCH) {
+                keyCode = KeyEvent.KEYCODE_BACK;
+            }
+            onBeforeVirtualInteraction(id);
             if (!injectKey(id, keyCode)) {
                 shell("input", "-d", String.valueOf(id), "keyevent", String.valueOf(keyCode));
             }
-            return state().put("key", key);
+            scheduleEscapeContainment(id);
+            return state().put("key", key).put("keycode", keyCode);
+        } else if (op.equals("open_uri") || op.equals("open_url")) {
+            int id = requireDisplay();
+            String uri = cmd.optString("uri", cmd.optString("url", cmd.optString("text", ""))).trim();
+            if (uri.isEmpty()) throw new Exception("请提供要打开的 URI/URL");
+            onBeforeVirtualInteraction(id);
+            String out = openUriOnDisplay(id, uri, cmd.optInt("user_id", 0));
+            scheduleEscapeContainment(id);
+            return state().put("opened_uri", uri).put("output", out);
+        } else if (op.equals("long_press")) {
+            int id = requireDisplay(), x = cmd.getInt("x"), y = cmd.getInt("y");
+            int duration = Math.max(450, Math.min(2000, cmd.optInt("duration_ms", 650)));
+            checkTarget(cmd, id);
+            checkPoint(x, y);
+            onBeforeVirtualInteraction(id);
+            if (!injectSwipe(id, x, y, x, y, duration)) {
+                shell("input", "-d", String.valueOf(id), "swipe", String.valueOf(x), String.valueOf(y), String.valueOf(x), String.valueOf(y), String.valueOf(duration));
+            }
+            scheduleEscapeContainment(id);
+            return state().put("long_pressed", true).put("x", x).put("y", y);
         } else if (op.equals("launch")) {
             int id = requireDisplay();
             checkTarget(cmd, id);
@@ -605,8 +683,11 @@ final class DisplayRuntime {
             if (!component.equals("dev.bubuki.proactive/.DisplayTestActivity") && isPackageVisibleOnMainDisplay(pkg)) {
                 throw new Exception("该 App 当前在主屏前台，余拒绝打断主人的主屏操作；请先切走该应用或换个应用");
             }
+            managedVirtualPackages.add(pkg);
+            onBeforeVirtualInteraction(id);
             int userId = cmd.optInt("user_id", 0);
             String output = launchOnDisplay(id, component, userId);
+            scheduleEscapeContainment(id);
             return state().put("output", output);
         } else if (!op.equals("status")) {
             throw new Exception("未知虚拟屏操作");
@@ -629,42 +710,121 @@ final class DisplayRuntime {
     private void setImePolicy(int displayId) {
         try {
             Object wm = Class.forName("android.view.WindowManagerGlobal").getMethod("getWindowManagerService").invoke(null);
-            // WindowManager.DISPLAY_IME_POLICY_LOCAL = 0
-            wm.getClass().getMethod("setDisplayImePolicy", int.class, int.class).invoke(wm, displayId, 0);
+            // WindowManager.DISPLAY_IME_POLICY_HIDE = 2: Prevents virtual display apps from hijacking or freezing the host phone's soft keyboard!
+            wm.getClass().getMethod("setDisplayImePolicy", int.class, int.class).invoke(wm, displayId, 2);
         } catch (Throwable ignored) {}
     }
 
     private void pokeDisplayAwake(int displayId) {
+        // Intentionally do NOT call IPowerManager.userActivity(displayId, ..., EVENT_TOUCH, 0)
+        // because on ColorOS / HyperOS / OneUI, userActivity on any displayId wakes the global
+        // DisplayPowerController and boosts physical screen brightness!
+        // FLAG_ALWAYS_UNLOCKED on the VirtualDisplay + PARTIAL_WAKE_LOCK on CPU already keep the
+        // virtual display rendering without touching physical screen backlight.
+    }
+
+    private void onBeforeVirtualInteraction(int displayId) {
+        if (displayId <= 0) return;
+        lastVirtualActionUptime = SystemClock.uptimeMillis();
         try {
-            if (sPowerManager != null && sUserActivityMethod != null) {
-                long now = SystemClock.uptimeMillis();
-                sUserActivityMethod.invoke(sPowerManager, displayId, now, 2 /* EVENT_TOUCH */, 0);
+            String vdTop = topPackageOnDisplay(displayId);
+            if (vdTop != null && !vdTop.isEmpty()) {
+                managedVirtualPackages.add(vdTop);
+            }
+            Object atm = Class.forName("android.app.ActivityTaskManager").getMethod("getService").invoke(null);
+            Class<?> taskInfoCls = Class.forName("android.app.TaskInfo");
+            Field displayField = taskInfoCls.getField("displayId");
+            Field taskIdField = taskInfoCls.getField("taskId");
+            Field topField = taskInfoCls.getField("topActivity");
+            for (Object t : queryTasksOnDisplay(atm, Display.DEFAULT_DISPLAY)) {
+                if (t == null) continue;
+                if (displayField.getInt(t) != Display.DEFAULT_DISPLAY) continue;
+                int tid = taskIdField.getInt(t);
+                ComponentName top = (ComponentName) topField.get(t);
+                String topPkg = top != null ? top.getPackageName() : "";
+                if (!managedVirtualPackages.contains(topPkg)) {
+                    baselineMainTaskId = tid;
+                    baselineMainPkg = topPkg;
+                }
+                break;
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private void scheduleEscapeContainment(int displayId) {
+        if (displayId <= 0) return;
+        final long triggerUptime = SystemClock.uptimeMillis();
+        lastVirtualActionUptime = triggerUptime;
+        int[] delaysMs = new int[]{65, 190, 440, 820};
+        for (int d : delaysMs) {
+            awakeTimer.schedule(() -> {
+                try {
+                    containEscapedTasks(displayId, triggerUptime);
+                } catch (Throwable ignored) {}
+            }, d, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    private void containEscapedTasks(int displayId, long triggerUptime) {
+        VirtualDisplay vd = this.display;
+        if (vd == null || vd.getDisplay() == null || vd.getDisplay().getDisplayId() != displayId) return;
+        if (SystemClock.uptimeMillis() - triggerUptime > 2200L) return;
+        try {
+            Object atm = Class.forName("android.app.ActivityTaskManager").getMethod("getService").invoke(null);
+            Class<?> taskInfoCls = Class.forName("android.app.TaskInfo");
+            Field displayField = taskInfoCls.getField("displayId");
+            Field taskIdField = taskInfoCls.getField("taskId");
+            Field topField = taskInfoCls.getField("topActivity");
+            Field baseField = taskInfoCls.getField("baseActivity");
+            boolean movedAny = false;
+            for (Object t : queryTasksOnDisplay(atm, Display.DEFAULT_DISPLAY)) {
+                if (t == null) continue;
+                if (displayField.getInt(t) != Display.DEFAULT_DISPLAY) continue;
+                int tid = taskIdField.getInt(t);
+                ComponentName top = (ComponentName) topField.get(t);
+                ComponentName base = (ComponentName) baseField.get(t);
+                String topPkg = top != null ? top.getPackageName() : "";
+                String basePkg = base != null ? base.getPackageName() : "";
+                String topCls = top != null ? top.getClassName() : "";
+                if (tid == baselineMainTaskId) break;
+                boolean isManagedEscape = managedVirtualPackages.contains(topPkg)
+                    || managedVirtualPackages.contains(basePkg)
+                    || topCls.contains("AppBrandUI")
+                    || topCls.contains("WebViewUI");
+                if (isManagedEscape && !topPkg.equals(baselineMainPkg)) {
+                    invokeMoveRootTaskToDisplay(atm, tid, displayId, true);
+                    movedAny = true;
+                }
+                break;
+            }
+            if (movedAny && baselineMainTaskId > 0) {
+                invokeMoveTaskToFront(atm, baselineMainTaskId);
             }
         } catch (Throwable ignored) {}
     }
 
     private void ensureAwakeAndUnlocked(int displayId) {
         pokeDisplayAwake(displayId);
+        boolean interactive = true;
         try {
             if (sPowerManager != null) {
-                boolean interactive = true;
-                try {
-                    interactive = (Boolean) sPowerManager.getClass().getMethod("isInteractive").invoke(sPowerManager);
-                } catch (Throwable ignored) {}
-                if (!interactive) {
-                    injectKey(0, KeyEvent.KEYCODE_WAKEUP);
-                }
+                interactive = (Boolean) sPowerManager.getClass().getMethod("isInteractive").invoke(sPowerManager);
             }
         } catch (Throwable ignored) {}
-        try {
-            Object wm = Class.forName("android.view.WindowManagerGlobal").getMethod("getWindowManagerService").invoke(null);
-            for (Method m : wm.getClass().getMethods()) {
-                if (m.getName().equals("dismissKeyguard") && m.getParameterTypes().length == 2) {
-                    m.invoke(wm, null, null);
-                    break;
+        if (!interactive) {
+            try {
+                injectKey(0, KeyEvent.KEYCODE_WAKEUP);
+            } catch (Throwable ignored) {}
+            try {
+                Object wm = Class.forName("android.view.WindowManagerGlobal").getMethod("getWindowManagerService").invoke(null);
+                for (Method m : wm.getClass().getMethods()) {
+                    if (m.getName().equals("dismissKeyguard") && m.getParameterTypes().length == 2) {
+                        m.invoke(wm, null, null);
+                        break;
+                    }
                 }
-            }
-        } catch (Throwable ignored) {}
+            } catch (Throwable ignored) {}
+        }
     }
 
     private String topPackageOnDisplay(int displayId) {
@@ -694,134 +854,6 @@ final class DisplayRuntime {
             }
         } catch (Throwable ignored) {}
         return "";
-    }
-
-    /**
-     * Root Binder fallback for hardened apps (like WeChat on a VirtualDisplay) where Accessibility
-     * windows report 0 visible nodes: parses `dumpsys activity top` View Hierarchy for `targetPkg`
-     * and converts visible clickable/identified views into uiautomator-compatible `<hierarchy>` XML.
-     */
-    private String dumpTopViewHierarchyXml(String targetPkg) {
-        if (targetPkg == null || targetPkg.isEmpty()) return "";
-        try {
-            String dump = shell("dumpsys", "activity", "top");
-            if (dump == null || dump.isEmpty()) return "";
-            String[] lines = dump.split("\n");
-            boolean inMatchingActivity = false;
-            boolean inViewHierarchy = false;
-            int[] indentStack = new int[96];
-            int[] absLeftStack = new int[96];
-            int[] absTopStack = new int[96];
-            boolean[] visStack = new boolean[96];
-            int stackDepth = 0;
-
-            StringBuilder xml = new StringBuilder(8192);
-            xml.append("<?xml version='1.0' encoding='UTF-8' standalone='yes' ?><hierarchy rotation=\"0\">");
-            int nodeCount = 0;
-
-            for (String rawLine : lines) {
-                String trimmed = rawLine.trim();
-                if (trimmed.startsWith("TASK ") || trimmed.startsWith("ACTIVITY ")) {
-                    if (trimmed.startsWith("ACTIVITY ")) {
-                        inMatchingActivity = trimmed.contains(targetPkg + "/");
-                        inViewHierarchy = false;
-                        stackDepth = 0;
-                    }
-                    continue;
-                }
-                if (!inMatchingActivity) continue;
-                if (trimmed.equals("View Hierarchy:")) {
-                    inViewHierarchy = true;
-                    stackDepth = 0;
-                    continue;
-                }
-                if (!inViewHierarchy) continue;
-                if (trimmed.startsWith("Looper ") || trimmed.startsWith("Local FragmentActivity") || trimmed.startsWith("Added Fragments:")) {
-                    inViewHierarchy = false;
-                    continue;
-                }
-                int braceOpen = trimmed.indexOf('{');
-                int braceClose = trimmed.lastIndexOf('}');
-                if (braceOpen <= 0 || braceClose <= braceOpen) continue;
-
-                int indent = rawLine.indexOf(trimmed);
-                String clsName = trimmed.substring(0, braceOpen).trim();
-                String inside = trimmed.substring(braceOpen + 1, braceClose).trim();
-                String[] parts = inside.split("\\s+");
-                if (parts.length < 4) continue;
-
-                String flags = parts[1];
-                String coords = parts[3];
-                int comma1 = coords.indexOf(',');
-                int dash = coords.indexOf('-', comma1 + 1);
-                int comma2 = coords.indexOf(',', dash + 1);
-                if (comma1 < 0 || dash < 0 || comma2 < 0) continue;
-
-                int relL, relT, relR, relB;
-                try {
-                    relL = Integer.parseInt(coords.substring(0, comma1));
-                    relT = Integer.parseInt(coords.substring(comma1 + 1, dash));
-                    relR = Integer.parseInt(coords.substring(dash + 1, comma2));
-                    relB = Integer.parseInt(coords.substring(comma2 + 1));
-                } catch (NumberFormatException e) {
-                    continue;
-                }
-
-                while (stackDepth > 0 && indentStack[stackDepth - 1] >= indent) {
-                    stackDepth--;
-                }
-                boolean parentVis = stackDepth == 0 || visStack[stackDepth - 1];
-                boolean selfVis = flags.length() > 0 && flags.charAt(0) == 'V' && parentVis;
-                int parentL = stackDepth == 0 ? 0 : absLeftStack[stackDepth - 1];
-                int parentT = stackDepth == 0 ? 0 : absTopStack[stackDepth - 1];
-                int absL = parentL + relL;
-                int absT = parentT + relT;
-                int absR = parentL + relR;
-                int absB = parentT + relB;
-
-                if (stackDepth < indentStack.length) {
-                    indentStack[stackDepth] = indent;
-                    absLeftStack[stackDepth] = absL;
-                    absTopStack[stackDepth] = absT;
-                    visStack[stackDepth] = selfVis;
-                    stackDepth++;
-                }
-
-                if (!selfVis) continue;
-                int w = absR - absL;
-                int h = absB - absT;
-                if (w < 8 || h < 8 || absR <= 0 || absB <= 0 || absL >= width || absT >= height) continue;
-
-                boolean clickable = (flags.length() > 5 && flags.charAt(5) == 'C') || (flags.length() > 6 && flags.charAt(6) == 'L');
-                boolean editable = clsName.toLowerCase().contains("edittext");
-                String resId = "";
-                for (int i = 4; i < parts.length; i++) {
-                    if (parts[i].contains(":id/")) {
-                        resId = parts[i];
-                        break;
-                    }
-                }
-                if (clickable || editable || !resId.isEmpty()) {
-                    xml.append("<node index=\"0\" text=\"\" resource-id=\"")
-                        .append(resId.replace("\"", ""))
-                        .append("\" class=\"")
-                        .append(clsName.replace("\"", ""))
-                        .append("\" package=\"")
-                        .append(targetPkg.replace("\"", ""))
-                        .append("\" content-desc=\"\" checkable=\"false\" checked=\"false\" clickable=\"")
-                        .append(clickable)
-                        .append("\" enabled=\"true\" focusable=\"true\" focused=\"false\" scrollable=\"false\" long-clickable=\"false\" password=\"false\" selected=\"false\" bounds=\"[")
-                        .append(Math.max(0, absL)).append(",").append(Math.max(0, absT)).append("][")
-                        .append(Math.min(width, absR)).append(",").append(Math.min(height, absB)).append("]\" />");
-                    nodeCount++;
-                    if (nodeCount >= 110) break;
-                }
-            }
-            xml.append("</hierarchy>");
-            return nodeCount > 0 ? xml.toString() : "";
-        } catch (Throwable ignored) {
-            return "";
-        }
     }
 
     private void startKeepAwake(int displayId) {
@@ -1002,29 +1034,116 @@ final class DisplayRuntime {
         }
     }
 
-    private String launchOnDisplay(int displayId, String component, int userId) throws Exception {
-        String[] parts = component.split("/");
-        String pkg = parts[0];
-        String cls = parts[1].startsWith(".") ? pkg + parts[1] : parts[1];
-        Intent intent = new Intent(Intent.ACTION_MAIN)
-            .addCategory(Intent.CATEGORY_LAUNCHER)
-            .setComponent(new ComponentName(pkg, cls))
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        Bundle options = ActivityOptions.makeBasic().setLaunchDisplayId(displayId).toBundle();
+    private void guardAndContainLaunchOnDisplay(Object atm, int displayId, String targetPkg, int mainBeforeTaskId, String mainBeforePkg) {
+        if (atm == null || displayId <= 0) return;
         try {
-            Object atm = Class.forName("android.app.ActivityTaskManager").getMethod("getService").invoke(null);
-            for (Method m : atm.getClass().getMethods()) {
-                if (m.getName().equals("startActivityAsUser") && m.getParameterTypes().length == 12) {
-                    int res = (Integer) m.invoke(
-                        atm, null, SHELL_PACKAGE, null, intent, null, null, null,
-                        0, 0, null, options, userId == 0 ? USER_CURRENT : userId
-                    );
-                    if (res >= 0) return "startActivityAsUser ok (" + res + ")";
+            Class<?> taskInfoCls = Class.forName("android.app.TaskInfo");
+            Field displayField = taskInfoCls.getField("displayId");
+            Field taskIdField = taskInfoCls.getField("taskId");
+            Field topField = taskInfoCls.getField("topActivity");
+            Field baseField = taskInfoCls.getField("baseActivity");
+            for (int check = 0; check < 2; check++) {
+                if (check > 0) Thread.sleep(55L);
+                for (Object t : queryTasksOnDisplay(atm, Display.DEFAULT_DISPLAY)) {
+                    if (t == null) continue;
+                    if (displayField.getInt(t) != Display.DEFAULT_DISPLAY) continue;
+                    int tid = taskIdField.getInt(t);
+                    ComponentName top = (ComponentName) topField.get(t);
+                    ComponentName base = (ComponentName) baseField.get(t);
+                    String topPkg = top != null ? top.getPackageName() : "";
+                    String basePkg = base != null ? base.getPackageName() : "";
+                    if (tid != mainBeforeTaskId && !targetPkg.isEmpty() && (targetPkg.equals(topPkg) || targetPkg.equals(basePkg)) && !targetPkg.equals(mainBeforePkg)) {
+                        invokeMoveRootTaskToDisplay(atm, tid, displayId, true);
+                        if (mainBeforeTaskId > 0) {
+                            invokeMoveTaskToFront(atm, mainBeforeTaskId);
+                        }
+                    }
                     break;
                 }
             }
         } catch (Throwable ignored) {}
+    }
+
+    private String launchOnDisplay(int displayId, String component, int userId) throws Exception {
+        String[] parts = component.split("/");
+        String pkg = parts[0];
+        String cls = parts[1].startsWith(".") ? pkg + parts[1] : parts[1];
+        Object atm = null;
+        int mainBeforeTaskId = -1;
+        String mainBeforePkg = "";
+        try {
+            atm = Class.forName("android.app.ActivityTaskManager").getMethod("getService").invoke(null);
+            Class<?> taskInfoCls = Class.forName("android.app.TaskInfo");
+            Field displayField = taskInfoCls.getField("displayId");
+            Field taskIdField = taskInfoCls.getField("taskId");
+            Field topField = taskInfoCls.getField("topActivity");
+            Field baseField = taskInfoCls.getField("baseActivity");
+            int idx = 0;
+            for (Object t : queryTasksOnDisplay(atm, Display.DEFAULT_DISPLAY)) {
+                if (t == null) continue;
+                if (displayField.getInt(t) != Display.DEFAULT_DISPLAY) continue;
+                int tid = taskIdField.getInt(t);
+                ComponentName top = (ComponentName) topField.get(t);
+                ComponentName base = (ComponentName) baseField.get(t);
+                String topPkg = top != null ? top.getPackageName() : "";
+                String basePkg = base != null ? base.getPackageName() : "";
+                if (idx == 0) {
+                    mainBeforeTaskId = tid;
+                    mainBeforePkg = topPkg;
+                } else if (pkg.equals(topPkg) || pkg.equals(basePkg)) {
+                    // Pre-move background task of target app from Display 0 into virtual display so singleTask apps don't wake on Display 0!
+                    invokeMoveRootTaskToDisplay(atm, tid, displayId, true);
+                }
+                idx++;
+            }
+        } catch (Throwable ignored) {}
+
+        Intent intent = new Intent(Intent.ACTION_MAIN)
+            .addCategory(Intent.CATEGORY_LAUNCHER)
+            .setComponent(new ComponentName(pkg, cls))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_MULTIPLE_TASK);
+        Bundle options = ActivityOptions.makeBasic().setLaunchDisplayId(displayId).toBundle();
+        try {
+            if (atm != null) {
+                for (Method m : atm.getClass().getMethods()) {
+                    if (m.getName().equals("startActivityAsUser") && m.getParameterTypes().length == 12) {
+                        int res = (Integer) m.invoke(
+                            atm, null, SHELL_PACKAGE, null, intent, null, null, null,
+                            0, 0, null, options, userId == 0 ? USER_CURRENT : userId
+                        );
+                        if (res >= 0) {
+                            guardAndContainLaunchOnDisplay(atm, displayId, pkg, mainBeforeTaskId, mainBeforePkg);
+                            return "startActivityAsUser ok (" + res + ")";
+                        }
+                        break;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
         String output = shell("am", "start", "--display", String.valueOf(displayId), "--user", String.valueOf(userId), "-f", "0x18008000", "-n", component);
+        guardAndContainLaunchOnDisplay(atm, displayId, pkg, mainBeforeTaskId, mainBeforePkg);
+        if (output.contains("Error") || output.contains("Exception")) {
+            throw new Exception(output.substring(0, Math.min(300, output.length())));
+        }
+        return output;
+    }
+
+    private String openUriOnDisplay(int displayId, String uri, int userId) throws Exception {
+        String topPkg = topPackageOnDisplay(displayId);
+        if ("com.tencent.mm".equals(topPkg) || uri.contains("docs.qq.com") || uri.contains("weixin.qq.com")) {
+            try {
+                String wxOut = shell(
+                    "am", "start", "--display", String.valueOf(displayId), "--user", String.valueOf(userId),
+                    "-f", "0x18008000",
+                    "-n", "com.tencent.mm/.plugin.webview.ui.tools.WebViewUI",
+                    "-e", "rawUrl", uri
+                );
+                if (!wxOut.contains("Error") && !wxOut.contains("Exception")) {
+                    return wxOut;
+                }
+            } catch (Throwable ignored) {}
+        }
+        String output = shell("am", "start", "--display", String.valueOf(displayId), "--user", String.valueOf(userId), "-f", "0x18008000", "-a", "android.intent.action.VIEW", "-d", uri);
         if (output.contains("Error") || output.contains("Exception")) {
             throw new Exception(output.substring(0, Math.min(300, output.length())));
         }
@@ -1056,9 +1175,14 @@ final class DisplayRuntime {
         int r = (vd == null || vd.getDisplay() == null) ? 0 : vd.getDisplay().getRotation();
         int lw = r % 2 == 0 ? width : height;
         int lh = r % 2 == 0 ? height : width;
+        int dispId = (vd == null || vd.getDisplay() == null) ? -1 : vd.getDisplay().getDisplayId();
+        boolean activeCreated = vd != null && dispId > 0 && !releasedToBackground;
         return new JSONObject()
-            .put("created", vd != null)
-            .put("displayId", (vd == null || vd.getDisplay() == null) ? -1 : vd.getDisplay().getDisplayId())
+            .put("created", activeCreated)
+            .put("allocated", vd != null && dispId > 0)
+            .put("released", releasedToBackground)
+            .put("displayId", dispId)
+            .put("display_id", dispId)
             .put("width", lw)
             .put("height", lh)
             .put("dpi", densityDpi)
@@ -1073,15 +1197,135 @@ final class DisplayRuntime {
         return RootCommands.run(args);
     }
 
-    private void release() {
+    private List<?> queryTasksOnDisplay(Object atm, int targetDisplayId) {
+        try {
+            Method getTasks4 = null, getTasks3 = null;
+            for (Method m : atm.getClass().getMethods()) {
+                if (m.getName().equals("getTasks")) {
+                    if (m.getParameterTypes().length == 4) getTasks4 = m;
+                    else if (m.getParameterTypes().length == 3) getTasks3 = m;
+                }
+            }
+            if (getTasks4 != null) {
+                return (List<?>) getTasks4.invoke(atm, 50, false, false, targetDisplayId);
+            } else if (getTasks3 != null) {
+                return (List<?>) getTasks3.invoke(atm, 50, false, false);
+            }
+        } catch (Throwable ignored) {}
+        return java.util.Collections.emptyList();
+    }
+
+    private void invokeMoveRootTaskToDisplay(Object atm, int taskId, int targetDisplayId, boolean onTop) {
+        if (taskId <= 0) return;
+        try {
+            for (Method m : atm.getClass().getMethods()) {
+                String n = m.getName();
+                if ((n.equals("moveRootTaskToDisplay") || n.equals("moveStackToDisplay")) && m.getParameterTypes().length == 3) {
+                    m.invoke(atm, taskId, targetDisplayId, onTop);
+                    return;
+                }
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private void invokeMoveTaskToFront(Object atm, int taskId) {
+        if (taskId <= 0) return;
+        try {
+            for (Method m : atm.getClass().getMethods()) {
+                if (m.getName().equals("startActivityFromRecents") && m.getParameterTypes().length == 2) {
+                    m.invoke(atm, taskId, null);
+                    return;
+                }
+            }
+        } catch (Throwable ignored) {}
+        try {
+            for (Method m : atm.getClass().getMethods()) {
+                if (m.getName().equals("moveTaskToFront") && m.getParameterTypes().length == 5) {
+                    m.invoke(atm, null, SHELL_PACKAGE, taskId, 0, null);
+                    return;
+                }
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private String release() {
+        return release(false);
+    }
+
+    private String release(boolean destroy) {
         stopKeepAwake();
         inputHandler.removeCallbacksAndMessages(null);
         frameHandler.removeCallbacksAndMessages(null);
         framePending = false;
+        if (!destroy && display != null) {
+            // Keep VirtualDisplay alive silently in the background with zero frame-processing CPU drain;
+            // mark releasedToBackground = true so UI overlays know the workspace is closed/released!
+            releasedToBackground = true;
+            synchronized (frameLock) {
+                if (reader != null) {
+                    try { reader.setOnImageAvailableListener(null, null); } catch (Throwable ignored) {}
+                }
+            }
+            return "";
+        }
+        releasedToBackground = false;
         latestPreview = null;
         if (display != null) {
+            int dispId = -1;
+            try {
+                dispId = display.getDisplay() != null ? display.getDisplay().getDisplayId() : -1;
+            } catch (Throwable ignored) {}
+
+            Object atm = null;
+            int mainTopTaskId = -1;
+            ComponentName mainTopComp = null;
+            java.util.Set<String> vdPackages = new java.util.HashSet<>();
+
+            if (dispId > 0) {
+                try {
+                    atm = Class.forName("android.app.ActivityTaskManager").getMethod("getService").invoke(null);
+                    Class<?> taskInfoCls = Class.forName("android.app.TaskInfo");
+                    Field displayField = taskInfoCls.getField("displayId");
+                    Field taskIdField = taskInfoCls.getField("taskId");
+                    Field topField = taskInfoCls.getField("topActivity");
+
+                    for (Object t : queryTasksOnDisplay(atm, Display.DEFAULT_DISPLAY)) {
+                        if (t == null) continue;
+                        if (displayField.getInt(t) != Display.DEFAULT_DISPLAY) continue;
+                        mainTopTaskId = taskIdField.getInt(t);
+                        mainTopComp = (ComponentName) topField.get(t);
+                        break;
+                    }
+
+                    for (Object t : queryTasksOnDisplay(atm, dispId)) {
+                        if (t == null) continue;
+                        if (displayField.getInt(t) != dispId) continue;
+                        ComponentName top = (ComponentName) topField.get(t);
+                        if (top != null && top.getPackageName() != null) {
+                            vdPackages.add(top.getPackageName());
+                        }
+                    }
+                    // NEVER call invokeMoveRootTaskToDisplay(atm, tid, Display.DEFAULT_DISPLAY, ...) here!
+                    // Moving tasks to Display 0 causes OEM ROMs to pop them onto the main screen foreground!
+                } catch (Throwable ignored) {}
+            }
+
             try { display.release(); } catch (Throwable ignored) {}
             display = null;
+
+            if (dispId > 0 && atm != null) {
+                try {
+                    Thread.sleep(40L);
+                    String afterTop = topPackageOnDisplay(Display.DEFAULT_DISPLAY);
+                    String mainTopPkg = mainTopComp != null ? mainTopComp.getPackageName() : "";
+                    if (!afterTop.isEmpty() && vdPackages.contains(afterTop) && !afterTop.equals(mainTopPkg)) {
+                        if (mainTopTaskId > 0) {
+                            invokeMoveTaskToFront(atm, mainTopTaskId);
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            }
+            managedVirtualPackages.clear();
         }
         synchronized (frameLock) {
             if (reader != null) {
@@ -1098,10 +1342,13 @@ final class DisplayRuntime {
             }
             frameSequence = 0;
         }
+        return "";
     }
 
     void close() {
-        execute("{\"op\":\"release\"}");
+        if (display != null) {
+            execute("{\"op\":\"release\",\"destroy\":true}");
+        }
         awakeTimer.shutdownNow();
         inputThread.quitSafely();
         thread.quitSafely();

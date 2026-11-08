@@ -352,6 +352,9 @@ object FloatingVirtualDisplay {
     fun currentTier(): SizeTier = sizeTier
 
     @JvmStatic
+    fun isPreviewVisible(): Boolean = rootView != null && !minimizedToPill && !userDismissed
+
+    @JvmStatic
     fun cycleSizeTier(context: Context) {
         sizeTier = sizeTier.next()
         customWidthFraction = null
@@ -372,9 +375,12 @@ object FloatingVirtualDisplay {
     // Frame decoding cache
     @Volatile private var lastDecodedB64: String = ""
     @Volatile private var currentBitmap: Bitmap? = null
+    @Volatile private var isDecodingFrame: Boolean = false
 
     private val _overlayVisible = MutableStateFlow(false)
     val overlayVisible: StateFlow<Boolean> = _overlayVisible.asStateFlow()
+    private val _userDismissed = MutableStateFlow(false)
+    val userDismissedFlow: StateFlow<Boolean> = _userDismissed.asStateFlow()
 
     internal fun cachedBitmap(): Bitmap? = currentBitmap
 
@@ -403,6 +409,7 @@ object FloatingVirtualDisplay {
     fun show(context: Context, forceExpand: Boolean = false) {
         val appCtx = context.applicationContext
         userDismissed = false
+        _userDismissed.value = false
         minimizedToPill = false
         mainHandler.post {
             if (forceExpand) expanded = true
@@ -416,7 +423,25 @@ object FloatingVirtualDisplay {
     @JvmStatic
     fun hide() {
         userDismissed = true
+        _userDismissed.value = true
+        pickingApp = false
+        expanded = false
+        minimizedToPill = false
         mainHandler.post { removeWindow() }
+    }
+
+    @JvmStatic
+    fun minimizeToSidePill(context: Context) {
+        val appCtx = context.applicationContext
+        mainHandler.post {
+            if (rootView == null) return@post
+            pickingApp = false
+            expanded = false
+            minimizedToPill = true
+            if (!userDismissed && canOverlay(appCtx) && rootView != null) {
+                transitionSizeAndRebuild(appCtx, RootPhoneHarness.changes.value)
+            }
+        }
     }
 
     internal fun onWorkspaceStateChanged(context: Context, state: RootPhoneState) {
@@ -424,8 +449,9 @@ object FloatingVirtualDisplay {
         mainHandler.post {
             ensureWatching(appCtx)
             val created = runCatching { JSONObject(state.display).optBoolean("created") }.getOrDefault(false)
-            if (!created && !state.active) {
+            if (!created || state.phase == "stopping" || state.phase == "stopped") {
                 userDismissed = false
+                _userDismissed.value = false
                 minimizedToPill = false
                 expanded = false
                 pickingApp = false
@@ -443,7 +469,7 @@ object FloatingVirtualDisplay {
         watchJob = scope.launch {
             RootPhoneHarness.changes.collect { state ->
                 val created = runCatching { JSONObject(state.display).optBoolean("created") }.getOrDefault(false)
-                if (!created && !state.active) {
+                if (!created || state.phase == "stopping" || state.phase == "stopped") {
                     removeWindow()
                 } else if (!userDismissed && canOverlay(context)) {
                     mountOrUpdateWindow(context, state)
@@ -563,6 +589,7 @@ object FloatingVirtualDisplay {
             pill.addView(label, LinearLayout.LayoutParams(-2, -2).apply { rightMargin = dp(context, 8) })
 
             val closeMiniBtn = PipVectorIconButton(context, PipVectorIconButton.IconKind.POWER_CLOSE, isDanger = true) {
+                hide()
                 scope.launch(Dispatchers.IO) {
                     runCatching { RootPhoneHarness.command(context, JSONObject().put("op", "release")) }
                 }
@@ -572,6 +599,9 @@ object FloatingVirtualDisplay {
             attachSpringDragAndTap(context, pill, onTap = {
                 minimizedToPill = false
                 transitionSizeAndRebuild(context, RootPhoneHarness.changes.value)
+                scope.launch(Dispatchers.IO) {
+                    runCatching { RootPhoneHarness.command(context, JSONObject().put("op", "create").put("manual", true)) }
+                }
             })
             container.addView(pill, FrameLayout.LayoutParams(-1, -1))
             return
@@ -651,6 +681,18 @@ object FloatingVirtualDisplay {
         innerBox.addView(hint, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
 
         if (!expanded) {
+            val miniCloseSize = dp(context, 20)
+            val miniCloseBtn = PipVectorIconButton(context, PipVectorIconButton.IconKind.POWER_CLOSE, isDanger = true) {
+                hide()
+                scope.launch(Dispatchers.IO) {
+                    runCatching { RootPhoneHarness.command(context, JSONObject().put("op", "release")) }
+                }
+            }
+            innerBox.addView(miniCloseBtn, FrameLayout.LayoutParams(miniCloseSize, miniCloseSize, Gravity.TOP or Gravity.END).apply {
+                rightMargin = dp(context, 4)
+                topMargin = dp(context, 4)
+            })
+
             val waitTag = TextView(context).apply {
                 text = "待你处理"
                 textSize = layout.capsuleSp
@@ -745,8 +787,7 @@ object FloatingVirtualDisplay {
             topRightRow.addView(shrinkBtn, LinearLayout.LayoutParams(btnSize, btnSize).apply { rightMargin = btnGap })
 
             val closeDisplayBtn = PipVectorIconButton(context, PipVectorIconButton.IconKind.POWER_CLOSE, isDanger = true) {
-                pickingApp = false
-                expanded = false
+                hide()
                 scope.launch(Dispatchers.IO) {
                     runCatching { RootPhoneHarness.command(context, JSONObject().put("op", "release")) }
                 }
@@ -1064,34 +1105,38 @@ object FloatingVirtualDisplay {
             dot.animate().alpha(0f).scaleX(1.18f).scaleY(1.18f).setDuration(360L).withEndAction { dot.visibility = View.GONE }.start()
         }
 
-        // Decode frame if changed (with cache hit when unchanged)
-        if (state.image.isNotBlank() && state.image != lastDecodedB64) {
+        // Decode frame if changed (skip decoding when minimized to pill, dismissed, or already decoding to prevent OOM/jank)
+        if (!minimizedToPill && !userDismissed && state.image.isNotBlank() && state.image != lastDecodedB64 && !isDecodingFrame) {
+            isDecodingFrame = true
             lastDecodedB64 = state.image
             val b64 = state.image
             scope.launch(Dispatchers.Default) {
-                val bmp = runCatching {
-                    val bytes = Base64.decode(b64, Base64.DEFAULT)
-                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                }.getOrNull()
-                if (bmp != null) {
-                    withContext(Dispatchers.Main) {
-                        currentBitmap = bmp
-                        screenImageView?.setImageBitmap(bmp)
-                        emptyHintView?.visibility = View.GONE
-                        val (tw, th) = computeWindowSizePx(context, state, expanded, minimizedToPill)
-                        if (abs(lp.width - tw) > 1 || abs(lp.height - th) > 1) {
-                            lp.width = tw
-                            lp.height = th
-                            if (rootView === container) runCatching { wm.updateViewLayout(container, lp) }
+                try {
+                    val bmp = runCatching {
+                        val bytes = Base64.decode(b64, Base64.DEFAULT)
+                        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    }.getOrNull()
+                    if (bmp != null) {
+                        withContext(Dispatchers.Main) {
+                            currentBitmap = bmp
+                            screenImageView?.setImageBitmap(bmp)
+                            emptyHintView?.visibility = View.GONE
+                            val (tw, th) = computeWindowSizePx(context, state, expanded, minimizedToPill)
+                            if (abs(lp.width - tw) > 1 || abs(lp.height - th) > 1) {
+                                lp.width = tw
+                                lp.height = th
+                                if (rootView === container) runCatching { wm.updateViewLayout(container, lp) }
+                            }
                         }
                     }
+                } finally {
+                    isDecodingFrame = false
                 }
             }
         } else if (state.image.isBlank()) {
-            currentBitmap = null
-            lastDecodedB64 = ""
-            screenImageView?.setImageBitmap(null)
-            emptyHintView?.visibility = View.VISIBLE
+            if (currentBitmap == null) {
+                emptyHintView?.visibility = View.VISIBLE
+            }
         } else if (currentBitmap != null && screenImageView?.drawable == null) {
             screenImageView?.setImageBitmap(currentBitmap)
             emptyHintView?.visibility = View.GONE
@@ -1385,14 +1430,15 @@ internal fun InAppFloatingVirtualDisplay() {
     val context = LocalContext.current
     val state by RootPhoneHarness.changes.collectAsState()
     val systemOverlayShowing by FloatingVirtualDisplay.overlayVisible.collectAsState()
+    val userDismissed by FloatingVirtualDisplay.userDismissedFlow.collectAsState()
     val disp = remember(state.display) { runCatching { JSONObject(state.display) }.getOrDefault(JSONObject()) }
     val created = disp.optBoolean("created")
 
-    val visible = (created || state.active) && !systemOverlayShowing
+    val visible = created && !userDismissed && state.phase != "stopping" && state.phase != "stopped" && !systemOverlayShowing && !FloatingVirtualDisplay.canOverlay(context)
     var expanded by remember { mutableStateOf(false) }
     var hiddenToPill by remember { mutableStateOf(false) }
-    LaunchedEffect(created, state.active) {
-        if (!created && !state.active) {
+    LaunchedEffect(created, state.active, state.phase, userDismissed) {
+        if (!created || userDismissed || state.phase == "stopping" || state.phase == "stopped") {
             expanded = false
             hiddenToPill = false
         }
@@ -1434,7 +1480,7 @@ internal fun InAppFloatingVirtualDisplay() {
                         .background(androidx.compose.ui.graphics.Color(0xE618181C))
                         .border(1.dp, borderColor, RoundedCornerShape(22.dp))
                         .clickable { hiddenToPill = false }
-                        .padding(horizontal = 13.dp, vertical = 8.dp)
+                        .padding(start = 13.dp, end = 8.dp, top = 7.dp, bottom = 7.dp)
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
                         Box(Modifier.size(7.dp).clip(CircleShape).background(borderColor))
@@ -1444,6 +1490,23 @@ internal fun InAppFloatingVirtualDisplay() {
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Medium
                         )
+                        ComposePipCircleButton(
+                            modifier = Modifier.size(20.dp),
+                            isDanger = true,
+                            onClick = {
+                                hiddenToPill = false
+                                expanded = false
+                                FloatingVirtualDisplay.hide()
+                                scope.launch(Dispatchers.IO) {
+                                    runCatching { RootPhoneHarness.command(context, JSONObject().put("op", "release")) }
+                                }
+                            }
+                        ) {
+                            val strokeW = 1.4.dp.toPx()
+                            val c = androidx.compose.ui.graphics.Color(0xFFFF7A72)
+                            drawLine(c, Offset(size.width * 0.32f, size.height * 0.32f), Offset(size.width * 0.68f, size.height * 0.68f), strokeW, StrokeCap.Round)
+                            drawLine(c, Offset(size.width * 0.68f, size.height * 0.32f), Offset(size.width * 0.32f, size.height * 0.68f), strokeW, StrokeCap.Round)
+                        }
                     }
                 }
                 return@BoxWithConstraints
@@ -1635,6 +1698,25 @@ internal fun InAppFloatingVirtualDisplay() {
                         )
                     }
 
+                    if (!expanded) {
+                        ComposePipCircleButton(
+                            modifier = Modifier.align(Alignment.TopEnd).padding(4.dp).size(20.dp),
+                            isDanger = true,
+                            onClick = {
+                                expanded = false
+                                FloatingVirtualDisplay.hide()
+                                scope.launch(Dispatchers.IO) {
+                                    runCatching { RootPhoneHarness.command(context, JSONObject().put("op", "release")) }
+                                }
+                            }
+                        ) {
+                            val strokeW = 1.4.dp.toPx()
+                            val c = androidx.compose.ui.graphics.Color(0xFFFF7A72)
+                            drawLine(c, Offset(size.width * 0.32f, size.height * 0.32f), Offset(size.width * 0.68f, size.height * 0.68f), strokeW, StrokeCap.Round)
+                            drawLine(c, Offset(size.width * 0.68f, size.height * 0.32f), Offset(size.width * 0.32f, size.height * 0.68f), strokeW, StrokeCap.Round)
+                        }
+                    }
+
                     if (!expanded && state.phase == "waiting_user") {
                         Box(
                             Modifier
@@ -1685,6 +1767,7 @@ internal fun InAppFloatingVirtualDisplay() {
                                 isDanger = true,
                                 onClick = {
                                     expanded = false
+                                    FloatingVirtualDisplay.hide()
                                     scope.launch(Dispatchers.IO) {
                                         runCatching { RootPhoneHarness.command(context, JSONObject().put("op", "release")) }
                                     }
@@ -1695,6 +1778,36 @@ internal fun InAppFloatingVirtualDisplay() {
                                 drawLine(c, Offset(size.width * 0.32f, size.height * 0.32f), Offset(size.width * 0.68f, size.height * 0.68f), strokeW, StrokeCap.Round)
                                 drawLine(c, Offset(size.width * 0.68f, size.height * 0.32f), Offset(size.width * 0.32f, size.height * 0.68f), strokeW, StrokeCap.Round)
                             }
+                        }
+
+                        // Bottom capsule: "我处理好了，继续" when waiting_user, or "‹ 返回"
+                        Box(
+                            Modifier
+                                .align(Alignment.BottomCenter)
+                                .padding(bottom = 6.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(if (state.phase == "waiting_user") androidx.compose.ui.graphics.Color(0xFFFF9F0A) else androidx.compose.ui.graphics.Color(0x99141418))
+                                .border(0.8.dp, androidx.compose.ui.graphics.Color(0x2EFFFFFF), RoundedCornerShape(12.dp))
+                                .clickable {
+                                    if (state.phase == "waiting_user") {
+                                        expanded = false
+                                        runCatching { RootPhoneHarness.resume(context) }
+                                    } else {
+                                        scope.launch(Dispatchers.IO) {
+                                            runCatching {
+                                                RootPhoneHarness.command(context, JSONObject().put("op", "key").put("key", "back").put("manual", true))
+                                            }
+                                        }
+                                    }
+                                }
+                                .padding(horizontal = 10.dp, vertical = 4.dp)
+                        ) {
+                            Text(
+                                if (state.phase == "waiting_user") "我处理好了，继续" else "‹ 返回",
+                                color = if (state.phase == "waiting_user") androidx.compose.ui.graphics.Color.Black else androidx.compose.ui.graphics.Color(0xE6FFFFFF),
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold
+                            )
                         }
                     }
                 }

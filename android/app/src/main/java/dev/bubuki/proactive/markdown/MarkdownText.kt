@@ -3,7 +3,9 @@ package dev.bubuki.proactive.markdown
 
 import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.graphics.Color as AndroidColor
 import android.net.Uri
+import android.webkit.WebView
 import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -16,6 +18,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
@@ -30,6 +33,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
@@ -40,6 +44,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import dev.bubuki.proactive.PulseTheme
@@ -52,11 +57,14 @@ fun MarkdownText(markdown: String, style: TextStyle, modifier: Modifier = Modifi
     var streamingBlocks by remember { mutableStateOf<List<MdBlock>>(emptyList()) }
     LaunchedEffect(markdown, styles, streaming) {
         if (streaming) {
+            if (streamingBlocks.isNotEmpty() && markdown.length > 160) {
+                kotlinx.coroutines.delay(36L)
+            }
             streamingBlocks = withContext(Dispatchers.Default) { MarkdownModel.parseStreaming(markdown, styles) }
         }
     }
     val blocks = if (streaming) {
-        if (streamingBlocks.isEmpty() && markdown.isNotBlank()) remember(markdown, styles) { MarkdownModel.parseStreaming(markdown, styles) }
+        if (streamingBlocks.isEmpty() && markdown.isNotBlank() && markdown.length <= 400) remember(markdown, styles) { MarkdownModel.parseStreaming(markdown, styles) }
         else streamingBlocks
     } else remember(markdown, styles) { MarkdownModel.parse(markdown, styles) }
     val context = LocalContext.current
@@ -98,11 +106,20 @@ private fun Block(b: MdBlock, style: TextStyle, depth: Int) {
                 letterSpacing = (-0.3).sp
             ),
         )
-        is MdBlock.Code -> Box(
-            Modifier.fillMaxWidth().background(PulseTheme.colors.fill, RoundedCornerShape(12.dp))
-                .horizontalScroll(rememberScrollState()).padding(horizontal = 13.dp, vertical = 11.dp),
-        ) {
-            Text(b.code, style = style.copy(fontFamily = FontFamily.Monospace, fontSize = 13.5.sp, lineHeight = 20.sp), softWrap = false)
+        is MdBlock.Code -> {
+            val trimmed = b.code.trim()
+            val isSvg = (b.info.equals("svg", ignoreCase = true) || trimmed.startsWith("<svg", ignoreCase = true)) &&
+                trimmed.contains("</svg>", ignoreCase = true)
+            if (isSvg) {
+                SvgBlock(trimmed)
+            } else {
+                Box(
+                    Modifier.fillMaxWidth().background(PulseTheme.colors.fill, RoundedCornerShape(12.dp))
+                        .horizontalScroll(rememberScrollState()).padding(horizontal = 13.dp, vertical = 11.dp),
+                ) {
+                    Text(b.code, style = style.copy(fontFamily = FontFamily.Monospace, fontSize = 13.5.sp, lineHeight = 20.sp), softWrap = false)
+                }
+            }
         }
         is MdBlock.Quote -> Row(Modifier.height(IntrinsicSize.Min)) {
             Box(Modifier.width(3.dp).fillMaxHeight().background(PulseTheme.colors.accent.copy(alpha = 0.45f), RoundedCornerShape(2.dp)))
@@ -166,5 +183,45 @@ private fun TableBlock(t: MdBlock.Table, style: TextStyle) {
                 }
             }
         }
+    }
+}
+
+private val svgScriptRegex = Regex("""(?is)<script[\s\S]*?</script>""")
+private val svgEventAttrRegex = Regex("""(?i)\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)""")
+
+@Composable
+private fun SvgBlock(rawSvg: String) {
+    val cleanSvg = remember(rawSvg) {
+        rawSvg.replace(svgScriptRegex, "").replace(svgEventAttrRegex, "")
+    }
+    val htmlDoc = remember(cleanSvg) {
+        """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=2"><style>html,body{margin:0;padding:0;background:transparent;display:flex;align-items:center;justify-content:center;overflow:hidden}svg{max-width:100%;height:auto;max-height:300px;display:block}</style></head><body>$cleanSvg</body></html>"""
+    }
+    Box(
+        Modifier.fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(PulseTheme.colors.fill)
+            .border(0.5.dp, PulseTheme.colors.hair, RoundedCornerShape(14.dp))
+            .padding(10.dp)
+    ) {
+        AndroidView(
+            modifier = Modifier.fillMaxWidth().heightIn(min = 120.dp, max = 320.dp),
+            factory = { ctx ->
+                WebView(ctx).apply {
+                    setBackgroundColor(AndroidColor.TRANSPARENT)
+                    settings.javaScriptEnabled = false
+                    settings.allowFileAccess = false
+                    settings.allowContentAccess = false
+                    isVerticalScrollBarEnabled = false
+                    isHorizontalScrollBarEnabled = false
+                }
+            },
+            update = { webView ->
+                if (webView.tag != htmlDoc) {
+                    webView.tag = htmlDoc
+                    webView.loadDataWithBaseURL(null, htmlDoc, "text/html", "UTF-8", null)
+                }
+            }
+        )
     }
 }

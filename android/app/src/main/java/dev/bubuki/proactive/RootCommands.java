@@ -10,7 +10,7 @@ final class RootCommands {
     private static final ScheduledExecutorService TIMER=Executors.newSingleThreadScheduledExecutor(r->{Thread t=new Thread(r,"root-command-timeout");t.setDaemon(true);return t;});
     static String run(String... args)throws Exception {
         java.lang.Process process=new ProcessBuilder(args).redirectErrorStream(true).start();AtomicBoolean timedOut=new AtomicBoolean();
-        ScheduledFuture<?> deadline=TIMER.schedule(()->{timedOut.set(true);process.destroyForcibly();},8,TimeUnit.SECONDS);
+        ScheduledFuture<?> deadline=TIMER.schedule(()->{timedOut.set(true);try{process.getInputStream().close();}catch(Throwable ignored){}process.destroyForcibly();},8,TimeUnit.SECONDS);
         try(InputStream input=process.getInputStream()){
             String output=new String(Io.read(input,1000000),StandardCharsets.UTF_8);process.waitFor();
             if(timedOut.get())throw new Exception("Root 系统命令超时");

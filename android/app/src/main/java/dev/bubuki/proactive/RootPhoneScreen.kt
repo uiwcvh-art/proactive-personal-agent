@@ -37,7 +37,8 @@ import kotlin.math.min
     val dark = appearanceDark(); val activity = LocalContext.current as androidx.activity.ComponentActivity
     LaunchedEffect(dark) { activity.systemBarsFor(dark) }
     PulseTheme(dark = dark) {
-        val colors = PulseTheme.colors; val scope = rememberCoroutineScope(); val display = remember(state.display) { JSONObject(state.display) }
+        val colors = PulseTheme.colors; val scope = rememberCoroutineScope()
+        val display = remember(state.display) { runCatching { JSONObject(state.display) }.getOrDefault(JSONObject()) }
         val created = display.optBoolean("created"); val manual = state.phase != "running" && !busy
         var picking by remember { mutableStateOf(false) }; var input by remember { mutableStateOf("") }
         val image by produceState<ImageBitmap?>(null, state.image) { value = withContext(Dispatchers.Default) { if (state.image.isBlank()) null else runCatching { val bytes = Base64.decode(state.image, Base64.DEFAULT); BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap() }.getOrNull() } }
@@ -120,38 +121,48 @@ import kotlin.math.min
                     }
                     BoxWithConstraints(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(colors.fill).border(1.dp, colors.hair, RoundedCornerShape(18.dp)).padding(12.dp), contentAlignment = Alignment.Center) {
                         val h = min(460f, maxWidth.value * height / width).dp; val w = (h.value * width / height).dp
+                        val curWidth by rememberUpdatedState(width)
+                        val curHeight by rememberUpdatedState(height)
                         val bitmap = image
                         if (bitmap == null) Text("打开一个应用后，画面会出现在这里。", Modifier.padding(32.dp), color = colors.ink2, fontSize = 12.sp)
-                        else Image(bitmap, "独立工作区实时画面", Modifier.size(w, h).clip(RoundedCornerShape(9.dp)).pointerInput(manual, state.imageInfo) {
+                        else Image(bitmap, "独立工作区实时画面", Modifier.size(w, h).clip(RoundedCornerShape(9.dp)).pointerInput(manual) {
                             if (!manual) return@pointerInput
                             awaitEachGesture {
                                 val down = awaitFirstDown(requireUnconsumed = false)
-                                fun x(value: Float) = (value / size.width.coerceAtLeast(1) * width).toInt().coerceIn(0, width - 1)
-                                fun y(value: Float) = (value / size.height.coerceAtLeast(1) * height).toInt().coerceIn(0, height - 1)
-                                RootPhoneHarness.sendLiveTouch(activity, "down", x(down.position.x), y(down.position.y))
+                                down.consume()
+                                fun x(value: Float) = (value / size.width.coerceAtLeast(1) * curWidth).toInt().coerceIn(0, (curWidth - 1).coerceAtLeast(0))
+                                fun y(value: Float) = (value / size.height.coerceAtLeast(1) * curHeight).toInt().coerceIn(0, (curHeight - 1).coerceAtLeast(0))
                                 var end = down.position
-                                var lastMoveAt = android.os.SystemClock.uptimeMillis()
-                                var lastX = x(down.position.x)
-                                var lastY = y(down.position.y)
-                                do {
-                                    val event = awaitPointerEvent()
-                                    val pointer = event.changes.firstOrNull { it.id == down.id } ?: break
-                                    end = pointer.position
-                                    pointer.consume()
-                                    if (pointer.pressed) {
-                                        val now = android.os.SystemClock.uptimeMillis()
-                                        val tx = x(end.x)
-                                        val ty = y(end.y)
-                                        if (now - lastMoveAt >= 10L || abs(tx - lastX) + abs(ty - lastY) >= 2) {
-                                            lastMoveAt = now
-                                            lastX = tx
-                                            lastY = ty
-                                            RootPhoneHarness.sendLiveTouch(activity, "move", tx, ty)
+                                var sentDown = false
+                                try {
+                                    RootPhoneHarness.sendLiveTouch(activity, "down", x(down.position.x), y(down.position.y))
+                                    sentDown = true
+                                    var lastMoveAt = android.os.SystemClock.uptimeMillis()
+                                    var lastX = x(down.position.x)
+                                    var lastY = y(down.position.y)
+                                    do {
+                                        val event = awaitPointerEvent()
+                                        val pointer = event.changes.firstOrNull { it.id == down.id } ?: break
+                                        end = pointer.position
+                                        pointer.consume()
+                                        if (pointer.pressed) {
+                                            val now = android.os.SystemClock.uptimeMillis()
+                                            val tx = x(end.x)
+                                            val ty = y(end.y)
+                                            if (now - lastMoveAt >= 10L || abs(tx - lastX) + abs(ty - lastY) >= 2) {
+                                                lastMoveAt = now
+                                                lastX = tx
+                                                lastY = ty
+                                                RootPhoneHarness.sendLiveTouch(activity, "move", tx, ty)
+                                            }
                                         }
+                                        if (!pointer.pressed) break
+                                    } while (true)
+                                } finally {
+                                    if (sentDown) {
+                                        RootPhoneHarness.sendLiveTouch(activity, "up", x(end.x), y(end.y))
                                     }
-                                    if (!pointer.pressed) break
-                                } while (true)
-                                RootPhoneHarness.sendLiveTouch(activity, "up", x(end.x), y(end.y))
+                                }
                             }
                         })
                     }
@@ -161,10 +172,11 @@ import kotlin.math.min
                     OutlinedButton(onClick = { scope.launch { if (command("text", JSONObject().put("text", input))) input = "" } }, enabled = manual && input.isNotEmpty(), modifier = Modifier.fillMaxWidth()) { Text("发送文字") }
                 }
                 if (state.active || state.result.isNotBlank()) {
+                    val traceLen = remember(state.trace) { runCatching { org.json.JSONArray(state.trace).length() }.getOrDefault(0) }
                     Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(colors.fill).padding(16.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
                         Text(when (state.phase) { "running" -> "正在执行"; "waiting_user" -> "需要你接管"; "stopping" -> "正在停止"; "failed", "stopped" -> "执行已停止"; else -> "本轮结果" }, color = colors.ink, fontWeight = FontWeight.Medium)
                         Text(state.goal, color = colors.ink2, fontSize = 13.sp); if (state.result.isNotBlank()) Text(state.result, color = colors.ink, fontSize = 13.sp)
-                        Text("已记录 ${org.json.JSONArray(state.trace).length()} 个工具动作 · 完整记录在对话中", color = colors.ink2, fontSize = 11.sp)
+                        Text("已记录 $traceLen 个工具动作 · 完整记录在对话中", color = colors.ink2, fontSize = 11.sp)
                         if (state.phase == "waiting_user") Button(onClick = { act("resume") }) { Text("我处理好了，继续") }
                     }
                 }

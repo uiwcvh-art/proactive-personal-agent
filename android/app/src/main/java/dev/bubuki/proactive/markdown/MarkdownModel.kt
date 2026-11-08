@@ -78,9 +78,31 @@ object MarkdownModel {
         .extensions(listOf(TablesExtension.create(), StrikethroughExtension.create()))
         .build()
 
+    private val rawSvgRegex = Regex("""(?is)<svg\b[\s\S]*?</svg>""")
+
+    private fun normalizeInlineSvgBlocks(markdown: String): String {
+        if (!markdown.contains("<svg", ignoreCase = true) || !markdown.contains("</svg>", ignoreCase = true)) {
+            return markdown
+        }
+        // Only wrap <svg>...</svg> that are not already inside fenced ``` blocks
+        val parts = markdown.split("```")
+        if (parts.size == 1) {
+            return rawSvgRegex.replace(markdown) { m -> "\n```svg\n${m.value.trim()}\n```\n" }
+        }
+        val sb = StringBuilder()
+        for (i in parts.indices) {
+            if (i % 2 == 0) {
+                sb.append(rawSvgRegex.replace(parts[i]) { m -> "\n```svg\n${m.value.trim()}\n```\n" })
+            } else {
+                sb.append("```").append(parts[i]).append("```")
+            }
+        }
+        return sb.toString()
+    }
+
     /** 解析失败(包括写到一半的流式文字导致的任何意外)时,整段按纯文字一段显示。 */
     fun parse(markdown: String, styles: Styles = Styles.Light): List<MdBlock> = try {
-        blocks(parser.parse(markdown), 0, styles)
+        blocks(parser.parse(normalizeInlineSvgBlocks(markdown)), 0, styles)
     } catch (e: Exception) {
         plain(markdown)
     } catch (e: StackOverflowError) {

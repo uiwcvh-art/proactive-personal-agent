@@ -16,6 +16,15 @@ import okhttp3.*;
 public class AgentForegroundService extends Service {
     static volatile boolean connected=false;
     static volatile boolean running=false;
+    static volatile long phoneAbortUntilMs=0L;
+    static void abortPhoneCommands(Context ctx){
+        phoneAbortUntilMs=System.currentTimeMillis()+5000L;
+        try{
+            if(RootPhoneHarness.isVirtualDisplayActive()){
+                RootPhoneHarness.stop(ctx);
+            }
+        }catch(Exception ignored){}
+    }
     private static volatile Ringtone activeAlarmRingtone=null;
     private static volatile Vibrator activeVibrator=null;
     private final Handler handler=new Handler(Looper.getMainLooper());
@@ -68,7 +77,10 @@ public class AgentForegroundService extends Service {
             .setOngoing(true).setShowWhen(false).build();
         if(Build.VERSION.SDK_INT>=34)startForeground(10,notification,ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);else startForeground(10,notification);
         screen=new BroadcastReceiver(){@Override public void onReceive(Context c,Intent i){
-            if(Intent.ACTION_SCREEN_OFF.equals(i.getAction()))overlay.hide();
+            if(Intent.ACTION_SCREEN_OFF.equals(i.getAction())){
+                overlay.hide();
+                try{ RootPhoneHarness.scheduleAutoRelease(AgentForegroundService.this, 1500L); }catch(Throwable ignored){}
+            }
             else if(Intent.ACTION_USER_PRESENT.equals(i.getAction())||Intent.ACTION_SCREEN_ON.equals(i.getAction()))tryShowOverlay();
         }};
         IntentFilter filter=new IntentFilter();filter.addAction(Intent.ACTION_SCREEN_ON);filter.addAction(Intent.ACTION_SCREEN_OFF);filter.addAction(Intent.ACTION_USER_PRESENT);
@@ -83,7 +95,7 @@ public class AgentForegroundService extends Service {
             if(!settings.optBoolean("background",true)){handler.post(this::stopSelf);return;}
             SecureTransport.Session s=new SecureTransport(this).session(new JSONObject(), true);
             sessionKey=s.key;nonces.clear();
-            OkHttpClient client=SecureTransport.HTTP.newBuilder().pingInterval(30,TimeUnit.SECONDS).readTimeout(0,TimeUnit.SECONDS).build();
+            OkHttpClient client=SecureTransport.HTTP.newBuilder().pingInterval(28,TimeUnit.SECONDS).readTimeout(0,TimeUnit.SECONDS).build();
             String url=s.base.replaceFirst("^http","ws")+"/ws/client";
             socket=client.newWebSocket(new Request.Builder().url(url).build(),new WebSocketListener(){
                 @Override public void onOpen(WebSocket ws,Response response){ws.send(s.packet.toString());}
@@ -105,9 +117,30 @@ public class AgentForegroundService extends Service {
     }
     private final Runnable reconnect=this::connect;
     private void handle(JSONObject event){
-        try{NativePulseModel.dispatchRealtimeEvent(event);}catch(Exception ignored){}
         String type=event.optString("type");
-        if(type.equals("connected")){connected=true;retrySeconds=2;snoozeUntil=event.optLong("snooze_until")*1000;}
+        String mySource=SecureTransport.getNodeSource(this);
+        String evSource=event.optString("source","").trim();
+        if(evSource.isEmpty()){
+            JSONObject sub=event.optJSONObject("message");
+            if(sub==null)sub=event.optJSONObject("stream");
+            if(sub==null)sub=event.optJSONObject("execution");
+            if(sub!=null)evSource=sub.optString("source","").trim();
+        }
+        if(!evSource.isEmpty()&&!evSource.equals(mySource)&&Arrays.asList("message","stream","execution","stopped","phone_workspace_command").contains(type)){
+            return;
+        }
+        try{NativePulseModel.dispatchRealtimeEvent(event);}catch(Exception ignored){}
+        if(type.equals("connected")){connected=true;retrySeconds=2;snoozeUntil=event.optLong("snooze_until")*1000;try{NativePulseModel.syncOnReconnect();}catch(Exception ignored){}}
+        if(type.equals("heartbeat")){
+            io.execute(()->{
+                try{
+                    if(socket!=null&&sessionKey!=null){
+                        socket.send(SecureTransport.encrypt(sessionKey,new JSONObject().put("type","ping")).toString());
+                    }
+                }catch(Exception ignored){}
+            });
+            return;
+        }
         if(type.equals("snooze")){
             snoozeUntil=event.optLong("until")*1000;pendingOverlay=null;overlay.hide();
             stopEmergencyAlarm(this);
@@ -140,52 +173,102 @@ public class AgentForegroundService extends Service {
             String botId=event.optString("bot_id","companion");
             JSONObject args=event.optJSONObject("args");
             if(args==null)args=new JSONObject();
+            if("release".equals(op)&&args.optBoolean("force",false)){
+                phoneAbortUntilMs=System.currentTimeMillis()+5000L;
+            }
             final JSONObject cmdArgs=args;
             cmdPool.execute(()->{
                 JSONObject res=new JSONObject();
                 try{
-                    if(op.equals("run")||op.equals("task")){
+                    if(!("release".equals(op)||"auto_release".equals(op))&&System.currentTimeMillis()<phoneAbortUntilMs){
+                        throw new Exception("用户已停止执行");
+                    }
+                    if(("release".equals(op)||"auto_release".equals(op))&&!RootPhoneHarness.isVirtualDisplayActive()){
+                        res=new JSONObject().put("ok",true).put("noop",true).put("created",false);
+                    }else if(op.equals("run")||op.equals("task")){
                         String goal=cmdArgs.optString("goal",cmdArgs.optString("text","")).trim();
                         res=RootPhoneHarness.submitFromBridge(this,botId,goal);
                     }else{
                         JSONObject input=new JSONObject(cmdArgs.toString());
                         input.put("op",op);
-                        if(Arrays.asList("capture","ui_tree","dump","tap","tap_node","tap_and_type","batch","swipe","text","type_node","key","launch").contains(op)){
+                        int dispIdForSnap=-1;
+                        String beforePkg="";
+                        String beforeHash="";
+                        int beforeNodes=-1;
+                        long beforeFrameSeq=-1L;
+                        String beforeImgSig="";
+                        if(Arrays.asList("capture","ui_tree","dump","tap","tap_node","tap_and_type","long_press","batch","swipe","text","type_node","key","launch","open_uri","open_url").contains(op)){
                             JSONObject st=RootPhoneHarness.status(this);
                             if(!st.optBoolean("root")){
                                 RootPhoneHarness.command(this,new JSONObject().put("op","connect"));
                                 st=RootPhoneHarness.status(this);
                             }
                             JSONObject disp=st.optJSONObject("display");
-                            if(disp==null||disp.optInt("displayId",-1)<=0){
-                                RootPhoneHarness.command(this,new JSONObject().put("op","create"));
+                            if(disp!=null && disp.optBoolean("created",false)){
+                                dispIdForSnap=disp.optInt("displayId",-1);
+                            }
+                            if(dispIdForSnap>0){
+                                PulseAccessibilityService.CachedSnapshot prevSnap=PulseAccessibilityService.getCachedSnapshot(dispIdForSnap);
+                                if(prevSnap!=null){
+                                    beforePkg=prevSnap.getActivePackage();
+                                    beforeHash=prevSnap.getTreeHash();
+                                    beforeNodes=prevSnap.getNodes().size();
+                                }
+                                try{
+                                    JSONObject prevFrame=RootPhoneHarness.command(this,new JSONObject().put("op","preview").put("since",-1));
+                                    beforeFrameSeq=prevFrame.optLong("frameSequence",-1L);
+                                    String bImg=prevFrame.optString("image","");
+                                    if(!bImg.isEmpty()) beforeImgSig=bImg.length()+":"+bImg.hashCode();
+                                }catch(Exception ignored){}
                             }
                         }
                         res=RootPhoneHarness.command(this,input);
                         if(Arrays.asList("ui_tree","dump","tree","nodes","read_screen").contains(op)){
-                            int nc=res.optInt("nodeCount",0);
-                            String pkg=res.optString("package","");
-                            if(nc<3||"com.tencent.mm".equals(pkg)){
-                                try{
-                                    JSONObject snap=RootPhoneHarness.command(this,new JSONObject().put("op","preview").put("since",-1));
-                                    if(snap.has("image"))res.put("image",snap.getString("image")).put("width",snap.optInt("width",540)).put("height",snap.optInt("height",1200));
-                                }catch(Exception ignored){}
-                            }
+                            try{
+                                JSONObject snap=RootPhoneHarness.command(this,new JSONObject().put("op","preview").put("since",-1));
+                                if(snap.has("image"))res.put("image",snap.getString("image")).put("width",snap.optInt("width",540)).put("height",snap.optInt("height",1200));
+                            }catch(Exception ignored){}
                         }
-                        if(Arrays.asList("launch","tap","tap_node","tap_and_type","batch","swipe","text","type_node","key").contains(op)){
-                            Thread.sleep(op.equals("launch") ? 750 : 420);
+                        if(Arrays.asList("launch","open_uri","open_url","tap","tap_node","tap_and_type","long_press","batch","swipe","text","type_node","key").contains(op)){
+                            long settleMs=(op.equals("launch")||op.equals("open_uri")||op.equals("open_url")) ? 820L : (op.equals("swipe") ? 460L : 350L);
+                            Thread.sleep(settleMs);
                             int ncAfter=0;
+                            String afterPkg="";
+                            String afterHash="";
                             try{
                                 JSONObject tree=RootPhoneHarness.command(this,new JSONObject().put("op","ui_tree").put("refresh",true));
                                 ncAfter=tree.optInt("nodeCount",0);
-                                if(tree.has("summary"))res.put("ui_tree",tree.getString("summary")).put("node_count",ncAfter).put("package",tree.optString("package",""));
+                                afterPkg=tree.optString("package","");
+                                afterHash=tree.optString("treeHash","");
+                                // If launch is still on splash screen (<=1 node), wait once more for home screen to settle
+                                if((op.equals("launch")||op.equals("open_uri")||op.equals("open_url"))&&ncAfter<=1){
+                                    Thread.sleep(480L);
+                                    tree=RootPhoneHarness.command(this,new JSONObject().put("op","ui_tree").put("refresh",true));
+                                    ncAfter=tree.optInt("nodeCount",0);
+                                    afterPkg=tree.optString("package","");
+                                    afterHash=tree.optString("treeHash","");
+                                }
+                                if(tree.has("summary"))res.put("ui_tree",tree.getString("summary")).put("node_count",ncAfter).put("package",afterPkg).put("tree_hash",afterHash);
                             }catch(Exception ignored){}
-                            if(ncAfter<3){
-                                try{
-                                    JSONObject snap=RootPhoneHarness.command(this,new JSONObject().put("op","preview").put("since",-1));
-                                    if(snap.has("image"))res.put("image",snap.getString("image")).put("width",snap.optInt("width",540)).put("height",snap.optInt("height",1200));
-                                }catch(Exception ignored){}
-                            }
+                            long afterFrameSeq=-1L;
+                            String afterImgSig="";
+                            try{
+                                JSONObject snap=RootPhoneHarness.command(this,new JSONObject().put("op","preview").put("since",-1));
+                                afterFrameSeq=snap.optLong("frameSequence",-1L);
+                                if(snap.has("image")){
+                                    String aImg=snap.getString("image");
+                                    if(!aImg.isEmpty()) afterImgSig=aImg.length()+":"+aImg.hashCode();
+                                    res.put("image",aImg).put("width",snap.optInt("width",540)).put("height",snap.optInt("height",1200));
+                                }
+                            }catch(Exception ignored){}
+                            boolean visualChanged=(afterFrameSeq>0 && afterFrameSeq!=beforeFrameSeq) || (!afterImgSig.isEmpty() && !afterImgSig.equals(beforeImgSig));
+                            boolean treeChanged=beforeHash.isEmpty() || !afterHash.equals(beforeHash) || !afterPkg.equals(beforePkg) || beforeNodes!=ncAfter;
+                            boolean changed=treeChanged || visualChanged;
+                            String changeSummary=(changed ? "✅ 界面已变化: " : "⚠️ 界面未变: ")
+                                + "包名 " + (beforePkg.isEmpty() ? "none" : beforePkg) + " -> " + (afterPkg.isEmpty() ? "unknown" : afterPkg)
+                                + ", 节点数 " + (beforeNodes<0 ? "?" : beforeNodes) + " -> " + ncAfter
+                                + (visualChanged && !treeChanged ? " (自绘画面帧已更新)" : "");
+                            res.put("ui_changed",changed).put("visual_changed",visualChanged).put("change_summary",changeSummary);
                         }
                     }
                 }catch(Exception e){
@@ -207,6 +290,23 @@ public class AgentForegroundService extends Service {
             });
             return;
         }
+        if(type.equals("message")&&System.currentTimeMillis()>=snoozeUntil&&!NativePulseModel.isForeground()){
+            JSONObject m=event.optJSONObject("message");
+            if(m!=null&&"assistant".equals(m.optString("role"))&&!m.optBoolean("is_sub_turn",false)){
+                String id=m.optString("id","");
+                String text=m.optString("text","").trim();
+                String kind=m.optString("kind","chat");
+                if(!id.isEmpty()&&!text.isEmpty()&&!notified.contains(id)&&!kind.equals("stopped")){
+                    String botId=m.optString("bot_id","companion");
+                    String botName=m.optString("from_bot_name","").trim();
+                    if(botName.isEmpty()) botName="companion".equals(botId)?"白珂":botId;
+                    String title="curiosity".equals(kind)?(botName+" · 主动搭话"):botName;
+                    notifyCustom(id,title,text.length()>260?text.substring(0,260)+"…":text,botId);
+                    notified.add(id);
+                    if(notified.size()>600)notified.clear();
+                }
+            }
+        }
         if(type.equals("user_notification")&&System.currentTimeMillis()>=snoozeUntil){
             String id=event.optString("id",UUID.randomUUID().toString());
             if(!notified.contains(id)){
@@ -226,7 +326,9 @@ public class AgentForegroundService extends Service {
             }
             if(stage==3){pendingOverlay=event;tryShowOverlay();}
         }
-        broadcast();
+        if(!type.equals("stream")&&!type.equals("execution")&&!type.equals("cloud_desktop_frame")){
+            broadcast();
+        }
     }
 
     private void startEmergencyAlarm(String title,String body,String botId,int durSec){

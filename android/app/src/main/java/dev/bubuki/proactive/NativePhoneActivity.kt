@@ -25,13 +25,6 @@ class NativePhoneActivity : ComponentActivity() {
         super.onResume(); poll?.cancel()
         poll = scope.launch {
             try { withContext(Dispatchers.IO) { RootPhoneHarness.status(this@NativePhoneActivity) } } catch (failure: Exception) { if (failure is CancellationException) throw failure; error = MainActivity.safeError(failure) }
-            while (isActive) {
-                delay(1500)
-                if (JSONObject(RootPhoneHarness.changes.value.display).optBoolean("created") && !busy) {
-                    try { withContext(Dispatchers.IO) { RootPhoneHarness.command(this@NativePhoneActivity, JSONObject().put("op", "capture").put("manual", true)) } }
-                    catch (failure: Exception) { if (failure is CancellationException) throw failure }
-                }
-            }
         }
     }
     private suspend fun command(op: String, arguments: JSONObject): Boolean {
@@ -46,7 +39,7 @@ class NativePhoneActivity : ComponentActivity() {
                 "overlay" -> startActivity(Intent(android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION, android.net.Uri.parse("package:$packageName")))
                 "listener" -> startActivity(Intent(android.provider.Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
                 "background" -> {
-                    val enabled = withContext(Dispatchers.IO) { synchronized(SecurePrefs::class.java) { val saved = SecurePrefs.read(this@NativePhoneActivity); val enabled = !saved.optBoolean("background"); SecurePrefs.save(this@NativePhoneActivity, saved.put("background", enabled)); enabled } }
+                    val enabled = withContext(Dispatchers.IO) { synchronized(SecurePrefs::class.java) { val saved = SecurePrefs.read(this@NativePhoneActivity); val enabled = !saved.optBoolean("background", true); SecurePrefs.save(this@NativePhoneActivity, saved.put("background", enabled)); enabled } }
                     if (enabled) startForegroundService(Intent(this, AgentForegroundService::class.java)) else stopService(Intent(this, AgentForegroundService::class.java))
                     withContext(Dispatchers.IO) { RootPhoneHarness.status(this@NativePhoneActivity) }
                 }
@@ -56,8 +49,12 @@ class NativePhoneActivity : ComponentActivity() {
         finally { busy = false }
     }
     private fun settings() {
-        @Suppress("DEPRECATION")
-        startActivityForResult(Intent(this, MainActivity::class.java).putExtra("nativeParent", true).putExtra("entryRoute", "settings"), 740)
+        startActivity(
+            Intent(this, NativePulseActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                .putExtra("entryRoute", "settings")
+        )
+        finish()
     }
     override fun onPause() { poll?.cancel(); super.onPause() }
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) { super.onRequestPermissionsResult(requestCode, permissions, grantResults); scope.launch { withContext(Dispatchers.IO) { RootPhoneHarness.status(this@NativePhoneActivity) } } }

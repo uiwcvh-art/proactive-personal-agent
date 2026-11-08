@@ -17,10 +17,17 @@ final class RootClipboard {
     }
     void paste(int displayId,String text)throws Exception {
         if(android.os.Process.myUid()!=0||displayId<=0)throw new SecurityException("只允许 Root 向独立屏输入");
-        java.lang.Process broker=new ProcessBuilder("app_process","/system/bin","dev.bubuki.proactive.RootClipboardBroker").redirectError(new File("/dev/null")).start();
+        ProcessBuilder pb = new ProcessBuilder("/system/bin/app_process","/system/bin","dev.bubuki.proactive.RootClipboardBroker").redirectError(new File("/dev/null"));
+        String cp = System.getenv("CLASSPATH");
+        if (cp == null || cp.isEmpty()) cp = System.getProperty("java.class.path", "");
+        if (cp != null && !cp.isEmpty()) pb.environment().put("CLASSPATH", cp);
+        java.lang.Process broker=pb.start();
         try(BufferedReader in=new BufferedReader(new InputStreamReader(broker.getInputStream(),StandardCharsets.UTF_8));BufferedWriter out=new BufferedWriter(new OutputStreamWriter(broker.getOutputStream(),StandardCharsets.UTF_8))){
             out.write(new JSONObject().put("text",text).toString()+"\n");out.flush();line(in);
-            try{RootCommands.run("input","-d",String.valueOf(displayId),"keyevent","279");}
+            try{
+                RootCommands.run("input","-d",String.valueOf(displayId),"keyevent","279");
+                try{Thread.sleep(240L);}catch(InterruptedException ignored){}
+            }
             finally{out.write("restore\n");out.flush();line(in);}
         }finally{if(broker.isAlive())broker.destroy();}
     }

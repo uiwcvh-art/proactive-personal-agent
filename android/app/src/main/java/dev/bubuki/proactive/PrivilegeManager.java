@@ -92,18 +92,7 @@ final class PrivilegeManager {
         persistHint(detected, winningMode);
         if (detected) {
             autoGrantPermissionsViaRoot(winningMode);
-            try {
-                JSONObject identity = execute(new JSONObject().put("op", "status"));
-                if (identity.optInt("uid", -1) != 0) {
-                    lastDiag = "helper uid=" + identity.optInt("uid", -1);
-                } else {
-                    lastDiag = "ok";
-                }
-            } catch (Throwable e) {
-                // Keep rootGranted = true because `su` (`id -u == 0`) genuinely succeeded!
-                // Record the helper diagnostic so we can retry or report accurately without claiming "no Root".
-                lastDiag = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
-            }
+            lastDiag = "ok";
         } else {
             lastDiag = "su id -u did not return 0";
         }
@@ -205,10 +194,18 @@ final class PrivilegeManager {
                 JSONObject result = new JSONObject(line);
                 if (result.has("error")) throw new Exception(result.getString("error"));
                 return result;
+            } catch (InterruptedException e) {
+                closeRoot();
+                Thread.currentThread().interrupt();
+                throw e;
             } catch (IOException e) {
                 closeRoot();
                 lastErr = e;
             }
+        }
+        if (rootProcess == null) {
+            rootGranted = false;
+            persistHint(false, suMode);
         }
         throw lastErr != null ? lastErr : new Exception("Root 工具调用失败");
     }
@@ -266,6 +263,10 @@ final class PrivilegeManager {
         });
         try {
             return future.get(timeoutMs, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            future.cancel(true);
+            closeRoot();
+            throw e;
         } catch (TimeoutException e) {
             future.cancel(true);
             throw new IOException("等待 Root 工具响应超时");

@@ -28,15 +28,17 @@ class PulseAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         runCatching {
             serviceInfo?.let { info ->
-                info.eventTypes = AccessibilityEvent.TYPES_ALL_MASK
-                info.feedbackType = info.feedbackType or
-                    AccessibilityServiceInfo.FEEDBACK_SPOKEN or
-                    AccessibilityServiceInfo.FEEDBACK_GENERIC
-                info.flags = info.flags or
+                // Subscribe ONLY to low-frequency window state transitions instead of TYPES_ALL_MASK,
+                // and avoid FEEDBACK_SPOKEN / FLAG_REQUEST_ENHANCED_WEB_ACCESSIBILITY so we never
+                // trigger system-wide TalkBack/WebView accessibility overhead or high-frequency scroll/content IPC wakeups.
+                info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
+                info.notificationTimeout = 500L
+                info.flags = (info.flags or
                     AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS or
                     AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
-                    AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
-                    AccessibilityServiceInfo.FLAG_REQUEST_ENHANCED_WEB_ACCESSIBILITY
+                    AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS) and
+                    AccessibilityServiceInfo.FLAG_REQUEST_ENHANCED_WEB_ACCESSIBILITY.inv()
                 serviceInfo = info
             }
         }
@@ -79,13 +81,16 @@ class PulseAccessibilityService : AccessibilityService() {
             .put("role", role)
             .put("text", text)
             .put("desc", desc)
+            .put("hint", hint)
             .put("id", resourceId)
+            .put("pkg", pkg)
             .put("bounds", JSONArray().put(bounds.left).put(bounds.top).put(bounds.right).put(bounds.bottom))
             .put("center_x", centerX)
             .put("center_y", centerY)
             .put("clickable", clickable)
             .put("editable", editable)
             .put("scrollable", scrollable)
+            .put("checkable", checkable)
             .put("checked", checked)
     }
 
@@ -113,9 +118,10 @@ class PulseAccessibilityService : AccessibilityService() {
         fun getCachedSnapshot(displayId: Int): CachedSnapshot? = snapshotCache[displayId]
 
         @JvmStatic
-        fun updateSnapshotFromExternal(displayId: Int, nodes: List<CachedNode>, activePkg: String): CachedSnapshot {
+        @JvmOverloads
+        fun updateSnapshotFromExternal(displayId: Int, nodes: List<CachedNode>, activePkg: String, screenW: Int = 720, screenH: Int = 1600): CachedSnapshot {
             val hash = computeTreeHash(nodes, activePkg)
-            val summary = formatCompactSummary(displayId, activePkg, hash, nodes)
+            val summary = formatCompactSummary(displayId, activePkg, hash, nodes, screenW, screenH)
             val snap = CachedSnapshot(
                 displayId = displayId,
                 timestampMs = System.currentTimeMillis(),
@@ -148,20 +154,22 @@ class PulseAccessibilityService : AccessibilityService() {
             screenW: Int,
             screenH: Int,
             forceRefresh: Boolean = false,
-            waitMs: Long = 1500L
+            waitMs: Long = 420L
         ): JSONObject? {
             if (displayId <= 0) return null
             if (!forceRefresh) {
                 val cached = snapshotCache[displayId]
-                if (cached != null && System.currentTimeMillis() - cached.timestampMs < 180L && cached.nodes.isNotEmpty()) {
+                if (cached != null && System.currentTimeMillis() - cached.timestampMs < 240L && cached.nodes.isNotEmpty()) {
                     return snapshotToJson(cached, fromCache = true)
                 }
             }
-            val deadline = SystemClock.uptimeMillis() + waitMs.coerceAtLeast(0L)
+            val deadline = SystemClock.uptimeMillis() + waitMs.coerceIn(0L, 750L)
             val wSafe = screenW.coerceAtLeast(1)
             val hSafe = screenH.coerceAtLeast(1)
             val screenRect = Rect(0, 0, wSafe, hSafe)
-            val maxContainerArea = (wSafe.toLong() * hSafe.toLong() * 80L) / 100L
+            val maxContainerArea = (wSafe.toLong() * hSafe.toLong() * 65L) / 100L
+            val maxRowHeight = (hSafe * 22) / 100
+            var lastEmptySnap: CachedSnapshot? = null
 
             while (true) {
                 val svc = instance
@@ -179,16 +187,21 @@ class PulseAccessibilityService : AccessibilityService() {
                         .sortedByDescending { it.layer }
 
                     if (contentWindows.isNotEmpty()) {
-                        val collected = ArrayList<CachedNode>(64)
+                        val collected = ArrayList<CachedNode>(80)
                         var activePkg = ""
                         var nextIdx = 1
 
                         fun collectFromWindows(strictVisible: Boolean) {
+                            var visitedNodes = 0
                             for (win in contentWindows) {
                                 val root = try { win.root } catch (t: Throwable) { null } ?: continue
                                 val winPkg = root.packageName?.toString().orEmpty()
-                                // Never read our own host app UI on the virtual display
-                                if (winPkg == "dev.bubuki.proactive") continue
+                                val winTitle = try { win.title?.toString().orEmpty() } catch (t: Throwable) { "" }
+                                // Skip our own main chat UI if it ever lands on the virtual display, but allow DisplayTestActivity
+                                if (winPkg == "dev.bubuki.proactive" && !winTitle.contains("测试", ignoreCase = true) && !winTitle.contains("Test", ignoreCase = true)) {
+                                    val firstChildId = try { root.getChild(0)?.viewIdResourceName.orEmpty() } catch (t: Throwable) { "" }
+                                    if (firstChildId.isEmpty() && contentWindows.size > 1) continue
+                                }
                                 if (activePkg.isEmpty() && winPkg.isNotBlank() && win.type == AccessibilityWindowInfo.TYPE_APPLICATION) {
                                     activePkg = winPkg
                                 } else if (activePkg.isEmpty() && winPkg.isNotBlank()) {
@@ -196,16 +209,14 @@ class PulseAccessibilityService : AccessibilityService() {
                                 }
 
                                 fun traverse(node: AccessibilityNodeInfo?, depth: Int) {
-                                    if (node == null || depth > 52 || collected.size >= 140) return
+                                    if (node == null || depth > 42 || collected.size >= 110 || ++visitedNodes > 650) return
                                     val visible = try { node.isVisibleToUser } catch (t: Throwable) { true }
 
-                                    val rect = Rect()
-                                    try { node.getBoundsInScreen(rect) } catch (t: Throwable) {}
-                                    val intersects = rect.intersect(screenRect) && rect.width() >= 4 && rect.height() >= 4
+                                    val rawRect = Rect()
+                                    try { node.getBoundsInScreen(rawRect) } catch (t: Throwable) {}
+                                    val rect = Rect(rawRect)
+                                    val intersects = rect.intersect(screenRect) && rect.width() >= 6 && rect.height() >= 6
 
-                                    // NOTE: On a VirtualDisplay (displayId > 0), hardened apps like WeChat (com.tencent.mm)
-                                    // often report `isVisibleToUser = false` on outer containers while children have valid bounds!
-                                    // Therefore we NEVER return before traversing children.
                                     if (!strictVisible || visible) {
                                         val rawClass = node.className?.toString().orEmpty()
                                         val editable = node.isEditable
@@ -225,26 +236,34 @@ class PulseAccessibilityService : AccessibilityService() {
 
                                         val nodeArea = rect.width().toLong() * rect.height().toLong()
                                         val isFullscreenBlankContainer = nodeArea >= maxContainerArea &&
-                                            !editable && !scrollable && !checkable &&
+                                            !editable && !checkable &&
                                             ownText.isEmpty() && ownDesc.isEmpty() && hint.isEmpty()
 
+                                        // Only aggregate descendant labels for single-row containers (height <= 22% of screen),
+                                        // NEVER for multi-row lists whose centerY would point between different rows!
                                         val effectiveText = when {
                                             ownText.isNotEmpty() -> ownText
-                                            ownDesc.isEmpty() && hint.isEmpty() && clickable && !isFullscreenBlankContainer -> descendantLabel(node, strictVisible)
+                                            ownDesc.isEmpty() && hint.isEmpty() && clickable && !scrollable &&
+                                                !isFullscreenBlankContainer && rect.height() <= maxRowHeight -> descendantLabel(node, strictVisible)
                                             else -> ""
                                         }
 
+                                        val hasLabel = effectiveText.isNotEmpty() || ownDesc.isNotEmpty() || hint.isNotEmpty()
+                                        // Across ALL apps, reject unlabeled non-editable generic views (`[View] click` blind boxes)
+                                        // so custom-drawn / obfuscated apps never jitter node counts or expose misleading empty shells!
                                         val meaningful = intersects && !isFullscreenBlankContainer && (
-                                            clickable || editable || scrollable || checkable ||
-                                                effectiveText.isNotEmpty() || ownDesc.isNotEmpty() || hint.isNotEmpty()
+                                            editable || checkable || hasLabel || scrollable
                                             )
                                         if (meaningful) {
                                             val cx = rect.centerX().coerceIn(0, (wSafe - 1).coerceAtLeast(0))
                                             val cy = rect.centerY().coerceIn(0, (hSafe - 1).coerceAtLeast(0))
                                             val duplicate = collected.any { prev ->
-                                                !clickable && !editable &&
-                                                    prev.text == effectiveText && prev.desc == ownDesc &&
-                                                    kotlin.math.abs(prev.centerX - cx) <= 6 && kotlin.math.abs(prev.centerY - cy) <= 6
+                                                kotlin.math.abs(prev.centerX - cx) <= 12 &&
+                                                    kotlin.math.abs(prev.centerY - cy) <= 12 &&
+                                                    (
+                                                        (prev.text == effectiveText && prev.desc == ownDesc && prev.hint == hint && prev.editable == editable && prev.checkable == checkable) ||
+                                                        (prev.text.isNotEmpty() && effectiveText.isEmpty() && ownDesc.isEmpty() && hint.isEmpty() && !editable && !checkable && !clickable)
+                                                    )
                                             }
                                             if (!duplicate) {
                                                 val ref = "@e${nextIdx++}"
@@ -283,21 +302,22 @@ class PulseAccessibilityService : AccessibilityService() {
                         }
 
                         collectFromWindows(strictVisible = true)
-                        if (collected.size < 2) {
+                        if (collected.size < 2 && activePkg != "com.tencent.mm") {
                             collected.clear()
                             nextIdx = 1
                             collectFromWindows(strictVisible = false)
                         }
-                        if (collected.isNotEmpty()) {
-                            val snap = updateSnapshotFromExternal(displayId, collected, activePkg)
+                        val snap = updateSnapshotFromExternal(displayId, collected, activePkg, wSafe, hSafe)
+                        if (collected.isNotEmpty() || SystemClock.uptimeMillis() >= deadline) {
                             return snapshotToJson(snap, fromCache = false)
                         }
+                        lastEmptySnap = snap
                     }
                 }
                 if (SystemClock.uptimeMillis() >= deadline) break
-                try { Thread.sleep(85L) } catch (ignored: InterruptedException) { break }
+                try { Thread.sleep(110L) } catch (ignored: InterruptedException) { break }
             }
-            return null
+            return lastEmptySnap?.let { snapshotToJson(it, fromCache = false) }
         }
 
         /**
@@ -407,11 +427,15 @@ class PulseAccessibilityService : AccessibilityService() {
                 .sortedByDescending { it.layer }
             for (win in contentWindows) {
                 val root = try { win.root } catch (t: Throwable) { null } ?: continue
-                if (root.packageName?.toString() == "dev.bubuki.proactive") continue
+                val winPkg = root.packageName?.toString().orEmpty()
+                val winTitle = try { win.title?.toString().orEmpty() } catch (t: Throwable) { "" }
+                if (winPkg == "dev.bubuki.proactive" && !winTitle.contains("测试", ignoreCase = true) && !winTitle.contains("Test", ignoreCase = true) && contentWindows.size > 1) continue
                 val rootRect = Rect()
                 try { root.getBoundsInScreen(rootRect) } catch (t: Throwable) {}
+                val screenClip = Rect(0, 0, rootRect.right.coerceAtLeast(1080), rootRect.bottom.coerceAtLeast(1920))
                 val maxParentArea = (rootRect.width().coerceAtLeast(1080).toLong() * rootRect.height().coerceAtLeast(1920).toLong() * 70L) / 100L
-                val found = findLiveNode(root, target, 0)
+                val visited = intArrayOf(0)
+                val found = findLiveNode(root, target, 0, screenClip, visited)
                 if (found != null) {
                     return try {
                         when (action) {
@@ -451,19 +475,31 @@ class PulseAccessibilityService : AccessibilityService() {
             return false
         }
 
-        private fun findLiveNode(node: AccessibilityNodeInfo?, target: CachedNode, depth: Int): AccessibilityNodeInfo? {
-            if (node == null || depth > 48) return null
-            val r = Rect()
-            try { node.getBoundsInScreen(r) } catch (t: Throwable) {}
-            if (kotlin.math.abs(r.centerX() - target.centerX) <= 10 && kotlin.math.abs(r.centerY() - target.centerY) <= 10) {
+        private fun findLiveNode(
+            node: AccessibilityNodeInfo?,
+            target: CachedNode,
+            depth: Int,
+            screenClip: Rect,
+            visited: IntArray
+        ): AccessibilityNodeInfo? {
+            if (node == null || depth > 48 || ++visited[0] > 650) return null
+            val raw = Rect()
+            try { node.getBoundsInScreen(raw) } catch (t: Throwable) {}
+            val r = Rect(raw)
+            r.intersect(screenClip)
+            if (kotlin.math.abs(r.centerX() - target.centerX) <= 14 && kotlin.math.abs(r.centerY() - target.centerY) <= 14) {
                 val txt = node.text?.toString()?.trim().orEmpty()
                 val desc = node.contentDescription?.toString()?.trim().orEmpty()
+                val hint = node.hintText?.toString()?.trim().orEmpty()
                 val resId = node.viewIdResourceName?.substringAfterLast('/')?.trim().orEmpty()
+                val clickable = node.isClickable || node.isLongClickable || node.isContextClickable
                 if (
                     (target.resourceId.isNotEmpty() && resId == target.resourceId) ||
                     (txt.isNotEmpty() && txt == target.text) ||
                     (desc.isNotEmpty() && desc == target.desc) ||
-                    (node.isClickable == target.clickable && kotlin.math.abs(r.width() - target.bounds.width()) <= 16)
+                    (hint.isNotEmpty() && hint == target.hint) ||
+                    (node.isEditable && target.editable) ||
+                    (clickable == target.clickable && kotlin.math.abs(r.width() - target.bounds.width()) <= 20)
                 ) {
                     return node
                 }
@@ -471,7 +507,7 @@ class PulseAccessibilityService : AccessibilityService() {
             val count = try { node.childCount } catch (t: Throwable) { 0 }
             for (i in 0 until count) {
                 val child = try { node.getChild(i) } catch (t: Throwable) { null }
-                val match = findLiveNode(child, target, depth + 1)
+                val match = findLiveNode(child, target, depth + 1, screenClip, visited)
                 if (match != null) return match
             }
             return null
@@ -502,23 +538,29 @@ class PulseAccessibilityService : AccessibilityService() {
             }
             feed(activePkg)
             for (n in nodes) {
-                feed(n.role); feed(n.text); feed(n.desc); feed("${n.centerX},${n.centerY}")
+                feed(n.role); feed(n.text); feed(n.desc); feed(n.hint); feed(n.resourceId)
+                feed("${n.centerX},${n.centerY},${n.clickable},${n.checked}")
             }
             return Integer.toHexString(h)
         }
 
-        internal fun formatCompactSummary(displayId: Int, activePkg: String, hash: String, nodes: List<CachedNode>): String {
+        internal fun formatCompactSummary(displayId: Int, activePkg: String, hash: String, nodes: List<CachedNode>, screenW: Int = 720, screenH: Int = 1600): String {
             val sb = StringBuilder()
+            val wSafe = screenW.coerceAtLeast(1)
+            val hSafe = screenH.coerceAtLeast(1)
             sb.append("displayId=").append(displayId)
                 .append(" package=").append(activePkg.ifBlank { "unknown" })
                 .append(" treeHash=").append(hash)
                 .append(" count=").append(nodes.size).append("\n")
             for (n in nodes) {
+                val nx = ((n.centerX * 1000L) / wSafe).toInt().coerceIn(0, 1000)
+                val ny = ((n.centerY * 1000L) / hSafe).toInt().coerceIn(0, 1000)
                 sb.append(n.ref).append(" [").append(n.role).append("]")
                 val label = listOf(n.text, n.desc, n.hint).firstOrNull { it.isNotBlank() }.orEmpty()
                 if (label.isNotEmpty()) sb.append(" \"").append(label.replace("\n", " ")).append("\"")
                 if (n.resourceId.isNotEmpty()) sb.append(" id=").append(n.resourceId)
                 sb.append(" center=(").append(n.centerX).append(",").append(n.centerY).append(")")
+                sb.append(" norm=(").append(nx).append(",").append(ny).append(")")
                 val flags = mutableListOf<String>()
                 if (n.clickable) flags.add("click")
                 if (n.editable) flags.add("edit")

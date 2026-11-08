@@ -28,6 +28,7 @@ import org.json.JSONObject;
 public class AgentNotificationListener extends NotificationListenerService {
     private static final int MAX_BUFFER = 80;
     private static volatile AgentNotificationListener instance = null;
+    private static final Map<String, String> appNameCache = new java.util.concurrent.ConcurrentHashMap<>();
     private static final Map<String, JSONObject> recentBuffer = Collections.synchronizedMap(
         new LinkedHashMap<String, JSONObject>(MAX_BUFFER + 16, 0.75f, false) {
             @Override
@@ -74,13 +75,14 @@ public class AgentNotificationListener extends NotificationListenerService {
     @Override
     public void onNotificationRemoved(StatusBarNotification sbn) {
         if (sbn == null) return;
-        String key = sbn.getKey() != null ? sbn.getKey() : (sbn.getPackageName() + ":" + sbn.getId());
+        String sbnKey = sbn.getKey() != null ? sbn.getKey() : (sbn.getPackageName() + ":" + sbn.getId());
         synchronized (recentBuffer) {
-            JSONObject existing = recentBuffer.get(key);
-            if (existing != null) {
-                try {
-                    existing.put("active", false);
-                } catch ( Exception ignored) {}
+            for (JSONObject item : recentBuffer.values()) {
+                if (sbnKey.equals(item.optString("sbn_key"))) {
+                    try {
+                        item.put("active", false);
+                    } catch (Exception ignored) {}
+                }
             }
         }
     }
@@ -96,6 +98,9 @@ public class AgentNotificationListener extends NotificationListenerService {
             if (notif == null) return;
             Bundle extras = notif.extras;
             if (extras == null) return;
+            if (sbn.isOngoing() && (extras.containsKey(Notification.EXTRA_PROGRESS) || (notif.flags & Notification.FLAG_FOREGROUND_SERVICE) != 0)) {
+                return;
+            }
 
             CharSequence titleCs = extras.getCharSequence(Notification.EXTRA_TITLE);
             CharSequence textCs = extras.getCharSequence(Notification.EXTRA_TEXT);
@@ -110,11 +115,23 @@ public class AgentNotificationListener extends NotificationListenerService {
 
             if (title.isEmpty() && text.isEmpty()) return;
 
-            String appName = resolveAppName(this, pkg);
+            String sbnKey = sbn.getKey() != null ? sbn.getKey() : (pkg + ":" + sbn.getId());
+            String dedupKey = pkg + "|" + title + "|" + text;
             long postTime = sbn.getPostTime() > 0 ? sbn.getPostTime() : System.currentTimeMillis();
+            synchronized (recentBuffer) {
+                JSONObject existing = recentBuffer.get(dedupKey);
+                if (existing != null && Math.abs(postTime - existing.optLong("timestamp_ms", 0L)) < 10_000L) {
+                    existing.put("active", isActive);
+                    existing.put("sbn_key", sbnKey);
+                    return;
+                }
+            }
+
+            String appName = resolveAppName(this, pkg);
             String timeStr = new SimpleDateFormat("MM-dd HH:mm:ss", Locale.CHINA).format(new Date(postTime));
 
             JSONObject item = new JSONObject();
+            item.put("sbn_key", sbnKey);
             item.put("package", pkg);
             item.put("app", appName);
             item.put("title", title);
@@ -125,7 +142,6 @@ public class AgentNotificationListener extends NotificationListenerService {
             item.put("ongoing", sbn.isOngoing());
             item.put("active", isActive);
 
-            String dedupKey = pkg + "|" + title + "|" + text;
             synchronized (recentBuffer) {
                 recentBuffer.remove(dedupKey);
                 recentBuffer.put(dedupKey, item);
@@ -135,12 +151,19 @@ public class AgentNotificationListener extends NotificationListenerService {
 
     public static String resolveAppName(Context ctx, String pkg) {
         if (pkg == null || pkg.isEmpty()) return "";
+        String cached = appNameCache.get(pkg);
+        if (cached != null) return cached;
         try {
             PackageManager pm = ctx.getPackageManager();
             ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
             CharSequence label = pm.getApplicationLabel(ai);
-            if (label != null && label.length() > 0) return label.toString();
+            if (label != null && label.length() > 0) {
+                String resolved = label.toString();
+                appNameCache.put(pkg, resolved);
+                return resolved;
+            }
         } catch (Throwable ignored) {}
+        appNameCache.put(pkg, pkg);
         return pkg;
     }
 

@@ -68,10 +68,16 @@ final class CloudFiles {
         if(!"workspace".equals(source)&&!"computer".equals(source))throw new Exception("文件来源无效");
         String name="attachment";
         long rawSize=-1;
-        try(android.database.Cursor cursor=context.getContentResolver().query(uri,new String[]{android.provider.OpenableColumns.DISPLAY_NAME,android.provider.OpenableColumns.SIZE},null,null,null)){
-            if(cursor!=null&&cursor.moveToFirst()){
-                name=cursor.getString(0);
-                if(!cursor.isNull(1))rawSize=cursor.getLong(1);
+        if("file".equalsIgnoreCase(uri.getScheme())&&uri.getPath()!=null){
+            java.io.File localFile=new java.io.File(uri.getPath());
+            name=localFile.getName();
+            rawSize=localFile.length();
+        }else{
+            try(android.database.Cursor cursor=context.getContentResolver().query(uri,new String[]{android.provider.OpenableColumns.DISPLAY_NAME,android.provider.OpenableColumns.SIZE},null,null,null)){
+                if(cursor!=null&&cursor.moveToFirst()){
+                    name=cursor.getString(0);
+                    if(!cursor.isNull(1))rawSize=cursor.getLong(1);
+                }
             }
         }
         if(name==null)name="attachment";name=name.replaceAll("[\\\\/:*?\"<>|\\p{Cntrl}]","_");
@@ -119,7 +125,7 @@ final class CloudFiles {
         String extension=MimeTypeMap.getFileExtensionFromUrl(name),mime=MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension.toLowerCase(java.util.Locale.ROOT));
         ContentValues values=new ContentValues();values.put(MediaStore.Downloads.DISPLAY_NAME,name);
         values.put(MediaStore.Downloads.MIME_TYPE,mime==null?"application/octet-stream":mime);
-        values.put(MediaStore.Downloads.RELATIVE_PATH,Environment.DIRECTORY_DOWNLOADS+"/Pulse Bot");values.put(MediaStore.Downloads.IS_PENDING,1);
+        values.put(MediaStore.Downloads.RELATIVE_PATH,Environment.DIRECTORY_DOWNLOADS+"/DeepSeek Claw");values.put(MediaStore.Downloads.IS_PENDING,1);
         Uri target=context.getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI,values);
         if(target==null)throw new Exception("下载目录不可用");
         long offset=0,expected=-1;boolean complete=false;String version=null;
@@ -139,7 +145,17 @@ final class CloudFiles {
                 }
             }
             values.clear();values.put(MediaStore.Downloads.IS_PENDING,0);context.getContentResolver().update(target,values,null,null);complete=true;
-            return new JSONObject().put("name",name).put("bytes",offset).put("uri",target.toString());
+            String actualPath="/sdcard/Download/DeepSeek Claw/"+name;
+            try(android.database.Cursor c=context.getContentResolver().query(target,new String[]{MediaStore.MediaColumns.DATA,MediaStore.MediaColumns.DISPLAY_NAME},null,null,null)){
+                if(c!=null&&c.moveToFirst()){
+                    String dataPath=c.getString(0);
+                    String dispName=c.getString(1);
+                    if(dataPath!=null&&!dataPath.isEmpty())actualPath=dataPath;
+                    else if(dispName!=null&&!dispName.isEmpty())actualPath="/sdcard/Download/DeepSeek Claw/"+dispName;
+                }
+            }catch(Throwable ignored){}
+            try{android.media.MediaScannerConnection.scanFile(context,new String[]{actualPath},mime==null?null:new String[]{mime},null);}catch(Throwable ignored){}
+            return new JSONObject().put("name",name).put("bytes",offset).put("uri",target.toString()).put("path",actualPath);
         } finally {if(!complete)context.getContentResolver().delete(target,null,null);}
     }
 }

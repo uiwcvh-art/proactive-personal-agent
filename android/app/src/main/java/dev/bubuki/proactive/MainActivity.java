@@ -186,7 +186,7 @@ public class MainActivity extends Activity {
                         break;
                     case "copy":
                         String copyText=data.optString("text","");
-                        runOnUiThread(()->getSystemService(android.content.ClipboardManager.class).setPrimaryClip(ClipData.newPlainText("Pulse Bot",copyText)));
+                        runOnUiThread(()->getSystemService(android.content.ClipboardManager.class).setPrimaryClip(ClipData.newPlainText("DeepSeek Claw",copyText)));
                         break;
                     case "openUrl":
                         Uri target=Uri.parse(data.getString("url"));

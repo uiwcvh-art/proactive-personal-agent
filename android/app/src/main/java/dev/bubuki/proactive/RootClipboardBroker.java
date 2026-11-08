@@ -27,10 +27,14 @@ public final class RootClipboardBroker {
         ClipboardManager manager=constructor.newInstance(context,new Handler(Looper.getMainLooper()));
         Object binder=Class.forName("android.os.ServiceManager").getMethod("getService",String.class).invoke(null,"clipboard");
         Object service=Class.forName("android.content.IClipboard$Stub").getMethod("asInterface",IBinder.class).invoke(null,binder);
-        Class<?> type=Class.forName("android.content.IClipboard");Method getter;
-        try{getter=type.getMethod("getPrimaryClip",String.class,String.class,int.class,int.class);}catch(NoSuchMethodException error){getter=type.getMethod("getPrimaryClip",String.class,String.class,int.class);}
+        Class<?> type=Class.forName("android.content.IClipboard");Method getter=null;
+        for (Method m : type.getMethods()) {
+            if ("getPrimaryClip".equals(m.getName())) { getter = m; break; }
+        }
         BufferedReader in=new BufferedReader(new InputStreamReader(System.in,StandardCharsets.UTF_8));PrintWriter out=new PrintWriter(new OutputStreamWriter(System.out,StandardCharsets.UTF_8),true);
-        ClipData previous=read(getter,service);String label="pulse-input-"+UUID.randomUUID();boolean changed=false;
+        ClipData previous=null;
+        try { previous=read(getter,service); } catch (Throwable ignored) {}
+        String label="pulse-input-"+UUID.randomUUID();boolean changed=false;
         try {
             String request=in.readLine();if(request==null)return;String text=new JSONObject(request).getString("text");
             ClipData pending=ClipData.newPlainText(label,text);PersistableBundle extras=new PersistableBundle();extras.putBoolean("android.content.extra.IS_SENSITIVE",true);pending.getDescription().setExtras(extras);
@@ -38,10 +42,19 @@ public final class RootClipboardBroker {
             in.readLine();
         }catch(Exception error){out.println(new JSONObject().put("error",error.getClass().getSimpleName()+": "+error.getMessage()));}
         finally{
-            if(changed){ClipData current=read(getter,service);if(current!=null&&label.contentEquals(current.getDescription().getLabel())){if(previous==null)manager.clearPrimaryClip();else manager.setPrimaryClip(previous);}}
+            try {
+                if(changed){ClipData current=read(getter,service);if(current==null||label.contentEquals(current.getDescription().getLabel())){if(previous==null)manager.clearPrimaryClip();else manager.setPrimaryClip(previous);}}
+            } catch (Throwable ignored) {}
             out.println("{\"restored\":true}");
         }
         System.exit(0);
     }
-    private static ClipData read(Method getter,Object service)throws Exception{return (ClipData)(getter.getParameterCount()==4?getter.invoke(service,"com.android.shell",null,0,0):getter.invoke(service,"com.android.shell",null,0));}
+    private static ClipData read(Method getter,Object service)throws Exception{
+        if (getter == null || service == null) return null;
+        int n = getter.getParameterCount();
+        if (n == 4) return (ClipData)getter.invoke(service,"com.android.shell",null,0,0);
+        if (n == 3) return (ClipData)getter.invoke(service,"com.android.shell",null,0);
+        if (n == 2) return (ClipData)getter.invoke(service,"com.android.shell",0);
+        return null;
+    }
 }

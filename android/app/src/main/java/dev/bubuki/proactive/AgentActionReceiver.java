@@ -14,13 +14,13 @@ public class AgentActionReceiver extends BroadcastReceiver {
         if("stop_alarm".equals(action)){
             return;
         }
+        c.getSystemService(NotificationManager.class).cancel(id==null?0:id.hashCode());
         PendingResult pending=goAsync();
         new Thread(()->{try{
             JSONObject body=new JSONObject();
             if("ack".equals(action))body.put("ids",new JSONArray().put(id));
             else body.put("minutes",i.getIntExtra("minutes",60));
             new SecureTransport(c).request("POST","ack".equals(action)?"/api/ack":"/api/snooze",body,null);
-            c.getSystemService(NotificationManager.class).cancel(id==null?0:id.hashCode());
             c.sendBroadcast(new Intent(c.getPackageName()+".UPDATE").setPackage(c.getPackageName()));
         }catch(Exception ignored){}finally{pending.finish();}},"pulse-action").start();
     }

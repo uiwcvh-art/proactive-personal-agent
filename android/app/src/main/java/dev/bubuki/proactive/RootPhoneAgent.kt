@@ -82,11 +82,31 @@ internal class RootPhoneAgent {
                 onStep(trace)
                 messages.put(JSONObject().put("role", "tool").put("tool_call_id", toolCall.getString("id")).put("content", clean.toString()))
                 if (image.isNotBlank()) {
+                    val mime = if (image.startsWith("iVBOR")) "image/png" else "image/jpeg"
                     images.put(JSONObject().put("type", "text").put("text", "刚刚获取的工作区截图，坐标范围 ${clean.optInt("width")}×${clean.optInt("height")}，display_id=${clean.optInt("displayId")}。"))
-                    images.put(JSONObject().put("type", "image_url").put("image_url", JSONObject().put("url", "data:image/png;base64,$image")))
+                    images.put(JSONObject().put("type", "image_url").put("image_url", JSONObject().put("url", "data:$mime;base64,$image")))
                 }
             }
-            if (images.length() > 0) messages.put(JSONObject().put("role", "user").put("content", images))
+            if (images.length() > 0) {
+                // Evict older base64 screenshot payloads so multi-step loops never OOM or blow up LLM token limits
+                for (mIdx in 0 until messages.length()) {
+                    val msg = messages.optJSONObject(mIdx) ?: continue
+                    if (msg.optString("role") == "user") {
+                        val contentArr = msg.optJSONArray("content") ?: continue
+                        var hasImg = false
+                        for (cIdx in 0 until contentArr.length()) {
+                            if (contentArr.optJSONObject(cIdx)?.optString("type") == "image_url") {
+                                hasImg = true
+                                break
+                            }
+                        }
+                        if (hasImg) {
+                            msg.put("content", "[历史工作区截图已省略]")
+                        }
+                    }
+                }
+                messages.put(JSONObject().put("role", "user").put("content", images))
+            }
         }
         Outcome("本轮已执行到 24 步并自动释放队列。你可以查看执行记录，或直接发送下一条指令。", false)
     }
@@ -102,8 +122,8 @@ internal class RootPhoneAgent {
         return JSONArray(listOf(
             definition("phone_launch", "在独立虚拟屏启动应用（直接传应用名称如 '学习通' 或组件名）", mapOf("display_id" to display, "component" to field("string", "应用名称（如 '学习通'）或 package/.Activity")), listOf("component")),
             definition("phone_ui_tree", "【首选】读取当前独立虚拟屏的无障碍 UI 节点树，返回带 @e1, @e2 编号、角色、文字与中心坐标的紧凑元素列表", mapOf("display_id" to display), emptyList()),
-            definition("phone_tap_node", "【首选】根据 phone_ui_tree 返回的节点编号 ref（如 '@e3'）或可见文字 text（如 '作业'）精准点击控件", mapOf("ref" to field("string", "节点编号，如 '@e1'"), "text" to field("string", "控件上的文字或描述，如 '签到' / '作业'"), "id" to field("string", "可选 resource_id")), emptyList()),
-            definition("phone_type_node", "【首选】在指定输入框节点（ref 如 '@e2' 或 target 提示词）中输入文字", mapOf("ref" to field("string", "输入框节点编号，如 '@e2'"), "target" to field("string", "可选输入框提示文字"), "text" to field("string", "要输入的文字")), listOf("text")),
+            definition("phone_tap_node", "【首选】根据 phone_ui_tree 返回的节点编号 ref（如 '@e3'）或可见文字 text（如 '作业'）精准点击控件", mapOf("display_id" to display, "ref" to field("string", "节点编号，如 '@e1'"), "text" to field("string", "控件上的文字或描述，如 '签到' / '作业'"), "id" to field("string", "可选 resource_id")), emptyList()),
+            definition("phone_type_node", "【首选】在指定输入框节点（ref 如 '@e2' 或 target 提示词）中输入文字", mapOf("display_id" to display, "ref" to field("string", "输入框节点编号，如 '@e2'"), "target" to field("string", "可选输入框提示文字"), "text" to field("string", "要输入的文字")), listOf("text")),
             definition("phone_swipe", "在独立虚拟屏滑动（如上下翻页）", mapOf("display_id" to display, "x1" to x, "y1" to y, "x2" to x, "y2" to y), listOf("x1", "y1", "x2", "y2")),
             definition("phone_key", "发送独立屏按键", mapOf("display_id" to display, "key" to field("string", "工作区按键").put("enum", JSONArray(listOf("back", "home", "enter", "tab", "delete", "up", "down", "left", "right")))), listOf("key")),
             definition("phone_apps", "列出此手机可启动的应用与组件名"),

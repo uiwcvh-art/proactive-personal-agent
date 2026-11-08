@@ -24,19 +24,22 @@ final class AvatarImages {
     }
     static JSONObject read(Context context,Uri uri)throws Exception {
         byte[] bytes;
-        try(InputStream in=context.getContentResolver().openInputStream(uri)){bytes=Io.read(in,PHOTO_LIMIT+1);}
+        try(InputStream in=context.getContentResolver().openInputStream(uri)){
+            if(in==null)throw new IOException("无法读取所选图片");
+            bytes=Io.read(in,PHOTO_LIMIT+1);
+        }
         if(bytes.length>PHOTO_LIMIT)throw new IOException("图片不能超过 25 MB");
         Bitmap bitmap=ImageDecoder.decodeBitmap(ImageDecoder.createSource(ByteBuffer.wrap(bytes)),(decoder,info,source)->{
             int width=info.getSize().getWidth(),height=info.getSize().getHeight();
-            double ratio=Math.min(1.0,1536.0/Math.max(width,height));
+            double ratio=Math.min(1.0,768.0/Math.max(width,height));
             decoder.setTargetSize(Math.max(1,(int)(width*ratio)),Math.max(1,(int)(height*ratio)));
             decoder.setAllocator(ImageDecoder.ALLOCATOR_SOFTWARE);
             decoder.setTargetColorSpace(ColorSpace.get(ColorSpace.Named.SRGB));
         });
         try {
             ByteArrayOutputStream out=new ByteArrayOutputStream();
-            bitmap.compress(Bitmap.CompressFormat.PNG,100,out);
-            return new JSONObject().put("image","data:image/png;base64,"+Base64.encodeToString(out.toByteArray(),Base64.NO_WRAP))
+            bitmap.compress(Bitmap.CompressFormat.JPEG,88,out);
+            return new JSONObject().put("image","data:image/jpeg;base64,"+Base64.encodeToString(out.toByteArray(),Base64.NO_WRAP))
                 .put("width",bitmap.getWidth()).put("height",bitmap.getHeight());
         } finally {bitmap.recycle();}
     }
