@@ -5,8 +5,19 @@ from deploy_vps import SSH,SCP
 ROOT=Path(__file__).resolve().parents[1]
 work=ROOT/'work'
 archive=work/'redesign-server.tar.gz'
+files=sorted({
+    *(ROOT/'server').glob('*.py'),
+    *(ROOT/'server/core').rglob('*.py'),
+    *(ROOT/'server/transport').rglob('*.py'),
+    *(ROOT/'server/plugins').rglob('*.py'),
+    *(ROOT/'server/cloud_os').rglob('*.py'),
+    *(ROOT/'desktop').rglob('*.py'),
+    ROOT/'server/requirements.txt',
+    ROOT/'server/computer_requirements.txt',
+    ROOT/'server/computer-openbox.xml',
+})
 with tarfile.open(archive,'w:gz') as out:
-    for file in sorted((ROOT/'server').glob('*.py')):out.add(file,arcname='server/'+file.name)
+    for file in files:out.add(file,arcname=file.relative_to(ROOT).as_posix())
 digest=hashlib.sha256(archive.read_bytes()).hexdigest()
 stamp=time.strftime('%Y%m%dT%H%M%SZ',time.gmtime())
 snapshot=r'''python3 - <<'PY'
@@ -29,10 +40,10 @@ test "$(sha256sum .deploy/redesign-server.tar.gz | cut -d' ' -f1)" = {digest}
 tar -czf .deploy/server-before-{stamp}.tgz server
 if [ -f data/state.json ]; then cp -p data/state.json .deploy/state-before-{stamp}.json; fi
 tar -xzf .deploy/redesign-server.tar.gz -C /opt/proactive-agent
-chmod 644 server/*.py
+chmod -R a+rX server
 venv/bin/python - <<'PY'
 from pathlib import Path
-for path in Path('server').glob('*.py'): compile(path.read_text('utf-8'),str(path),'exec')
+for path in Path('server').rglob('*.py'): compile(path.read_text('utf-8'),str(path),'exec')
 PY
 systemctl restart proactive-agent.service
 for attempt in 1 2 3 4 5 6 7 8 9 10; do

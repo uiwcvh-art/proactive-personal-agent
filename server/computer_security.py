@@ -11,36 +11,62 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 
-def restrict_desktop(read_paths:list[Path], write_paths:list[Path]):
-    if sys.platform!='linux':raise RuntimeError('The isolated cloud desktop requires Linux')
-    libc=ctypes.CDLL(None,use_errno=True)
+def apply_landlock(read_paths=(), write_paths=(), rw_devs=('/dev/null', '/dev/urandom'), min_abi=1, scoped=0):
+    if sys.platform != 'linux':
+        raise RuntimeError('Linux Landlock requires Linux')
+    libc = ctypes.CDLL(None, use_errno=True)
     def check(value):
-        if value<0:raise OSError(ctypes.get_errno(),os.strerror(ctypes.get_errno()))
+        if value < 0:
+            raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
         return value
-    if check(libc.syscall(444,0,0,1))<6:raise RuntimeError('Landlock ABI >= 6 is required for desktop filesystem, signal and abstract-socket isolation')
-    fs=(1<<15)-1
-    class Ruleset(ctypes.Structure):_fields_=[('fs',ctypes.c_uint64),('net',ctypes.c_uint64),('scoped',ctypes.c_uint64)]
+    abi = check(libc.syscall(444, 0, 0, 1))
+    if abi < min_abi:
+        raise RuntimeError(f'Landlock ABI >= {min_abi} is required')
+    fs = (1 << min(abi + 12, 15)) - 1
+    if scoped:
+        class Ruleset(ctypes.Structure):
+            _fields_ = [('fs', ctypes.c_uint64), ('net', ctypes.c_uint64), ('scoped', ctypes.c_uint64)]
+        ruleset = Ruleset(fs, 0, scoped)
+    else:
+        class Ruleset(ctypes.Structure):
+            _fields_ = [('fs', ctypes.c_uint64), ('net', ctypes.c_uint64)]
+        ruleset = Ruleset(fs, 0)
     class Beneath(ctypes.Structure):
-        _pack_=1
-        _fields_=[('rights',ctypes.c_uint64),('parent',ctypes.c_int32)]
-    ruleset=Ruleset(fs,0,3);fd=check(libc.syscall(444,ctypes.byref(ruleset),ctypes.sizeof(ruleset),0))
-    def allow(path,rights):
-        path=Path(path)
-        if not path.exists():return
-        if not path.is_dir():rights&=(1<<0)|(1<<1)|(1<<2)
-        parent=os.open(path,os.O_PATH|os.O_CLOEXEC)
-        try:check(libc.syscall(445,fd,1,ctypes.byref(Beneath(rights,parent)),0))
-        finally:os.close(parent)
-    read=(1<<0)|(1<<2)|(1<<3)
-    for path in ['/usr','/bin','/sbin','/lib','/lib64','/proc','/sys','/etc','/var/cache','/var/lib/apt','/var/lib/dpkg']:
-        allow(path,read)
-    for path in read_paths:allow(path,read)
-    allow('/proc',read|(1<<1))
-    for path in write_paths:allow(path,fs)
-    for path in ['/tmp','/var/tmp','/dev/pts','/dev/shm','/run']:allow(path,fs)
-    for path in ['/dev/null','/dev/zero','/dev/urandom','/dev/random','/dev/ptmx','/dev/tty','/dev/dri']:
-        allow(path,(1<<1)|(1<<2))
-    check(libc.prctl(38,1,0,0,0));check(libc.syscall(446,fd,0));os.close(fd)
+        _pack_ = 1
+        _fields_ = [('rights', ctypes.c_uint64), ('parent', ctypes.c_int32)]
+    fd = check(libc.syscall(444, ctypes.byref(ruleset), ctypes.sizeof(ruleset), 0))
+    def allow(path, rights):
+        p_obj = Path(path)
+        if not p_obj.exists():
+            return
+        if not p_obj.is_dir():
+            rights &= (1 << 0) | (1 << 1) | (1 << 2)
+        parent = os.open(p_obj, os.O_PATH | os.O_CLOEXEC)
+        try:
+            check(libc.syscall(445, fd, 1, ctypes.byref(Beneath(rights, parent)), 0))
+        except OSError:
+            pass
+        finally:
+            os.close(parent)
+    read = (1 << 0) | (1 << 2) | (1 << 3)
+    for path in read_paths:
+        allow(path, read)
+    if '/proc' in [str(p) for p in read_paths]:
+        allow('/proc', read | (1 << 1))
+    for path in write_paths:
+        allow(path, fs)
+    for dev in rw_devs:
+        allow(dev, (1 << 1) | (1 << 2))
+    check(libc.prctl(38, 1, 0, 0, 0))
+    check(libc.syscall(446, fd, 0))
+    os.close(fd)
+
+
+def restrict_desktop(read_paths:list[Path], write_paths:list[Path]):
+    base_ro = ['/usr','/bin','/sbin','/lib','/lib64','/proc','/sys','/etc','/var/cache','/var/lib/apt','/var/lib/dpkg']
+    base_rw = ['/tmp','/var/tmp','/dev/pts','/dev/shm','/run']
+    devs = ['/dev/null','/dev/zero','/dev/urandom','/dev/random','/dev/ptmx','/dev/tty','/dev/dri']
+    apply_landlock([*base_ro, *read_paths], [*write_paths, *base_rw], devs, min_abi=6, scoped=3)
 
 
 async def public_addresses(host:str,port:int,blocked_hosts=()):

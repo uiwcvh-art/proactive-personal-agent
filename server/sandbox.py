@@ -3,43 +3,18 @@
 Confines filesystem writes to the workspace while permitting outbound HTTP/HTTPS
 requests (e.g. curl $API_BASE_URL/models) and read-only system libraries/certs.
 """
-import ctypes, os, resource, sys
+import os, resource, sys
+from computer_security import apply_landlock
 
 def restrict(root):
-    libc = ctypes.CDLL(None, use_errno=True)
-    def check(value):
-        if value < 0: raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
-        return value
-    abi = check(libc.syscall(444, 0, 0, 1))
-    if abi < 1: raise RuntimeError('Bash requires Linux Landlock ABI >= 1')
-    # EXECUTE, WRITE, READ, READ_DIR, REMOVE_*, MAKE_* and REFER/TRUNCATE.
-    fs = (1 << min(abi + 12, 15)) - 1
-    class Ruleset(ctypes.Structure):
-        _fields_=[('handled_access_fs',ctypes.c_uint64),('handled_access_net',ctypes.c_uint64)]
-    class Beneath(ctypes.Structure):
-        _pack_=1
-        _fields_=[('allowed_access',ctypes.c_uint64),('parent_fd',ctypes.c_int32)]
-    attr = Ruleset(fs, 0)
-    fd = check(libc.syscall(444,ctypes.byref(attr),ctypes.sizeof(attr),0))
-    def allow(path, rights):
-        if not os.path.exists(path): return
-        p = os.open(path, os.O_PATH | os.O_CLOEXEC)
-        rule = Beneath(rights, p)
-        try: check(libc.syscall(445,fd,1,ctypes.byref(rule),0))
-        except OSError: pass
-        finally: os.close(p)
-    read_dir = (1<<0)|(1<<2)|(1<<3)
-    read_file = (1<<0)|(1<<2)
-    for path in ['/usr','/bin','/lib','/lib64','/sbin','/etc/alternatives','/etc/ssl','/etc/ca-certificates','/etc/pki']:
-        allow(path,read_dir)
-    for path in ['/etc/resolv.conf','/etc/hosts','/etc/nsswitch.conf','/etc/localtime']:
-        allow(path,read_file)
-    allow(root,fs)
-    allow('/dev/null',(1<<1)|(1<<2))
-    allow('/dev/urandom',1<<2)
-    check(libc.prctl(38,1,0,0,0))
-    check(libc.syscall(446,fd,0))
-    os.close(fd)
+    ro = [
+        '/usr','/bin','/lib','/lib64','/sbin',
+        '/opt/proactive-agent/venv',
+        '/etc/alternatives','/etc/ssl','/etc/ca-certificates','/etc/pki',
+        '/etc/resolv.conf','/etc/hosts','/etc/nsswitch.conf','/etc/localtime',
+        '/etc/debian_version','/etc/os-release','/etc/fonts','/proc',
+    ]
+    apply_landlock(ro, [root], ('/dev/null', '/dev/urandom'), min_abi=1)
 
 if __name__ == '__main__':
     try:
@@ -50,10 +25,24 @@ if __name__ == '__main__':
         resource.setrlimit(resource.RLIMIT_NOFILE,(256,256))
         os.chdir(root)
         restrict(root)
-        env = {'PATH':'/usr/bin:/bin','HOME':root,'TMPDIR':root,'LANG':'C.UTF-8'}
-        for k in ('API_BASE_URL','API_KEY','DEFAULT_MODEL'):
-            if os.environ.get(k): env[k] = os.environ[k]
-        os.execve('/bin/bash',['bash','--noprofile','--norc','-c',sys.argv[2]], env)
+        py_user_base = os.environ.get('PYTHONUSERBASE') or os.path.join(root, '.python_packages')
+        py_user_bin = os.path.join(py_user_base, 'bin')
+        venv_bin = '/opt/proactive-agent/venv/bin'
+        path_parts = [p for p in (py_user_bin, venv_bin, '/usr/local/bin', '/usr/bin', '/bin') if os.path.isdir(p)]
+        base_path = ':'.join(path_parts) if path_parts else '/usr/local/bin:/usr/bin:/bin'
+        env = {
+            'PATH': base_path,
+            'HOME': root,
+            'TMPDIR': root,
+            'LANG': os.environ.get('LANG', 'C.UTF-8'),
+            'TZ': os.environ.get('TZ', 'Asia/Shanghai'),
+            'PYTHONUSERBASE': py_user_base,
+            'PIP_USER': os.environ.get('PIP_USER', '1'),
+        }
+        for k in ('API_BASE_URL', 'API_KEY', 'DEFAULT_MODEL', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY'):
+            if os.environ.get(k):
+                env[k] = os.environ[k]
+        os.execve('/bin/bash', ['bash', '--noprofile', '--norc', '-c', sys.argv[2]], env)
     except Exception as e:
         print(f'SANDBOX_REFUSED: {e}',file=sys.stderr)
         sys.exit(126)

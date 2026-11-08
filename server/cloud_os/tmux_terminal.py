@@ -28,6 +28,17 @@ TMUX_SESSION_NAME = 'agent'
 TERMINAL_WINDOW_TITLE = 'Windows Terminal'
 
 
+def _tmux_sock(env: Dict[str, str]) -> str:
+    home = Path(env.get('HOME') or str(Path.home()))
+    st = home / '.local' / 'state'
+    st.mkdir(parents=True, exist_ok=True)
+    try:
+        st.chmod(0o700)
+    except Exception:
+        pass
+    return str(st / 'tmux_agent.sock')
+
+
 def ensure_single_tmux_terminal(env: Dict[str, str], cwd: Path) -> None:
     """
     Ensure the persistent `tmux` session `agent` exists and at most ONE `xterm` window
@@ -36,9 +47,10 @@ def ensure_single_tmux_terminal(env: Dict[str, str], cwd: Path) -> None:
     if os.name == 'nt' or not shutil.which('tmux'):
         return
 
+    sock_path = _tmux_sock(env)
     # 1. Ensure tmux session `agent` exists
     has_session = subprocess.run(
-        ['tmux', 'has-session', '-t', TMUX_SESSION_NAME],
+        ['tmux', '-S', sock_path, 'has-session', '-t', TMUX_SESSION_NAME],
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -46,194 +58,96 @@ def ensure_single_tmux_terminal(env: Dict[str, str], cwd: Path) -> None:
 
     if not has_session:
         subprocess.run(
-            ['tmux', 'new-session', '-d', '-s', TMUX_SESSION_NAME, '-c', str(cwd)],
+            ['tmux', '-S', sock_path, 'new-session', '-d', '-s', TMUX_SESSION_NAME, '-c', str(cwd)],
             env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         subprocess.run(
-            ['tmux', 'set-option', '-t', TMUX_SESSION_NAME, 'status', 'off'],
+            ['tmux', '-S', sock_path, 'set-option', '-t', TMUX_SESSION_NAME, 'status', 'off'],
             env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         subprocess.run(
-            ['tmux', 'set-option', '-t', TMUX_SESSION_NAME, 'history-limit', '5000'],
+            ['tmux', '-S', sock_path, 'set-option', '-t', TMUX_SESSION_NAME, 'history-limit', '5000'],
             env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
 
-    # 2. Check existing XTerm windows on X11; keep at most one, kill duplicates
-    if not env.get('DISPLAY') or not shutil.which('wmctrl'):
+    # 2. Check existing XTerm windows on X11 using xdotool/xprop (never wmctrl, which segfaults on Debian 13)
+    if not env.get('DISPLAY'):
         return
 
     try:
-        out = subprocess.check_output(
-            ['wmctrl', '-lx'],
-            env=env,
-            text=True,
-            stderr=subprocess.DEVNULL,
-            timeout=3,
-        )
-        xterm_ids = []
-        for line in out.splitlines():
-            parts = line.split(None, 4)
-            if len(parts) >= 3 and 'xterm' in parts[2].lower():
-                xterm_ids.append(parts[0])
+        from cloud_os.window_manager import list_x11_windows
 
-        if len(xterm_ids) > 1:
-            # Close all extra xterm windows beyond the first
-            for extra_wid in xterm_ids[1:]:
-                subprocess.run(
-                    ['wmctrl', '-ic', extra_wid],
+        wins = list_x11_windows(env)
+        xterm_wins = [
+            w for w in wins
+            if any(k in str(w.get('wm_class', '')).lower() for k in ('xterm', 'lxterminal'))
+            or 'terminal' in str(w.get('title', '')).lower()
+        ]
+
+        if len(xterm_wins) > 1 and shutil.which('xdotool'):
+            # Close all extra terminal windows beyond the first
+            for extra_w in xterm_wins[1:]:
+                try:
+                    int_wid = str(int(str(extra_w.get('id', '0')), 16))
+                    subprocess.run(
+                        ['xdotool', 'windowclose', int_wid],
+                        env=env,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=2,
+                    )
+                except Exception:
+                    pass
+        elif len(xterm_wins) == 0:
+            if shutil.which('lxterminal'):
+                subprocess.Popen(
+                    [
+                        'lxterminal',
+                        f'--title={TERMINAL_WINDOW_TITLE}',
+                        '--geometry=105x28',
+                        '-e', f'tmux -S "{sock_path}" attach-session -t {TMUX_SESSION_NAME}',
+                    ],
                     env=env,
+                    cwd=str(cwd),
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
+                    start_new_session=True,
                 )
-        elif len(xterm_ids) == 0 and shutil.which('xterm'):
-            subprocess.Popen(
-                [
-                    'xterm',
-                    '-xrm', 'XTerm*allowTitleOps: false',
-                    '-title', TERMINAL_WINDOW_TITLE,
-                    '-geometry', '92x26+28+36',
-                    '-bg', '#0c0c0c',
-                    '-fg', '#cccccc',
-                    '-fa', 'DejaVu Sans Mono',
-                    '-fs', '10',
-                    '-e', f'tmux attach-session -t {TMUX_SESSION_NAME}',
-                ],
-                env=env,
-                cwd=str(cwd),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+            elif shutil.which('xterm'):
+                subprocess.Popen(
+                    [
+                        'xterm',
+                        '-xrm', 'XTerm*allowTitleOps: false',
+                        '-xrm', 'XTerm*internalBorder: 10',
+                        '-xrm', 'XTerm*cursorColor: #38bdf8',
+                        '-xrm', 'XTerm*selectToClipboard: true',
+                        '-title', TERMINAL_WINDOW_TITLE,
+                        '-geometry', '104x28+24+24',
+                        '-bg', '#0b1120',
+                        '-fg', '#e2e8f0',
+                        '-fa', 'DejaVu Sans Mono',
+                        '-fs', '10',
+                        '-e', 'tmux', '-S', sock_path, 'attach-session', '-t', TMUX_SESSION_NAME,
+                    ],
+                    env=env,
+                    cwd=str(cwd),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            for _ in range(12):
+                time.sleep(0.1)
+                if any(
+                    any(k in str(w.get('wm_class', '')).lower() for k in ('xterm', 'lxterminal'))
+                    for w in list_x11_windows(env)
+                ):
+                    break
     except Exception:
         pass
 
-
-def run_in_tmux_or_subshell(
-    command: str,
-    env: Dict[str, str],
-    cwd: Path,
-    timeout_s: int = 45,
-) -> Tuple[int, str, str, str]:
-    """
-    Execute `command` while preserving working directory (`~/.local/agent_cwd`)
-    and mirroring execution to the persistent `tmux` terminal so the live desktop
-    actually shows what the agent is running in real time.
-
-    Returns `(exit_code, stdout, stderr, final_cwd)`.
-    """
-    cwd.mkdir(parents=True, exist_ok=True)
-    state_dir = Path.home() / '.local' / 'state'
-    state_dir.mkdir(parents=True, exist_ok=True)
-    cwd_file = state_dir / 'agent_cwd'
-
-    active_cwd = cwd
-    if cwd_file.exists():
-        try:
-            saved = Path(cwd_file.read_text(encoding='utf-8').strip())
-            if saved.is_dir():
-                active_cwd = saved
-        except Exception:
-            active_cwd = cwd
-
-    if os.name == 'nt':
-        completed = subprocess.run(
-            command,
-            shell=True,
-            cwd=str(active_cwd),
-            env=env,
-            text=True,
-            capture_output=True,
-            timeout=timeout_s,
-        )
-        return completed.returncode, completed.stdout or '', completed.stderr or '', str(active_cwd)
-
-    ensure_single_tmux_terminal(env, active_cwd)
-
-    # Echo the command and output banner into the tmux pane so the user watching the live desktop sees it
-    token = uuid.uuid4().hex[:8]
-    out_log = state_dir / f'cmd_{token}.out'
-    wrapped_command = (
-        f'cd "{active_cwd}" 2>/dev/null || cd "{cwd}";\n'
-        f'{command}\n'
-        f'__EC=$?;\n'
-        f'pwd > "{cwd_file}";\n'
-        f'exit $__EC\n'
-    )
-
-    try:
-        if shutil.which('tmux'):
-            preview_cmd = command.strip().replace('\n', '; ')[:120]
-            subprocess.run(
-                ['tmux', 'send-keys', '-t', TMUX_SESSION_NAME, f'# [agent] $ {preview_cmd}', 'C-m'],
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-
-        completed = subprocess.run(
-            ['/bin/bash', '-c', wrapped_command],
-            cwd=str(active_cwd),
-            env=env,
-            text=True,
-            capture_output=True,
-            timeout=timeout_s,
-        )
-        stdout = completed.stdout or ''
-        stderr = completed.stderr or ''
-        rc = int(completed.returncode)
-    except subprocess.TimeoutExpired as exc:
-        stdout = (exc.stdout or '') if isinstance(exc.stdout, str) else ''
-        stderr = ((exc.stderr or '') if isinstance(exc.stderr, str) else '') + f'\n[Timeout after {timeout_s}s]'
-        rc = 124
-    finally:
-        try:
-            out_log.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    final_cwd = str(active_cwd)
-    if cwd_file.exists():
-        try:
-            final_cwd = cwd_file.read_text(encoding='utf-8').strip() or str(active_cwd)
-        except Exception:
-            pass
-
-    # Mirror a short summary into tmux so the terminal window stays informative
-    if shutil.which('tmux'):
-        try:
-            snippet = (stdout.strip() or stderr.strip()).splitlines()
-            if snippet:
-                last_line = snippet[-1][:100].replace('"', '\\"')
-                subprocess.run(
-                    ['tmux', 'send-keys', '-t', TMUX_SESSION_NAME, f'echo "-> exit={rc} | {last_line}"', 'C-m'],
-                    env=env,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-        except Exception:
-            pass
-
-    return rc, stdout, stderr, final_cwd
-
-
-def capture_tmux_pane(env: Dict[str, str], lines: int = 35) -> str:
-    """Capture the visible scrollback of the persistent `agent` tmux session."""
-    if os.name == 'nt' or not shutil.which('tmux'):
-        return ''
-    try:
-        out = subprocess.check_output(
-            ['tmux', 'capture-pane', '-p', '-t', TMUX_SESSION_NAME, '-S', f'-{max(10, lines)}'],
-            env=env,
-            text=True,
-            stderr=subprocess.DEVNULL,
-            timeout=2,
-        )
-        return out.strip()
-    except Exception:
-        return ''

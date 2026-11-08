@@ -64,10 +64,11 @@ def list_x11_windows(env: Dict[str, str]) -> List[Dict[str, object]]:
                     title = wname
             except Exception:
                 pass
+        is_desktop_type = False
         if shutil.which('xprop'):
             try:
                 xp = subprocess.check_output(
-                    ['xprop', '-id', norm_wid, '_NET_WM_NAME', 'WM_NAME', 'WM_CLASS'],
+                    ['xprop', '-id', norm_wid, '_NET_WM_NAME', 'WM_NAME', 'WM_CLASS', '_NET_WM_WINDOW_TYPE'],
                     env=env, text=True, stderr=subprocess.DEVNULL, timeout=2,
                 )
                 for line in xp.splitlines():
@@ -79,8 +80,12 @@ def list_x11_windows(env: Dict[str, str]) -> List[Dict[str, object]]:
                         classes = re.findall(r'"([^"]+)"', line)
                         if classes:
                             wm_class = '.'.join(classes)
+                    elif '_NET_WM_WINDOW_TYPE' in line and ('_NET_WM_WINDOW_TYPE_DESKTOP' in line or '_NET_WM_WINDOW_TYPE_DOCK' in line):
+                        is_desktop_type = True
             except Exception:
                 pass
+        if is_desktop_type:
+            continue
         if shutil.which('xdotool'):
             try:
                 geom = subprocess.check_output(
@@ -96,7 +101,9 @@ def list_x11_windows(env: Dict[str, str]) -> List[Dict[str, object]]:
                 h = int(gmap.get('HEIGHT', 0))
             except Exception:
                 pass
-        if (title or wm_class) in ('Tint2', 'tint2', 'panel') or 'tint2' in wm_class.lower():
+        if (title or wm_class) in ('Tint2', 'tint2', 'panel', 'pcmanfm-desktop') or 'tint2' in wm_class.lower():
+            continue
+        if 'pcmanfm' in wm_class.lower() and w >= 1260 and h >= 740:
             continue
         is_focused = bool(active_id and norm_wid == active_id)
         raw_windows.append({
@@ -133,18 +140,18 @@ def focus_window(env: Dict[str, str], target: str) -> Optional[Dict[str, object]
     wid = str(matched['id'])
     if shutil.which('xdotool'):
         try:
+            int_id = str(int(wid, 16))
             subprocess.run(
-                ['xdotool', 'windowactivate', str(int(wid, 16))],
+                ['xdotool', 'windowactivate', int_id],
+                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2,
+            )
+            subprocess.run(
+                ['xdotool', 'windowraise', int_id],
                 env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2,
             )
             return matched
         except Exception:
             pass
-    if shutil.which('wmctrl'):
-        subprocess.run(
-            ['wmctrl', '-ia', wid],
-            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
     return matched
 
 
@@ -167,19 +174,15 @@ def close_window(env: Dict[str, str], target: str) -> Optional[Dict[str, object]
             return matched
         except Exception:
             pass
-    if shutil.which('wmctrl'):
-        subprocess.run(
-            ['wmctrl', '-ic', wid],
-            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
     return matched
 
 
-def tile_windows(env: Dict[str, str], width: int = 1280, height: int = 720) -> List[str]:
+def tile_windows(env: Dict[str, str], width: int = 1280, height: int = 720, mode: str = 'auto') -> List[str]:
     """
-    Arrange open windows cleanly on the desktop so they don't awkwardly overlap:
-    - If 1 window: center/maximize (`24,20` to `width-48, height-76`)
-    - If >=2 windows: place top-most 2 windows side by side (left half / right half)
+    Arrange open windows cleanly on the desktop:
+    - By default (`mode='auto'`), maximize the focused/top-most window to fill the workspace cleanly
+      (`16, 12` to `width-32, height-64`) so web apps and terminals have full readability.
+    - When `mode='split'` and >=2 windows exist, place top-most 2 windows side-by-side.
     """
     if os.name == 'nt':
         return []
@@ -187,14 +190,15 @@ def tile_windows(env: Dict[str, str], width: int = 1280, height: int = 720) -> L
     if not windows:
         return []
 
-    usable_h = max(400, height - 56)
+    usable_h = max(400, height - 52)
     tiled: List[str] = []
-    if len(windows) == 1:
+    if len(windows) == 1 or mode != 'split':
         w0 = windows[0]
         int_wid = str(int(str(w0['id']), 16))
         if shutil.which('xdotool'):
-            subprocess.run(['xdotool', 'windowmove', int_wid, '24', '20'], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(['xdotool', 'windowsize', int_wid, str(width - 48), str(usable_h - 24)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(['xdotool', 'windowmove', int_wid, '14', '10'], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(['xdotool', 'windowsize', int_wid, str(width - 28), str(usable_h - 14)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(['xdotool', 'windowactivate', int_wid], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         tiled.append(f"{w0['title']} (full)")
     else:
         half_w = (width - 36) // 2
@@ -203,8 +207,8 @@ def tile_windows(env: Dict[str, str], width: int = 1280, height: int = 720) -> L
         for idx, (win, x_pos) in enumerate(((left_w, 12), (right_w, 24 + half_w))):
             int_wid = str(int(str(win['id']), 16))
             if shutil.which('xdotool'):
-                subprocess.run(['xdotool', 'windowmove', int_wid, str(x_pos), '16'], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                subprocess.run(['xdotool', 'windowsize', int_wid, str(half_w), str(usable_h - 20)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(['xdotool', 'windowmove', int_wid, str(x_pos), '12'], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(['xdotool', 'windowsize', int_wid, str(half_w), str(usable_h - 16)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             tiled.append(f"{win['title']} ({'left' if idx == 0 else 'right'})")
     return tiled
 
@@ -247,38 +251,6 @@ def set_clipboard(env: Dict[str, str], text: str) -> bool:
         return True
     except Exception:
         return False
-
-
-def draw_action_crosshair(image_path: Path, x: Optional[int], y: Optional[int]) -> None:
-    """
-    Draw a high-contrast red crosshair + ring at `(x, y)` on `image_path`
-    so the Vision LLM and user have closed-loop visual feedback on pointer actions.
-    """
-    if x is None or y is None or not image_path.exists():
-        return
-    try:
-        from PIL import Image, ImageDraw
-
-        with Image.open(image_path) as im:
-            im = im.convert('RGBA')
-            overlay = Image.new('RGBA', im.size, (0, 0, 0, 0))
-            draw = ImageDraw.Draw(overlay)
-            r_outer = 14
-            r_inner = 4
-            # Outer white halo for contrast on dark backgrounds
-            draw.ellipse((x - r_outer - 1, y - r_outer - 1, x + r_outer + 1, y + r_outer + 1), outline=(255, 255, 255, 210), width=2)
-            # Red target ring
-            draw.ellipse((x - r_outer, y - r_outer, x + r_outer, y + r_outer), outline=(239, 68, 68, 245), width=2)
-            draw.ellipse((x - r_inner, y - r_inner, x + r_inner, y + r_inner), fill=(239, 68, 68, 245))
-            # Crosshair ticks
-            draw.line((x - 22, y, x - 7, y), fill=(239, 68, 68, 235), width=2)
-            draw.line((x + 7, y, x + 22, y), fill=(239, 68, 68, 235), width=2)
-            draw.line((x, y - 22, x, y - 7), fill=(239, 68, 68, 235), width=2)
-            draw.line((x, y + 7, x, y + 22), fill=(239, 68, 68, 235), width=2)
-            combined = Image.alpha_composite(im, overlay).convert('RGB')
-            combined.save(image_path, format='PNG')
-    except Exception:
-        pass
 
 
 def _get_active_window_id(env: Dict[str, str]) -> str:

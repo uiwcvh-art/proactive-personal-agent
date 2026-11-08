@@ -37,6 +37,10 @@ class SchedulerEngine:
         m_hm = re.fullmatch(r'(\d{1,2}):(\d{2})(?::(\d{2}))?', s)
         if m_hm:
             hh, mm, ss = int(m_hm.group(1)), int(m_hm.group(2)), int(m_hm.group(3) or 0)
+            if hh == 24 and mm == 0 and ss == 0:
+                hh = 0
+            if not (0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59):
+                raise ValueError(f'时间范围无效: {s}')
             target = now_dt.replace(hour=hh, minute=mm, second=ss, microsecond=0)
             if target.timestamp() <= base_ts:
                 target += timedelta(days=1)
@@ -48,32 +52,20 @@ class SchedulerEngine:
         return dt.timestamp()
 
     @classmethod
-    def extract_clock_from_goal(cls, goal: str) -> str:
-        m = re.search(r'(?:每天|每早|每晚|早上|上午|中午|下午|晚上|凌晨|定点|北京时间)?\s*(\d{1,2}):(\d{2})', goal)
-        if m:
-            hh, mm = int(m.group(1)), int(m.group(2))
-            if 0 <= hh <= 23 and 0 <= mm <= 59:
-                if any(k in goal for k in ('下午', '晚上', '每晚')) and 1 <= hh <= 11:
-                    hh += 12
-                return f'{hh:02d}:{mm:02d}'
-        return ''
-
-    @classmethod
     def compute_next_routine_run(cls, r: dict, now_ts: float | None = None) -> float:
         base_ts = now_ts if now_ts is not None else time.time()
         daily_raw = str(r.get('daily_time') or '').strip()
-        if not daily_raw:
-            inferred = cls.extract_clock_from_goal(str(r.get('goal') or ''))
-            if inferred:
-                daily_raw = inferred
-                r['daily_time'] = inferred
         if daily_raw:
             slots = []
             for part in daily_raw.split(','):
                 part = part.strip()
                 m = re.fullmatch(r'(\d{1,2}):(\d{2})(?::(\d{2}))?', part)
                 if m:
-                    slots.append((int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)))
+                    hh, mm, ss = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
+                    if hh == 24 and mm == 0 and ss == 0:
+                        hh = 0
+                    if 0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59:
+                        slots.append((hh, mm, ss))
             if slots:
                 wk_raw = str(r.get('weekdays') or '').strip().lower()
                 allowed_days = set(range(1, 8))
@@ -111,9 +103,6 @@ class SchedulerEngine:
         changed = False
         for r in routines:
             if not r.get('next_run') or (r.get('daily_time') and r.get('next_run', 0) < time.time() - 86400):
-                r['next_run'] = self.compute_next_routine_run(r)
-                changed = True
-            elif not r.get('daily_time') and self.extract_clock_from_goal(str(r.get('goal') or '')):
                 r['next_run'] = self.compute_next_routine_run(r)
                 changed = True
             mode_desc = f"每天 {r['daily_time']} (北京时间)" if r.get('daily_time') else f"每 {r.get('interval_hours', 24)} 小时"
@@ -172,8 +161,6 @@ class SchedulerEngine:
             hours = max(1, min(720, int(args.get('interval_hours') or 24)))
             bot_id = str(args.get('bot_id') or default_bot_id).strip()
             daily_time = str(args.get('daily_time') or args.get('at_time') or '').strip()
-            if not daily_time:
-                daily_time = self.extract_clock_from_goal(goal)
             weekdays = str(args.get('weekdays') or '').strip()
             item = {
                 'id': secrets.token_hex(8),
@@ -219,8 +206,11 @@ class SchedulerEngine:
                         t['goal'] = str(args['goal']).strip()[:2000]
                     if 'at_time' in args or 'daily_time' in args:
                         raw_at = str(args.get('at_time') or args.get('daily_time') or '').strip()
+                        try:
+                            t['due_at'] = self.parse_wall_time(raw_at)
+                        except Exception as e:
+                            return {'error': f'无法解析 at_time "{raw_at}"：{e}'}
                         t['at_time'] = raw_at
-                        t['due_at'] = self.parse_wall_time(raw_at)
                         t['due_at_bj'] = self.fmt_bj(t['due_at'])
                     elif 'delay_minutes' in args and args['delay_minutes'] is not None:
                         t['due_at'] = time.time() + max(1, int(args['delay_minutes'])) * 60

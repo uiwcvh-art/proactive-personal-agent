@@ -17,23 +17,26 @@ class InputAction(BaseModel):
         'click', 'double_click', 'right_click', 'move', 'hover', 'drag',
         'scroll', 'key', 'hotkey', 'type', 'launch_app', 'bash', 'batch',
         'focus_window', 'close_window', 'tile_windows', 'clipboard',
-        'click_ref', 'type_ref',
+        'click_ref', 'type_ref', 'wait', 'find_text',
     ]
-    x: int = Field(0, ge=0, lt=WIDTH)
-    y: int = Field(0, ge=0, lt=HEIGHT)
-    x2: int = Field(0, ge=0, lt=WIDTH)
-    y2: int = Field(0, ge=0, lt=HEIGHT)
+    x: int = Field(0, ge=0, le=4096)
+    y: int = Field(0, ge=0, le=4096)
+    x2: int = Field(0, ge=0, le=4096)
+    y2: int = Field(0, ge=0, le=4096)
     nx: int = Field(-1, ge=-1, le=1000)
     ny: int = Field(-1, ge=-1, le=1000)
+    nx2: int = Field(-1, ge=-1, le=1000)
+    ny2: int = Field(-1, ge=-1, le=1000)
     grid: str = Field('', max_length=16)
+    grid2: str = Field('', max_length=16)
     ref: str = Field('', max_length=32)
     target: str = Field('', max_length=200)
     text: str = Field('', max_length=16000)
     command: str = Field('', max_length=16000)
     key: str = Field('', max_length=60)
     app: str = Field('', max_length=80)
-    direction: Literal['up', 'down'] = 'down'
-    amount: int = Field(3, ge=1, le=12)
+    direction: Literal['up', 'down', 'left', 'right'] = 'down'
+    amount: int = Field(3, ge=1, le=100)
     timeout: int = Field(35, ge=1, le=120)
     steps: list[dict[str, Any]] = Field(default_factory=list, max_length=25)
     include_frame: bool = True

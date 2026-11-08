@@ -105,12 +105,13 @@ def test_primary_change_during_model_request_keeps_the_inflight_conversation(tmp
     app.state.store.update_config({'small_brain':{'api_key':'fixture','model':'fixture'}})
     entered, finish = asyncio.Event(), asyncio.Event()
     captured = []
-    async def complete(messages, tools=None, big=False):
+    async def complete(messages, tools=None, big=False, **kwargs):
         captured.append(messages)
         entered.set()
         await finish.wait()
         return {'role':'assistant','content':'给当前对话的问题'}
     app.state.brain.complete = complete
+    app.state.brain.llm.complete_silent = complete
     async def scenario():
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://test') as client:
             async def encrypted(method, path, body):
@@ -126,8 +127,8 @@ def test_primary_change_during_model_request_keeps_the_inflight_conversation(tmp
             assert first['body']['bot_id'] == 'companion'
             second = await encrypted('POST','/api/trigger-curiosity',{})
             assert second['body']['bot_id'] == 'research'
-            assert '负责研究和执行的助手' in captured[-1][0]['content']
-            assert not json.loads(captured[-1][1]['content'])
+            assert '研究助手' in captured[-1][0]['content']
+            assert '最近对话摘要' in captured[-1][1]['content']
     asyncio.run(scenario())
 
 
@@ -141,7 +142,7 @@ def test_generated_avatar_uses_the_configured_provider_and_stays_a_draft(tmp_pat
         assert request.headers['authorization'] == 'Bearer fixture-image-key'
         return httpx.Response(200, json={'data':[{'b64_json':photo().split(',')[1]}]})
     real_client = httpx.AsyncClient
-    monkeypatch.setattr(httpx, 'AsyncClient', lambda *args,**kwargs:real_client(*args,transport=httpx.MockTransport(provider),**kwargs))
+    monkeypatch.setattr(httpx, 'AsyncClient', lambda *args,**kwargs:real_client(*args,**{**kwargs,'transport':httpx.MockTransport(provider)}))
     with TestClient(app, headers={'Authorization':'Bearer test'}) as client:
         path = '/api/bots/research/avatar/generate'
         data = {'model':'fixture-image-model','prompt':'一个紫色的星球'}
@@ -150,10 +151,16 @@ def test_generated_avatar_uses_the_configured_provider_and_stays_a_draft(tmp_pat
         app.state.store.update_config({'big_brain':{'api_key':'fixture-image-key','base_url':'https://images.example/v1','model':'chat-model'}})
         generated = client.post(path,json=data)
         assert generated.status_code == 200 and generated.json()['width'] == 96
-        assert calls == [{**data,'n':1,'size':'1024x1024'}]
+        assert len(calls) == 1 and calls[0]['model'] == data['model'] and calls[0]['size'] == '1024x1024'
+        assert 'minimalist 2D Bot-style avatar' in calls[0]['prompt'] and data['prompt'] in calls[0]['prompt']
         assert not app.state.store.state['assistants'][1]['avatar_version']
         assert client.get('/api/bots/research/avatar').status_code == 404
         assert client.post(path,json={**data,'model':' '}).status_code == 422
         # Explicitly accepting the preview is the only operation that persists the picture.
         saved = client.patch('/api/bots/research/identity',json={'image':generated.json()['image']})
         assert saved.status_code == 200 and saved.json()['avatar_version']
+        # Also verify 'whale' and 'whalechan' shapes validate cleanly on IdentityInput and AssistantInput
+        whale_bot = client.patch('/api/bots/research/identity',json={'shape':'whalechan'}).json()
+        assert whale_bot['shape'] == 'whalechan'
+        whale2_bot = client.patch('/api/bots/research/identity',json={'shape':'whale'}).json()
+        assert whale2_bot['shape'] == 'whale'

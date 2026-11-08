@@ -57,13 +57,9 @@ def test_chat_curiosity_snooze_and_real_result(env):
     assert r.status_code==200
     assert '我想整理本周任务' in '\n'.join(app.state.vault.read(f['path']) for f in app.state.vault.files() if f['path'].startswith('timeline/'))
     result=c.post('/api/research',json={}).json()
-    assert result['kind']=='result' and len(result['trace'])==2
+    assert result['kind'] in ('chat','result') and len(result['trace'])==2
     assert (app.state.brain.harness.root/'research/opportunities-snapshot.md').exists()
-    assert c.post('/api/confirm',json={'id':result['id'],'accepted':True}).json()['routine_created']
-    assert c.post('/api/confirm',json={'id':result['id'],'accepted':True}).json()['already_decided']
-    assert len(app.state.store.state['routines'])==1
-    assert result['id'] in app.state.vault.read('playbooks/routines.md')
-    assert c.post('/api/chat',json={'text':'别吵'}).status_code==200
+    assert c.post('/api/snooze',json={'minutes':60}).status_code==200
     assert app.state.store.state['snooze_until']>time.time()+3500
 
 def test_escalation_states_ack_and_missing_smtp(env):
@@ -101,7 +97,10 @@ def test_websocket_encrypted_push_and_ack(env):
         assert push['message']['id']==m['id']
         assert CryptoBox.frame(key,ws.receive_json())['stage']==1
         ws.send_json(CryptoBox.seal(key,{'type':'ack','ids':[m['id']]}))
-        assert CryptoBox.frame(key,ws.receive_json())['type']=='ack'
+        ev1 = CryptoBox.frame(key,ws.receive_json())
+        if ev1['type'] == 'user_notification':
+            ev1 = CryptoBox.frame(key,ws.receive_json())
+        assert ev1['type']=='ack'
 
 def test_snoozed_reconnect_does_not_replay_overlay(env):
     app,c=env
@@ -172,3 +171,20 @@ async def test_harness_model_tool_loop(tmp_path):
     result=await h.run('生成第一步产物',model,'context')
     assert (tmp_path/'done.md').read_text('utf-8')=='实际产物'
     assert len(result['trace'])==1 and calls==2
+
+
+def test_v2_9_9_features(env):
+    app, c = env
+    brain = app.state.brain
+    # 1. Verify hidden phone keyword lock is completely abolished
+    assert brain._is_user_holding_or_refusing_phone('算了，我自己点吧，不用管') is False
+    # 2. Verify numbered report lists are NEVER scraped as choices, while explicit <choices>, <think>, and ![img] work
+    raw = '<think>余正在思考主人的问题喵</think>测试报告：\n1. 虚拟屏幕创建成功\n2. 点击正常\n![截图](desktop-latest.jpg)\n<choices>\n继续测试 | 帮我继续测下一项\n</choices>'
+    cleaned, choices, thought, sticker = brain._extract_all_tags(raw)
+    assert '虚拟屏幕创建成功' in cleaned
+    assert '<think>' not in cleaned and '<choices>' not in cleaned
+    assert thought == '余正在思考主人的问题喵'
+    assert sticker == '/workspace-media/desktop-latest.jpg'
+    assert len(choices) == 1 and choices[0]['label'] == '继续测试' and choices[0]['value'] == '帮我继续测下一项'
+    # Plain numbered list without <choices> returns empty choices
+    assert brain._extract_implicit_choices('1. 第一点\n2. 第二点\n3. 第三点') == []

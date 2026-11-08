@@ -3,7 +3,7 @@
 Android pins the server SPKI, wraps an ephemeral AES-256 key with RSA-OAEP,
 and uses distinct GCM nonces for every request, response and WS frame.
 """
-import base64, json, os, time
+import base64, hashlib, json, os, time
 from pathlib import Path
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
@@ -21,10 +21,16 @@ class CryptoBox:
             if os.name != 'nt': path.chmod(0o600)
         self.key = serialization.load_pem_private_key(path.read_bytes(), password=None)
         self.public_der = self.key.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+        self.fingerprint = hashlib.sha256(self.public_der).hexdigest()
         self.seen = {}  # Reject replayed envelopes during a process lifetime.
         self._session_keys: dict[str, tuple[bytes, float]] = {}  # Cache unwrapped AES session keys for 30 min
 
-    def public(self): return {'public_key':b64(self.public_der), 'algorithm':'RSA-OAEP-SHA256+A256GCM'}
+    def public(self):
+        return {
+            'public_key': b64(self.public_der),
+            'fingerprint': self.fingerprint,
+            'algorithm': 'RSA-OAEP-SHA256+A256GCM',
+        }
 
     def open(self, envelope):
         if len(envelope.get('data','')) > 6_000_000: raise ValueError('请求过大')

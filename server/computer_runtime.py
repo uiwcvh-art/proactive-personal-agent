@@ -1,5 +1,7 @@
 """Entry point for proactive-desktop.service, before loading the agent/browser SDK."""
 import os,sys,subprocess
+os.environ.setdefault('MALLOC_ARENA_MAX','2')
+os.environ.setdefault('MALLOC_TRIM_THRESHOLD_','65536')
 from pathlib import Path
 from computer_security import restrict_desktop
 

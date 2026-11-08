@@ -1,0 +1,10 @@
+{
+    "version_code": 60,
+    "version": "3.2.0",
+    "bytes": 21022072,
+    "versionName": "3.2.0",
+    "versionCode": 60,
+    "notes": "DSB v3.2.0 (Build 60)：删除预设模板，设置重构为极简二级子界面，清理全端 Emoji 图标，主助手统一使用紫色花朵胶囊眼头像。",
+    "version_name": "3.2.0",
+    "sha256": "a11588c30949426edaf8d19666f4bbdb600fa317814a29239950382f047e9cc4"
+}

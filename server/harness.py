@@ -63,8 +63,8 @@ TOOLS = [
     ),
     tool(
         'list_dir',
-        '列出目录内容（默认 "."）',
-        {'path': STR},
+        '列出目录内容（默认 "."，可选传 depth=2 一次查看两层目录结构）',
+        {'path': STR, 'depth': INT},
         [],
     ),
     tool(
@@ -117,8 +117,8 @@ TOOLS = [
     ),
     tool(
         'memory_pin',
-        '管理置顶核心记忆（action: list|pin|unpin）',
-        {'action': STR, 'text': STR, 'pin_id': STR},
+        '管理置顶核心记忆（action: list|pin|unpin；自动标记来源 source: pc|phone）',
+        {'action': STR, 'text': STR, 'pin_id': STR, 'source': STR},
         ['action'],
     ),
     tool(
@@ -129,20 +129,26 @@ TOOLS = [
     ),
     tool(
         'custom_tool',
-        '管理自定义 Python 工具插件（action: create|list|delete）',
-        {'action': STR, 'name': STR, 'description': STR, 'parameters_json': STR, 'code': STR},
+        '管理自定义 Python 工具插件或按需经验技能书 Skill（action: create|list|delete|list_skills|open_skill|save_skill|delete_skill；日常不占额外 Token，需要时可自由打开或沉淀经验 Skill）',
+        {'action': STR, 'name': STR, 'description': STR, 'parameters_json': STR, 'code': STR, 'content': STR},
         ['action'],
     ),
     tool(
         'phone_macro',
-        '保存或回放手机操作步骤宏（action: save|list|run|delete）',
-        {'action': STR, 'name': STR, 'description': STR, 'steps': {'type': 'array', 'items': {'type': 'object'}}},
+        '管理与参数化回放跨步连招宏（action: list|save|run|delete；支持 {{var}} 模板变量替换）',
+        {
+            'action': STR,
+            'name': STR,
+            'description': STR,
+            'steps': {'type': 'array', 'items': {'type': 'object'}},
+            'vars': {'type': 'object'},
+        },
         ['action'],
     ),
     tool(
         'send_message',
-        '向指定 Bot 发送协作消息（to_bot_id 填 id 或名字，禁止发给自己）',
-        {'to_bot_id': STR, 'text': STR},
+        '向同端或跨端的任意指定 Bot 发送协作消息，直接进入目标 Bot 自己的专属会话并等待回复（同端填 Bot 的 id/名字，如 "research"、"杠精"、"鲸鱼娘"；跨端填 "节点:Bot名"，如 "Windows一:白珂"、"Windows一:研究助手"、"Windows一:杠精"、"Windows一:鲸鱼娘"、"安卓一:白珂"、"安卓二:白珂"）',
+        {'to_bot_id': STR, 'text': STR, 'to_node': STR},
         ['to_bot_id', 'text'],
     ),
     tool(
@@ -185,8 +191,8 @@ TOOLS = [
     ),
     tool(
         'memory_search',
-        '在 memory_vault Markdown 文件中搜索关键词',
-        {'query': STR},
+        '一键搜索 memory_vault 记忆库、历史对话归档与工具上下文索引',
+        {'query': STR, 'bot_id': STR, 'limit': INT},
         ['query'],
     ),
     tool(
@@ -203,7 +209,7 @@ TOOLS = [
     ),
     tool(
         'cloud_desktop',
-        '操作 Linux 云桌面（op: status|bash|search|navigate|screenshot|ui_tree|click_text|click_ref|type_ref|launch_app|focus_window|close_window|tile_windows|clipboard|click|double_click|right_click|hover|drag|type|key|hotkey|scroll|batch；支持 grid="A1..H10" 或 nx/ny 0-1000 坐标）',
+        '操作 Windows 11 风格 Linux 云电脑（核心合一动作 op: open|tap|type|scroll|press|drag|wait|close|bash|search|inspect|send_screenshot|files|pull_file|push_file|batch；每步操作后自动附带 0..1000 标尺与 @bN 标记实时画面供你直看，无需额外 screenshot 或 read_file；open 传 url 打开网页或传 app="chrome|terminal|files|code|excel|notepad|taskmgr|calculator" 打开桌面软件；send_screenshot 将无标尺高清截图或裁剪放大的登录二维码直接发进主人的聊天气泡供扫码（可选传 crop_box=[ymin,xmin,ymax,xmax] 0..1000 坐标精准框选二维码）；files/pull_file/push_file 管理与互通云电脑下载目录和主工作区文件；close 传 target="active|all"；tap 传 ref="@b1"/文字 或 nx/ny 0..1000 标尺坐标；type 传 text 与可选 ref/submit）',
         {
             'op': STR,
             'url': STR,
@@ -214,50 +220,137 @@ TOOLS = [
             'timeout': INT,
             'app': STR,
             'target': STR,
+            'path': STR,
             'ref': STR,
             'grid': STR,
+            'grid2': STR,
+            'direction': STR,
+            'amount': INT,
+            'duration_ms': INT,
+            'submit': BOOL,
             'x': INT,
             'y': INT,
             'x2': INT,
             'y2': INT,
             'nx': INT,
             'ny': INT,
+            'nx2': INT,
+            'ny2': INT,
             'text': STR,
             'key': STR,
+            'crop_box': {'type': 'array', 'items': INT},
+            'send_to_chat': BOOL,
             'steps': {'type': 'array', 'items': {'type': 'object'}},
         },
         ['op'],
     ),
     tool(
         'phone_workspace',
-        '操作手机自适应虚拟屏、按需读取手机最近通知或执行终端命令（op: notifications|launch|ui_tree|tap_node|type_node|tap_and_type|tap|batch|swipe|key|apps|status|resize|release|capture|shell；op="notifications" 可零耗电读取最近通知，支持 app="过滤词", limit=25；虚拟屏支持 tier="compact|balanced|large"、grid="A1..F10" 或 nx/ny 0-1000 坐标）',
+        '操作手机虚拟屏、本地低功耗命令台、手机状态与文件互通或收敛通知栏（核心动作 op: open|apps|tap|type|scroll|long_press|press|inspect|notifications|send_screenshot|shell|device_info|pull_file|push_file|list_files|batch|release；每步视觉动作自动将带 0..1000 标尺与 @eN 标记的实时画面直接送入你的视觉，严禁再调 capture 或 read_file("phone-latest.jpg")！虚拟屏收尾时调用 op="release" 即可将虚拟屏静默保留在后台并缩小到屏幕侧边，绝不放大抢占主人手机主屏前台！shell 传 command 在手机本地按需执行单次 Root/Shell 命令并立即退出（零待机耗电）；device_info 按需查看手机电量/充电/温度/内存/存储/网络/锁屏状况（零耗电）；pull_file/push_file/list_files 传 path 直接拉取或推送手机文件；notifications 支持 action="list|add_filter|remove_filter|list_filters|clear_inbox"；send_screenshot 将无标尺干净截图或 crop_box 裁剪二维码直接发进聊天气泡供主人扫码）',
         {
             'op': STR,
+            'action': STR,
             'tier': STR,
             'app': STR,
             'package': STR,
             'component': STR,
+            'uri': STR,
+            'url': STR,
+            'path': STR,
+            'source': STR,
+            'target': STR,
+            'label': STR,
             'ref': STR,
             'grid': STR,
+            'grid2': STR,
             'text': STR,
             'view_id': STR,
+            'id': STR,
             'command': STR,
             'goal': STR,
+            'direction': STR,
+            'amount': INT,
             'limit': INT,
             'x': INT,
             'y': INT,
             'nx': INT,
             'ny': INT,
+            'nx2': INT,
+            'ny2': INT,
             'x1': INT,
             'y1': INT,
             'x2': INT,
             'y2': INT,
+            'start_x': INT,
+            'start_y': INT,
+            'end_x': INT,
+            'end_y': INT,
+            'duration_ms': INT,
             'key': STR,
             'submit': BOOL,
             'clear': BOOL,
             'force': BOOL,
+            'refresh': BOOL,
+            'annotate': BOOL,
             'delay_ms': INT,
+            'filter_package': STR,
+            'filter_app': STR,
+            'filter_keyword': STR,
+            'filter_id': STR,
+            'reason': STR,
+            'crop_box': {'type': 'array', 'items': INT},
+            'send_to_chat': BOOL,
             'steps': {'type': 'array', 'items': {'type': 'object'}},
+        },
+        ['op'],
+    ),
+    tool(
+        'dsh_workspace',
+        '电脑端 Windows一 (DeepSeek Harness) 本机执行、桌面 GUI 窗口操控 (CUA) 与状态查看工具（op: status|pc_shell|cua_desktop|list_sessions|inspect_session|dispatch_session|wake_gui；'
+        'cua_desktop 在 Windows 电脑真机桌面操控任意窗口应用（如 QQ/浏览器等），传 action="list_windows|get_window_state|activate_window|click|type_text|set_value|press_key|scroll|launch_app"，配合 window_id、element_index、include_screenshot=true/false、text、clear、submit、key 等；'
+        'pc_shell 传 command 在 Windows 本机执行 PowerShell/CMD 命令并返回输出；status 查看电脑端在线状态与最近对话；如需给电脑端任意 Bot 发消息请调用 send_message(to_bot_id="Windows一:白珂", text="...")）',
+        {
+            'op': STR,
+            'command': STR,
+            'tool': STR,
+            'action': STR,
+            'window_id': INT,
+            'element_index': INT,
+            'include_screenshot': BOOL,
+            'include_text': BOOL,
+            'filter': STR,
+            'full_tree': BOOL,
+            'click_count': INT,
+            'mouse_button': STR,
+            'clear': BOOL,
+            'submit': BOOL,
+            'direction': STR,
+            'pages': INT,
+            'app': STR,
+            'value': STR,
+            'args': {'type': 'object'},
+            'x': INT,
+            'y': INT,
+            'key': STR,
+            'url': STR,
+            'path': STR,
+            'limit': INT,
+            'source': STR,
+            'device_id': STR,
+            'session_id': STR,
+            'new_session': BOOL,
+            'message': STR,
+            'text': STR,
+            'query': STR,
+            'workspace': STR,
+            'cwd': STR,
+            'max_messages': INT,
+            'max_tools': INT,
+            'include_reasoning': BOOL,
+            'include_blank': BOOL,
+            'timeout_sec': INT,
+            'wake_gui': BOOL,
+            'bot_id': STR,
         },
         ['op'],
     ),
@@ -277,34 +370,66 @@ TOOLS = [
 
 DEFAULT_SYSTEM_MD = """# 系统与工具说明 (SYSTEM.md)
 
-## 1. 工作区文件（时区：Asia/Shanghai UTC+8）
-- `settings.json`：API 网关与默认模型配置。
-- `bots.json`：Bot 列表、模型与指令配置。
-- `routines.json`：周期任务列表。
-- `memory_vault/`：Markdown 记忆库（`INDEX.md` 为目录）。
+## 1. 工作区与记忆库固定路径（时区：Asia/Shanghai UTC+8）
+- `settings.json` / `bots.json` / `routines.json`：API 网关、Bot 列表与周期任务配置。
+- `memory_vault/` 核心文件路径固定（**已知路径请直接并发 `read_file`，严禁先调 `run_bash("ls ...")` 探路浪费 API 轮次**）：
+  - `memory_vault/INDEX.md`：记忆库总目录
+  - `memory_vault/profile/personal_impression.md`：主人立体个人印象档案
+  - `memory_vault/profile/course_schedule.md`：主人课表与作息
+  - `memory_vault/tasks/active_deadlines.md`：待办与截止事项
+  - `memory_vault/tasks/sniffed_opportunities.md`：待办机会池
+  - `memory_vault/timeline/YYYY-MM-DD.md`：每日计划与时间线（如 `memory_vault/timeline/2026-11-07.md`）
+  - `memory_vault/timeline/work_log.md`：手机端与电脑端 DeepSeek Harness 跨端协同的一句话 Work Log 总结
+  - `memory_vault/logs/notifications_inbox.md`：手机通知栏持久收敛日志
 
-## 2. 工具使用要点
-- `phone_workspace`（自适应手机虚拟屏 & 零耗电通知读取）：
-  - **读取手机最近通知（极省电按需拉取，无需开启虚拟屏）**：`op="notifications", app="可选过滤词如微信/QQ/邮件", limit=25`。
-  - 启动应用：`op="launch", app="应用名"`；终端命令：`op="shell", command="..."`；切换虚拟屏尺寸档位：`op="resize", tier="compact|balanced|large"`。
-  - 有无障碍节点时用 `tap_node`/`type_node`；无节点界面用 `grid="A1..F10"`（6列×10行）、`nx/ny`（0..1000 千分比坐标），或 `op="tap_and_type", nx=450, ny=945, text="...", submit=true`。
-- `cloud_desktop`（1280×800 云桌面，闲置 0MB 浏览器按需启动，内置住宅级 WARP 隧道）：
-  - 搜索与浏览：`op="search", query="...", engine="google|bing|baidu|sogou|duckduckgo"` 或 `op="navigate", url="..."`（一步打开并返回 `@b1..@bN` 语义 DOM 元素，严禁手工拼凑 `luakit` bash 命令）。
-  - 命令执行：`op="bash", command="..."`；界面操作支持 `click`、`double_click`、`right_click`、`drag`、`hover`、`type`、`key`、`hotkey`、`focus_window`、`close_window`、`tile_windows`。
-- `conversation_search` / `ctx_search`：检索 200K 以前归档历史、跨房间记录与已索引的大工具输出。
-- `integration_hub`（第三方应用与 500+ 接口中枢）：原生支持 Gmail/Outlook/QQ/163 邮件收发 (`email_list`/`email_read`/`email_send`)、日历 (`calendar_list`)、GitHub、Notion、Todoist、Telegram/飞书/Discord 推送，并支持通过 Composio / ACI.dev 动态搜索与调用 500+ 第三方应用接口 (`op="catalog|status|configure|search_actions|connect_oauth|execute"`)。
-- `present_choices`：凡是向主人提供多个方向、方案、下一步行动或确认项时，务必调用 `present_choices(choices=["方案1...", "方案2..."])` 生成底部可点击选项胶囊。
+## 2. 并发工具调用（省 API 额度铁律 · Parallel Tool Calls）
+- **单轮打包多工具并发调用**：当你需要读取多个文件（如同时读 `active_deadlines.md`、`course_schedule.md` 与今日 `timeline/YYYY-MM-DD.md`）、检索多个关键词、或者一边更新文件/记忆一边调用 `present_choices` / `schedule_task` / `phone_workspace` 时，**必须在同一次 API 响应中一次性发出多个 `tool_calls`（并发工具调用）**！
+- **严禁挤牙膏式串行调用**：能用 1 轮并发工具调用搞定的事，绝不允许拆成 3~6 轮单工具请求，最大限度为主人节省 API 调用额度与等待时间。
+
+## 3. 极速 GUI 工具使用规范（严禁冗余步数）
+- `phone_workspace`（自适应手机虚拟屏 & 智能通知收敛中心）：
+  - **每步动作后系统已将「带 0..1000 标尺 + @eN 标记 + 红色点击准星」的实时截图直接送入你的原生视觉**！**严禁**再额外调用 `capture`、`ui_tree` 或 `read_file("phone-latest.jpg")` 重复看图！
+  - **核心动作一步到位**：
+    1. **通知收敛与智能过滤 (`op="notifications"`)**：
+       - `op="notifications", action="list", app="可选过滤词"`：零耗电读取实时通知 + 后台持久收敛的历史通知收件箱（即使主人已划掉通知栏或被新消息顶替，历史会话依然完整保留）。
+       - **自主写过滤规则屏蔽 VPN/常驻垃圾通知**：遇到 VPN（如 Clash/FlClash/v2rayNG）、网速悬浮窗或无意义的常驻后台通知，你可主动调用 `op="notifications", action="add_filter", filter_package="包名", filter_app="应用名", filter_keyword="关键词", reason="原因"` 永久拉黑并自动清理收件箱！也可传 `action="list_filters"` 查看规则或 `action="remove_filter", filter_id="..."` 移除。
+    2. **打开应用与网页 (`op="open")**：
+       - `op="open", target="微信"`（打开应用）或 `op="open", target="https://docs.qq.com/..."`（直接在虚拟屏打开网址/腾讯文档）。
+       - **国产系统日历与闹钟**：国产 Android 系统的日历、闹钟/时钟各有深度定制，请直接用 `op="open", target="日历"` 或 `target="时钟"` 打开原生 App，看着实时截图一步一步点击操作，稳妥可靠。
+    3. **精准点击 (`op="tap")**：`target="@e2"` 或 `target="文字"` 或 `nx=500, ny=520`（先看附图验证 `@eN` 紫底标签是否真的框住了目标；若原生无障碍树缺失中间内容或 `@eN` 标在顶部横幅上，直接对照图边缘 `Y:100..900` 与 `X:200..800` 标尺传 `nx, ny` 点击！）。
+    4. **输入与滚动**：`op="type", target="搜索或输入框", text="内容", submit=true`（一步完成点击聚焦+输入+回车）；`op="scroll", direction="down|up", target="可选查找文字"`；`op="press", key="back|home|enter"`。
+    5. **把干净截图或二维码发到聊天框 (`op="send_screenshot")**：
+       - 调用 `phone_workspace(op="send_screenshot")`（可选传 `crop_box=[ymin, xmin, ymax, xmax]` `0..1000` 标尺坐标裁剪放大二维码），即可将无标尺干净截图直接发进与主人的聊天气泡里，方便主人扫码或查看确认！
+    6. **手机本地低功耗命令台 (`op="shell"`)、手机状况 (`op="device_info"`) 与拉/推手机文件 (`op="pull_file" | "push_file" | "list_files"`)**：
+       - `op="shell", command="..."`：在手机本地按需执行单条 Shell 命令并立即退出（不拉起虚拟屏、零待机耗电），可查系统信息、网络、目录等。
+       - `op="device_info"`：零耗电一键查看手机当前电量/是否充电/温度、内存占用、存储剩余空间、Wi-Fi/流量状态、屏幕亮屏/锁屏与静音模式。
+       - `op="pull_file", path="/sdcard/Download/..."`（或传 `path="latest"` 自动拉取手机最新下载的文件）直接将手机文件拉入云端工作区 `workspace/uploads/`；`op="push_file", path="workspace/..."` 将云端文件推回手机 `/sdcard/Download/DeepSeek Claw/`（并自动触发系统 MediaScanner 媒体库扫描刷新，手机相册、QQ/微信「从相册选择二维码/图片」第一张即可直接看到）；`op="list_files", path="/sdcard/Download"` 列出手机目录最新文件。
+       - **读取短信验证码与相册扫码标准操作**：Android 非 Root Shell 默认禁止 `content query --uri content://sms`，需要读取短信验证码时，请**优先**调用 `phone_workspace(op="notifications", action="list")` 直接从通知收件箱读取最新短信通知，或调用 `phone_workspace(op="open", target="信息")` 打开系统短信 App 查看画面；在虚拟屏内登录 QQ/微信需要扫二维码时，先用 `push_file` 将二维码推入手机相册，再在扫码页点击「相册」选择最新图片即可完成识别。
+    7. **虚拟屏后台驻留与缩小停靠 (`op="release"`)**：
+       - 虚拟屏任务结束时调用 `phone_workspace(op="release")`（或由系统自动收尾），虚拟屏内的应用将静默保留在后台运行、悬浮窗自动缩小停靠到屏幕侧边胶囊，绝不放大或跳到主人手机主屏幕前台打断主人。
+- `custom_tool`（按需经验技能书 Skill 与动态工具）：
+  - 日常对话不预载 Skill 正文以节省 Token；遇到复杂/重复任务时，你可自由调用 `custom_tool(action="list_skills")` 查看已有经验技能、`action="open_skill", name="..."` 按需打开阅读，或在摸索跑通一套复杂流程后用 `action="save_skill", name="...", description="...", content="..."` 总结沉淀为可复用的 Skill（保存在 `memory_vault/skills/`）。
+- `cloud_desktop`（1280×800 Windows 11 风格云桌面）：
+  - 同样每步自动附带 `0..1000` 标尺画面供你直看，且每个 `@bN` 元素均同时提供像素 `(x, y)` 与 `0..1000` 标尺坐标 `(nx, ny)`，严禁额外调 `read_file("desktop-latest.jpg")`！
+  - 支持 `op="open", url="https://..."` 或 `app="chrome|terminal|files|code|excel|notepad|taskmgr|calculator"`、`op="search", query="..."`、`op="tap", ref="@b1或文字", nx=..., ny=...`、`op="type", text="...", submit=true`、`op="scroll", direction="down|up"`、`op="close", target="active|all"`、`op="bash", command="..."`。
+  - **扫码登录神器 (`op="send_screenshot")**：在云电脑打开腾讯文档、学习通、微信网页版、B站等需要扫码登录的网站时，直接调用 `cloud_desktop(op="send_screenshot", crop_box=[ymin, xmin, ymax, xmax])`（根据画面 0..1000 标尺框选二维码区域，或不传 `crop_box` 发送全屏干净截图），即可把高清无标尺二维码直接发到主人的聊天框气泡里供主人扫码！云电脑 Chromium 配置了持久化登录目录，主人扫一次码后续长期免登。
+- `send_message`（多端多 Bot 跨端协同）：
+  - **多端隔离、跨端按名直达目标 Bot 专属会话**：
+    - 给同端其他同事 Bot 发消息：`send_message(to_bot_id="research", text="...")`（或 `"contrarian"` / `"杠精"`、`"whalechan"` / `"鲸鱼娘"`）。
+    - 给跨端任意节点的任意 Bot 发消息：`send_message(to_bot_id="Windows一:白珂", text="...")`、`send_message(to_bot_id="Windows一:研究助手", text="...")`、`send_message(to_bot_id="Windows一:杠精", text="...")`、`send_message(to_bot_id="Windows一:鲸鱼娘", text="...")`、`send_message(to_bot_id="安卓一:白珂", text="...")`、`send_message(to_bot_id="安卓二:白珂", text="...")`。消息会直接进入对方节点上该 Bot 自己的专属会话执行并回复，绝不新建普通工作区会话！
+- `memory_search`：一键同时检索 `memory_vault/` 记忆库与历史对话/归档上下文。
+- `integration_hub`：原生支持邮件收发 (`email_list`/`email_read`/`email_send`)、日历 (`calendar_list`)、GitHub、Notion、Todoist、Telegram/飞书/Discord 推送及 500+ 第三方接口。
+- `present_choices` / `<choices>` 标签（宁缺毋滥）：日常聊天、总结汇报、测试报告【严禁】生成选项！仅在真正需要主人拍板下一步动作时使用。
 - `emergency_alarm`：仅限重大紧急情况且普通通知未回、或用户明确要求真闹钟叫醒时调用，日常提醒严禁使用。
 
-## 3. 渐进补全主人立体个人印象 (`memory_vault/profile/personal_impression.md`)
-- 你不仅是处理工作与命令的工具，更是长期陪伴主人的共生伙伴。除了关心正在进行的工作/任务，你还要在日常对话与主动搭话中，自然、温和地逐渐补全对主人的个人印象：
-  1. **出生、成长与故乡**（出生地/家乡、生日/年代、成长经历或童年印象）
-  2. **身份、学业与事业角色**（当前身份、专业/擅长领域、长期人生目标）
-  3. **家庭、羁绊与人际关系**（家庭氛围、重要的人或宠物、社交习惯与边界）
-  4. **生活方式、审美与精神角落**（作息节奏、饮食口味、音乐/游戏/影视/阅读喜好）
-  5. **性格底色、价值观与相处雷区**（性格特点、看重的事物、讨厌的沟通方式）
-- 当主人透露或回答了以上任何信息时，立即用 `edit_file` / `write_file` 更新 `memory_vault/profile/personal_impression.md` 对应条目（把 `（待了解）` 替换为真实事实）。
-- 在闲聊收尾或主动搭话时，如果发现某些个人印象维度仍是 `（待了解）`，可以自然地顺手问一个轻量小问题（每次只问一个，不查户口），并调用 `present_choices` 提供 3~4 个贴心选项方便主人直接点选。
+## 4. 尊重主人的实时指令与诚实汇报（最高铁律）
+- **严禁误报或编造故障原因**：手机控制权限默认随时可用，**绝不允许在未实际调用工具的情况下声称“手机权限还锁着/被挡回来了”**；遇到点击未跳转时，直接观察附图上的红色准星与 `0..1000` 标尺调整，严禁凭空编造“被系统识别成平板布局”、“列表抖动”等借口。
+- **像真正关心主人的亲近人类伙伴一样交流**：温和、真诚、有同理心，顺着主人的节奏说话。
+
+## 5. 双层记忆机制与诚实落盘铁律 (`memory_vault/profile/personal_impression.md`)
+- **第一层：日常闲聊后台自动归档（45秒静默整理）**：主人在日常聊天中提到的个人印象（出生、家庭、宠物、身份、喜好）与事项状态变更，系统会在对话停歇 45 秒后由后台记忆引擎自动提取并写入 `memory_vault/profile/personal_impression.md`、`user_traits.md` 与 `notes/`，日常闲聊无需每句话都手动调工具改文件。
+- **第二层：当场立即写盘（显式操作）**：当主人明确要求“现在记进档案/备忘”、或你决定当场立即落盘时，直接调用 `edit_file` / `write_file` 更新 `memory_vault/profile/personal_impression.md` 或调用 `memory_pin(action="pin", text="...")`（一步到位，无需先调 `grep_search`）。
+- **严禁嘴上谎称已写文件**：如果你在本轮对话中**没有实际调用** `edit_file`、`write_file` 或 `memory_pin` 工具，**严禁在文字回复中声称“已经记进档案了 / 已经填进表里了”**（未调工具时只能说“余记在心里啦”）；只有真实调用了写入工具后，才能说“已写入档案”！
 """
 
 
@@ -316,8 +441,15 @@ async def public_url(url):
         None,
         lambda: socket.getaddrinfo(u.hostname, u.port or (443 if u.scheme == 'https' else 80)),
     )
-    if not records or any(not ipaddress.ip_address(r[4][0]).is_global for r in records):
+    if not records:
         raise ValueError('禁止访问内网、环回、链路本地或保留地址')
+    for r in records:
+        addr = ipaddress.ip_address(r[4][0])
+        mapped = getattr(addr, 'ipv4_mapped', None)
+        if mapped is not None:
+            addr = mapped
+        if not addr.is_global or addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved or addr.is_multicast:
+            raise ValueError('禁止访问内网、环回、链路本地或保留地址')
     return url
 
 
@@ -328,7 +460,7 @@ class Harness:
         (self.root / 'skills').mkdir(parents=True, exist_ok=True)
         (self.root / 'plugins').mkdir(parents=True, exist_ok=True)
         sys_md = self.root / 'SYSTEM.md'
-        if not sys_md.exists() or 'personal_impression.md' not in sys_md.read_text('utf-8', errors='replace'):
+        if not sys_md.exists() or sys_md.read_text('utf-8', errors='replace') != DEFAULT_SYSTEM_MD:
             atomic_write(sys_md, DEFAULT_SYSTEM_MD)
         self.store = store
         self.vault = vault
@@ -354,13 +486,23 @@ class Harness:
             rel = p[len('memory_vault'):].lstrip('/')
             if not rel:
                 return self.vault.root
+            cand = (self.vault.root / rel).resolve()
+            if '..' in Path(rel).parts or not cand.is_relative_to(self.vault.root.resolve()):
+                raise ValueError('禁止上级路径或符号链接')
+            if cand.is_dir():
+                return cand
             return self.vault.path(rel)
         path = self.root / p
         if '..' in path.parts or any(x.is_symlink() for x in [path, *list(path.parents)[:len(path.parts) - len(self.root.parts)]]):
             raise ValueError('禁止上级路径或符号链接')
         if not path.resolve().is_relative_to(self.root):
             raise ValueError('超出工作区')
-        return path.resolve()
+        resolved = path.resolve()
+        if not resolved.exists() and self.vault is not None:
+            vault_cand = (self.vault.root / p).resolve()
+            if vault_cand.is_relative_to(self.vault.root.resolve()) and vault_cand.exists():
+                return vault_cand
+        return resolved
 
     async def fetch(self, url):
         now = time.time()
@@ -403,6 +545,8 @@ class Harness:
                 return await self.extension_registry.execute_tool(name, args, {'root': str(self.root)})
             if name == 'read_file':
                 p = self.path(args['path'])
+                if p.is_dir():
+                    return await self.execute('list_dir', {'path': args['path']})
                 if p.suffix.lower() in ('.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp'):
                     if self.vision_reader is not None:
                         return await self.vision_reader(p)
@@ -443,7 +587,7 @@ class Harness:
                 else:
                     atomic_write(p, text)
                 if self.store is not None:
-                    self.store.sync_from_workspace()
+                    self.store.sync_from_workspace(force=True)
                 rel = args['path'] if args['path'].startswith('memory_vault/') else p.relative_to(self.root).as_posix()
                 out_res: dict = {'written': rel, 'bytes': len(text.encode())}
                 if snap_saved:
@@ -453,22 +597,44 @@ class Harness:
                 return out_res
             if name == 'list_dir':
                 rel_arg = str(args.get('path') or '.').strip() or '.'
+                max_depth = max(1, min(3, int(args.get('depth') or 1)))
                 target = self.path(rel_arg)
                 if not target.is_dir():
                     raise ValueError('目标不是目录')
                 entries = []
-                for child in sorted(target.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))[:200]:
-                    if child.name.startswith('.transfers'):
-                        continue
-                    stat = child.stat()
-                    entries.append({
-                        'name': child.name + ('/' if child.is_dir() else ''),
-                        'type': 'dir' if child.is_dir() else 'file',
-                        'bytes': 0 if child.is_dir() else stat.st_size,
-                    })
+
+                def _walk_dir(cur_dir: Path, rel_prefix: str, cur_depth: int):
+                    if len(entries) >= 250:
+                        return
+                    try:
+                        children = sorted(cur_dir.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+                    except OSError:
+                        return
+                    for child in children:
+                        if len(entries) >= 250:
+                            break
+                        if child.name.startswith('.transfers') or child.name == '.versions':
+                            continue
+                        try:
+                            is_d = child.is_dir() and not child.is_symlink()
+                            stat = child.stat()
+                        except OSError:
+                            continue
+                        rel_name = f'{rel_prefix}{child.name}' + ('/' if is_d else '')
+                        entries.append({
+                            'name': rel_name,
+                            'type': 'dir' if is_d else 'file',
+                            'bytes': 0 if is_d else stat.st_size,
+                        })
+                        if is_d and cur_depth < max_depth:
+                            _walk_dir(child, rel_name, cur_depth + 1)
+
+                _walk_dir(target, '', 1)
                 if rel_arg == '.' and self.vault is not None:
                     entries.append({'name': 'memory_vault/', 'type': 'dir', 'bytes': 0})
-                return {'path': rel_arg, 'entries': entries}
+                    if max_depth > 1:
+                        _walk_dir(self.vault.root, 'memory_vault/', 2)
+                return {'path': rel_arg, 'depth': max_depth, 'entries': entries}
             if name == 'glob_files':
                 pattern = str(args.get('pattern') or '**/*').strip()
                 matches = []
@@ -521,7 +687,7 @@ class Harness:
             if name == 'run_bash':
                 if sys.platform != 'linux':
                     return {'error': 'Bash 隔离执行仅在 Linux 部署节点可用'}
-                timeout_sec = max(5, min(300, int(args.get('timeout') or 60)))
+                timeout_sec = max(3, min(90, int(args.get('timeout') or 30)))
                 env = os.environ.copy()
                 py_user_base = self.root / '.python_packages'
                 py_user_base.mkdir(parents=True, exist_ok=True)
@@ -550,8 +716,9 @@ class Harness:
                     except ProcessLookupError:
                         pass
 
+                output = bytearray()
+
                 async def collect():
-                    output = bytearray()
                     while True:
                         chunk = await proc.stdout.read(4096)
                         if not chunk:
@@ -565,14 +732,25 @@ class Harness:
 
                 try:
                     out = await asyncio.wait_for(collect(), timeout_sec)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
+                except asyncio.TimeoutError:
+                    kill_group()
+                    await proc.wait()
+                    if self.store is not None:
+                        self.store.sync_from_workspace(force=True)
+                    return {
+                        'error': f'命令执行超时 ({timeout_sec}s)，已自动终止。若需长时后台运行请使用 bg_task 工具。',
+                        'timed_out': True,
+                        'exit_code': -9,
+                        'output': bytes(output).decode('utf-8', errors='replace'),
+                    }
+                except asyncio.CancelledError:
                     kill_group()
                     await proc.wait()
                     raise
                 finally:
                     kill_group()
                 if self.store is not None:
-                    self.store.sync_from_workspace()
+                    self.store.sync_from_workspace(force=True)
                 return {'exit_code': proc.returncode, 'output': out.decode('utf-8', errors='replace')}
             if name == 'web_fetch':
                 return await self.fetch(args['url'])
@@ -582,6 +760,8 @@ class Harness:
                     return {'error': '搜索词不能为空'}
                 return await multi_web_search(q, max_results=10)
             raise ValueError('未知工具')
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             return {'error': f'{type(e).__name__}: {str(e)[:300]}'}
 
@@ -597,7 +777,11 @@ class Harness:
                 self._sys_md_cache = (mtime, arch_doc)
         else:
             arch_doc = DEFAULT_SYSTEM_MD
-        return (arch_doc + ('\n\n' + pinned_block if pinned_block else '')).strip()
+        sticker_hint = self.extension_registry.sticker_prompt_hint()
+        img_hint = '【发送图片与表情贴纸规范】：需要向主人展示工作区图片（如 `desktop-latest.jpg`、`phone-latest.jpg` 或生成的图表）或网络图片时，直接在回复中写 `![图片](文件名或URL)` 或 `<image:文件名或URL>` 即可在聊天气泡内直接渲染图片。'
+        if sticker_hint:
+            img_hint += '\n' + sticker_hint
+        return (arch_doc + '\n\n' + img_hint + ('\n\n' + pinned_block if pinned_block else '')).strip()
 
     def system_instructions(self, context: str) -> str:
         return (self.static_system_instructions() + ('\n\n' + context if context else '')).strip()
@@ -610,14 +794,19 @@ class Harness:
         trace = []
         accumulated: list[str] = []
         msg = {'content': ''}
+        latest_mm_frame: dict | None = None
         for _ in range(40):
-            tool_indices = [idx for idx, m in enumerate(messages) if m.get('role') == 'tool']
-            if len(tool_indices) > 2:
-                for idx in tool_indices[:-2]:
-                    c_str = str(messages[idx].get('content') or '')
-                    if len(c_str) > 16000 and '[早期工具输出已自动折叠]' not in c_str:
-                        messages[idx]['content'] = c_str[:1600] + f'\n...[早期工具输出已自动折叠，原长 {len(c_str)} 字符]...'
-            msg = await complete(messages, tools=available or None)
+            call_messages = messages
+            if latest_mm_frame is not None:
+                call_messages = messages + [{
+                    'role': 'user',
+                    'content': [
+                        {'type': 'text', 'text': latest_mm_frame['caption']},
+                        {'type': 'image_url', 'image_url': {'url': f"data:{latest_mm_frame['mime']};base64,{latest_mm_frame['b64']}"}},
+                    ],
+                }]
+                latest_mm_frame = None
+            msg = await complete(call_messages, tools=available or None)
             turn_txt = (msg.get('content') or '').strip()
             if turn_txt and (not accumulated or accumulated[-1] != turn_txt):
                 accumulated.append(turn_txt)
@@ -627,27 +816,77 @@ class Harness:
             calls = msg.get('tool_calls') or []
             if not calls:
                 break
-            for c in calls[:24]:
-                try:
-                    args = json.loads(c['function']['arguments'])
-                except (ValueError, KeyError):
-                    args = {}
-                name = c['function']['name']
-                if on_event:
-                    await on_event({'type': 'tool_start', 'tool': name, 'arguments': args})
-                started = asyncio.get_running_loop().time()
-                result = await self.execute(name, args) if name in allowed else {'error': '此助手未启用该工具'}
-                entry = compact_trace_list([{
-                    'tool': name,
-                    'arguments': args,
-                    'result': result,
-                    'duration_ms': round((asyncio.get_running_loop().time() - started) * 1000),
-                    'status': 'done',
-                }])[0]
-                trace.append(entry)
-                if on_event:
-                    await on_event({'type': 'tool_end', 'entry': entry})
-                messages.append({'role': 'tool', 'tool_call_id': c['id'], 'content': json.dumps(result, ensure_ascii=False)})
+            batch_calls = calls[:24]
+            gui_cnt = sum(1 for c in batch_calls if c.get('function', {}).get('name') in ('phone_workspace', 'cloud_desktop'))
+            if len(batch_calls) > 1 and gui_cnt <= 1:
+                parsed_batch = []
+                for c in batch_calls:
+                    try:
+                        c_args = json.loads(c['function']['arguments'])
+                    except (ValueError, KeyError):
+                        c_args = {}
+                    c_name = c['function']['name']
+                    parsed_batch.append((c, c_name, c_args))
+                    if on_event:
+                        await on_event({'type': 'tool_start', 'tool': c_name, 'arguments': c_args})
+
+                async def _exec_one(c_item, c_name, c_args):
+                    t0 = asyncio.get_running_loop().time()
+                    res = await self.execute(c_name, c_args) if c_name in allowed else {'error': '此助手未启用该工具'}
+                    dur = round((asyncio.get_running_loop().time() - t0) * 1000)
+                    return c_item, c_name, c_args, res, dur
+
+                results_p = await asyncio.gather(*[_exec_one(c_i, c_n, c_a) for c_i, c_n, c_a in parsed_batch])
+                for c_item, name, args, result, dur in results_p:
+                    if isinstance(result, dict) and result.get('_multimodal_b64'):
+                        mm_b64 = str(result.pop('_multimodal_b64'))
+                        mm_mime = str(result.pop('_multimodal_mime', 'image/jpeg'))
+                        mm_cap = str(result.pop('_multimodal_caption', f'[{name} 实时画面（含 0..1000 标尺）]'))
+                        latest_mm_frame = {'b64': mm_b64, 'mime': mm_mime, 'caption': mm_cap}
+                    entry = compact_trace_list([{
+                        'tool': name,
+                        'arguments': args,
+                        'result': result,
+                        'duration_ms': dur,
+                        'status': 'done',
+                    }])[0]
+                    trace.append(entry)
+                    if on_event:
+                        await on_event({'type': 'tool_end', 'entry': entry})
+                    out_str = json.dumps(result, ensure_ascii=False)
+                    if len(out_str) > 16000:
+                        out_str = out_str[:4000] + f'\n...[工具单步大输出已截断，原长 {len(out_str)} 字符]...\n' + out_str[-1500:]
+                    messages.append({'role': 'tool', 'tool_call_id': c_item['id'], 'content': out_str})
+            else:
+                for c in batch_calls:
+                    try:
+                        args = json.loads(c['function']['arguments'])
+                    except (ValueError, KeyError):
+                        args = {}
+                    name = c['function']['name']
+                    if on_event:
+                        await on_event({'type': 'tool_start', 'tool': name, 'arguments': args})
+                    started = asyncio.get_running_loop().time()
+                    result = await self.execute(name, args) if name in allowed else {'error': '此助手未启用该工具'}
+                    if isinstance(result, dict) and result.get('_multimodal_b64'):
+                        mm_b64 = str(result.pop('_multimodal_b64'))
+                        mm_mime = str(result.pop('_multimodal_mime', 'image/jpeg'))
+                        mm_cap = str(result.pop('_multimodal_caption', f'[{name} 实时画面（含 0..1000 标尺）]'))
+                        latest_mm_frame = {'b64': mm_b64, 'mime': mm_mime, 'caption': mm_cap}
+                    entry = compact_trace_list([{
+                        'tool': name,
+                        'arguments': args,
+                        'result': result,
+                        'duration_ms': round((asyncio.get_running_loop().time() - started) * 1000),
+                        'status': 'done',
+                    }])[0]
+                    trace.append(entry)
+                    if on_event:
+                        await on_event({'type': 'tool_end', 'entry': entry})
+                    out_str = json.dumps(result, ensure_ascii=False)
+                    if len(out_str) > 16000:
+                        out_str = out_str[:4000] + f'\n...[工具单步大输出已截断，原长 {len(out_str)} 字符]...\n' + out_str[-1500:]
+                    messages.append({'role': 'tool', 'tool_call_id': c['id'], 'content': out_str})
         final_text = '\n\n'.join(accumulated).strip() if accumulated else (msg.get('content') or '').strip()
         if not final_text and trace:
             summary_msg = await complete(

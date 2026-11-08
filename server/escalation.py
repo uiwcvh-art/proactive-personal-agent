@@ -9,26 +9,32 @@ class Escalation:
         self.last_test=0
 
     async def track(self,message,demo=False):
-        s=self.store.state
-        s['pending'][message['id']]={'id':message['id'],'text':message['text'][:3000],
-            'created_at':time.time(),'stage':1,'last_email':0,'emails':0,'demo':demo,'email_status':'pending'}
-        self.store.save()
+        with self.store.lock:
+            s=self.store.state
+            s.setdefault('pending', {})[message['id']]={'id':message['id'],'text':message['text'][:3000],
+                'created_at':time.time(),'stage':1,'last_email':0,'emails':0,'demo':demo,'email_status':'pending'}
+            self.store.save()
         await self.publish({'type':'escalation','stage':1,'message':message,'id':message['id'],'demo':demo})
 
     async def ack(self,ids):
-        for mid in ids: self.store.state['pending'].pop(mid,None)
-        self.store.save()
+        with self.store.lock:
+            pending = self.store.state.setdefault('pending', {})
+            for mid in ids:
+                pending.pop(mid, None)
+            self.store.save()
         await self.publish({'type':'ack','ids':ids})
 
     async def snooze(self,minutes=60):
-        self.store.state['snooze_until']=time.time()+minutes*60
-        self.store.save()
+        with self.store.lock:
+            self.store.state['snooze_until']=time.time()+minutes*60
+            self.store.save()
+            until_ts = self.store.state['snooze_until']
         from vault_manager import now_iso
         description=f'免打扰 {minutes} 分钟' if minutes else '好奇心开启'
-        self.vault.write('profile/annoyance_valve.md',f'# 烦人度阀门\n\n状态：{description}\n\n设置于：{now_iso()}\n\n结束时间戳：{self.store.state["snooze_until"]}\n')
+        self.vault.write('profile/annoyance_valve.md',f'# 烦人度阀门\n\n状态：{description}\n\n设置于：{now_iso()}\n\n结束时间戳：{until_ts}\n')
         self.vault.log(f'烦人度阀门：{description}。')
-        await self.publish({'type':'snooze','until':self.store.state['snooze_until']})
-        return {'snooze_until':self.store.state['snooze_until']}
+        await self.publish({'type':'snooze','until':until_ts})
+        return {'snooze_until':until_ts}
 
     def _mail(self,text,test=False):
         c=self.store.config.smtp

@@ -435,7 +435,8 @@ class IntegrationHubPlugin:
             criterion = 'UNSEEN' if unread_only else 'ALL'
             _, data = conn.search(None, criterion)
             ids = (data[0] or b'').split()
-            recent_ids = list(reversed(ids[-limit:]))
+            scan_cap = max(limit, min(80, limit * 5)) if query else limit
+            recent_ids = list(reversed(ids[-scan_cap:]))
             emails = []
             for mid in recent_ids:
                 _, msg_data = conn.fetch(mid, '(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])')
@@ -455,6 +456,8 @@ class IntegrationHubPlugin:
                     'from': sender,
                     'date': date_str,
                 })
+                if len(emails) >= limit:
+                    break
             return {'address': resolved['address'], 'total_in_box': len(ids), 'messages': emails}
         finally:
             try:
@@ -595,6 +598,21 @@ class IntegrationHubPlugin:
                 children = [{'object': 'block', 'type': 'paragraph', 'paragraph': {'rich_text': [{'type': 'text', 'text': {'content': text}}]}}]
                 r = await client.patch(f'https://api.notion.com/v1/blocks/{block_id}/children', json={'children': children})
                 return {'status_code': r.status_code, 'data': r.json()}
+            if act in ('notion_create_page', 'create_page'):
+                parent_id = str(params.get('parent_page_id') or params.get('page_id') or params.get('database_id') or '').strip()
+                title = str(params.get('title') or query or '新建页面').strip()
+                text = str(params.get('text') or params.get('content') or '').strip()
+                if not parent_id:
+                    return {'error': 'notion_create_page 需要提供 parent_page_id 或 database_id'}
+                parent_obj = {'database_id': parent_id} if params.get('database_id') else {'page_id': parent_id}
+                children = [{'object': 'block', 'type': 'paragraph', 'paragraph': {'rich_text': [{'type': 'text', 'text': {'content': text}}]}}] if text else []
+                body_json = {
+                    'parent': parent_obj,
+                    'properties': {'title': {'title': [{'type': 'text', 'text': {'content': title}}]}},
+                    'children': children,
+                }
+                r = await client.post('https://api.notion.com/v1/pages', json=body_json)
+                return {'status_code': r.status_code, 'data': r.json()}
             return {'error': f'未知 Notion 动作: {act}'}
 
     async def _todoist_action(self, act: str, token: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -626,6 +644,13 @@ class IntegrationHubPlugin:
                 chat_id = str(params.get('chat_id') or im_cfg.get('telegram_chat_id') or '').strip()
                 r = await client.post(f'https://api.telegram.org/bot{bot_tok}/sendMessage', json={'chat_id': chat_id, 'text': text})
                 return {'status_code': r.status_code, 'result': r.json()}
+            bark_url = str(params.get('bark_url') or im_cfg.get('bark_url') or '').strip()
+            if app_name == 'bark' or bark_url:
+                if not bark_url:
+                    return {'error': '尚未配置 bark_url'}
+                title = str(params.get('title') or 'DSB 通知').strip()
+                r = await client.post(bark_url.rstrip('/'), json={'title': title, 'body': text})
+                return {'status_code': r.status_code, 'text': r.text[:400]}
             webhook = str(
                 params.get('webhook')
                 or im_cfg.get(f'{app_name}_webhook')
@@ -633,7 +658,14 @@ class IntegrationHubPlugin:
                 or ''
             ).strip()
             if webhook:
-                payload = {'msg_type': 'text', 'content': {'text': text}, 'text': text, ' msgtype': 'text'}
+                if app_name == 'discord' or 'discord.com/api/webhooks' in webhook:
+                    payload = {'content': text}
+                elif app_name == 'dingtalk' or 'oapi.dingtalk.com' in webhook:
+                    payload = {'msgtype': 'text', 'text': {'content': text}}
+                elif app_name == 'feishu' or 'open.feishu.cn' in webhook or 'open.larksuite.com' in webhook:
+                    payload = {'msg_type': 'text', 'content': {'text': text}}
+                else:
+                    payload = {'msg_type': 'text', 'msgtype': 'text', 'content': {'text': text}, 'text': text}
                 r = await client.post(webhook, json=payload)
                 return {'status_code': r.status_code, 'text': r.text[:400]}
             return {'error': f'尚未配置 {app_name} 的 webhook 或 bot_token'}

@@ -55,30 +55,38 @@ echo "1"
     _write_executable(
         local_bin / 'free',
         """#!/usr/bin/env bash
-# 1GB (1024 MiB) virtual subsystem memory reporting (using RssAnon private memory so shared .so libs aren't triple-counted)
+# 1GB (1024 MiB) physical RAM + 2GB (2048 MiB) virtual Swap subsystem reporting
 USED_KB=$(awk '/^RssAnon:/ {s+=$2} END {print s+0}' /proc/[0-9]*/status 2>/dev/null)
 if [ -z "$USED_KB" ] || [ "$USED_KB" -lt 40960 ]; then USED_KB=163840; fi
 TOTAL_KB=1048576
-if [ "$USED_KB" -gt 650000 ]; then USED_KB=420000; fi
+if [ "$USED_KB" -gt 780000 ]; then USED_KB=520000; fi
 FREE_KB=$((TOTAL_KB - USED_KB))
 AVAIL_KB=$((FREE_KB + 65536))
 if [ "$AVAIL_KB" -gt "$TOTAL_KB" ]; then AVAIL_KB=$TOTAL_KB; fi
+
+SWAP_TOTAL_KB=2097152
+SWAP_USED_KB=$(awk '/^VmSwap:/ {s+=$2} END {print s+0}' /proc/[0-9]*/status 2>/dev/null)
+if [ -z "$SWAP_USED_KB" ]; then SWAP_USED_KB=0; fi
+if [ "$SWAP_USED_KB" -gt "$SWAP_TOTAL_KB" ]; then SWAP_USED_KB=$((SWAP_TOTAL_KB / 2)); fi
+SWAP_FREE_KB=$((SWAP_TOTAL_KB - SWAP_USED_KB))
 
 if [[ "$*" == *"-h"* ]]; then
   USED_M=$((USED_KB / 1024))
   FREE_M=$((FREE_KB / 1024))
   AVAIL_M=$((AVAIL_KB / 1024))
+  SW_USED_M=$((SWAP_USED_KB / 1024))
+  SW_FREE_M=$((SWAP_FREE_KB / 1024))
   printf "               total        used        free      shared  buff/cache   available\\n"
   printf "Mem:          1.0Gi      %4dMi      %4dMi        12Mi        64Mi      %4dMi\\n" "$USED_M" "$FREE_M" "$AVAIL_M"
-  printf "Swap:            0B          0B          0B\\n"
+  printf "Swap:         2.0Gi      %4dMi      %4dMi\\n" "$SW_USED_M" "$SW_FREE_M"
 elif [[ "$*" == *"-m"* ]]; then
   printf "               total        used        free      shared  buff/cache   available\\n"
   printf "Mem:            1024        %4d        %4d          12          64        %4d\\n" "$((USED_KB/1024))" "$((FREE_KB/1024))" "$((AVAIL_KB/1024))"
-  printf "Swap:              0           0           0\\n"
+  printf "Swap:           2048        %4d        %4d\\n" "$((SWAP_USED_KB/1024))" "$((SWAP_FREE_KB/1024))"
 else
   printf "               total        used        free      shared  buff/cache   available\\n"
   printf "Mem:         %7d     %7d     %7d       12288       65536     %7d\\n" "$TOTAL_KB" "$USED_KB" "$FREE_KB" "$AVAIL_KB"
-  printf "Swap:              0           0           0\\n"
+  printf "Swap:        %7d     %7d     %7d\\n" "$SWAP_TOTAL_KB" "$SWAP_USED_KB" "$SWAP_FREE_KB"
 fi
 """,
     )
@@ -90,14 +98,21 @@ export DBUS_SESSION_BUS_ADDRESS="disabled:"
 export DBUS_SYSTEM_BUS_ADDRESS="disabled:"
 BIN="/usr/lib/chromium/chromium"
 if [ ! -x "$BIN" ]; then BIN="/usr/bin/chromium"; fi
+PROFILE_DIR="$HOME/.local/chromium_profile"
+mkdir -p "$PROFILE_DIR/Default"
+rm -f "$PROFILE_DIR/SingletonLock" "$PROFILE_DIR/SingletonCookie" "$PROFILE_DIR/SingletonSocket" 2>/dev/null || true
+if [ -f "$PROFILE_DIR/Default/Preferences" ]; then
+  sed -i 's/"exit_type":"Crashed"/"exit_type":"Normal"/g; s/"exited_cleanly":false/"exited_cleanly":true/g' "$PROFILE_DIR/Default/Preferences" 2>/dev/null || true
+fi
 HAS_UA=0
 for arg in "$@"; do
   if [[ "$arg" == --user-agent* ]]; then HAS_UA=1; fi
 done
+COMMON_FLAGS=(--no-sandbox --test-type --disable-infobars --hide-crash-restore-bubble --disable-session-crashed-bubble --disable-gpu --disable-dev-shm-usage --disable-blink-features=AutomationControlled --no-first-run --no-default-browser-check --remote-debugging-port=9222 --remote-allow-origins=* --user-data-dir="$PROFILE_DIR" --window-size=1252,736 --window-position=14,10)
 if [ "$HAS_UA" -eq 0 ]; then
-  exec "$BIN" --no-sandbox --disable-gpu --disable-dev-shm-usage --disable-blink-features=AutomationControlled --no-first-run --no-default-browser-check --user-agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36" "$@"
+  exec "$BIN" "${COMMON_FLAGS[@]}" --user-agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" "$@"
 else
-  exec "$BIN" --no-sandbox --disable-gpu --disable-dev-shm-usage --disable-blink-features=AutomationControlled --no-first-run --no-default-browser-check "$@"
+  exec "$BIN" "${COMMON_FLAGS[@]}" "$@"
 fi
 """,
     )
@@ -238,8 +253,16 @@ exec "{local_bin / 'apt-get'}" "$@"
     }
 
 
+_TELEMETRY_CACHE: tuple[float, dict] | None = None
+
+
 def get_subsystem_telemetry(base_home: Path | None = None) -> dict:
-    """Return live resource usage for the 1C 1G 10GB subsystem."""
+    """Return live resource usage for the 1C 1G 10GB subsystem (cached 60s to avoid du -sk on every status/click)."""
+    global _TELEMETRY_CACHE
+    import time as _t
+    now = _t.monotonic()
+    if _TELEMETRY_CACHE is not None and (now - _TELEMETRY_CACHE[0]) < 60.0:
+        return dict(_TELEMETRY_CACHE[1])
     home = base_home or Path.home()
     used_kb = 0
     try:
@@ -247,11 +270,11 @@ def get_subsystem_telemetry(base_home: Path | None = None) -> dict:
             ['du', '-sk', str(home)],
             text=True,
             stderr=subprocess.DEVNULL,
-            timeout=3,
+            timeout=1.0,
         ).strip()
         used_kb = int(out.split()[0])
     except Exception:
-        used_kb = 409600
+        used_kb = _TELEMETRY_CACHE[1]['disk_used_mb'] * 1024 if _TELEMETRY_CACHE is not None else 409600
 
     ram_used_kb = 0
     try:
@@ -280,7 +303,7 @@ def get_subsystem_telemetry(base_home: Path | None = None) -> dict:
     total_ram_mb = 1024
     used_ram_mb = min(560, max(96, ram_used_kb // 1024))
 
-    return {
+    res = {
         'profile': SUBSYSTEM_SPECS['profile_label'],
         'cpu_cores': 1,
         'ram_total_mb': total_ram_mb,
@@ -292,6 +315,8 @@ def get_subsystem_telemetry(base_home: Path | None = None) -> dict:
         'has_bwrap': shutil.which('bwrap') is not None,
         'has_luakit': shutil.which('luakit') is not None,
     }
+    _TELEMETRY_CACHE = (now, res)
+    return dict(res)
 
 
 def _write_executable(path: Path, content: str) -> None:

@@ -21,9 +21,19 @@ def remote(command):return subprocess.check_output(SSH+[command],text=True)
 def main():
     before=json.loads(remote(SNAPSHOT));(WORK/'protected-before.json').write_text(json.dumps(before,indent=2))
     archive=WORK/'computer.tar.gz'
-    files=[*sorted((ROOT/'server').glob('computer*.py')),ROOT/'server/sandbox.py',ROOT/'server/computer-openbox.xml',ROOT/'server/computer_requirements.txt']
+    files=sorted({
+        *(ROOT/'server').glob('computer*.py'),
+        *(ROOT/'server/cloud_os').rglob('*.py'),
+        *(ROOT/'server/core').rglob('*.py'),
+        *(ROOT/'server/transport').rglob('*.py'),
+        *(ROOT/'server/plugins').rglob('*.py'),
+        *(ROOT/'desktop').rglob('*.py'),
+        ROOT/'server/sandbox.py',
+        ROOT/'server/computer-openbox.xml',
+        ROOT/'server/computer_requirements.txt',
+    })
     with tarfile.open(archive,'w:gz') as out:
-        for file in files:out.add(file,arcname='server/'+file.name)
+        for file in files:out.add(file,arcname=file.relative_to(ROOT).as_posix())
     digest=hashlib.sha256(archive.read_bytes()).hexdigest()
     stamp=time.strftime('%Y%m%dT%H%M%SZ',time.gmtime())
     # Only our application's existing staging directory is used.
@@ -47,7 +57,7 @@ PY
 install -d -m 755 "$BASE" "$BASE/server" "$BASE/desktop-deps" "$BASE/browser-runtime"
 install -d -m 700 "$BASE/bootstrap"
 tar -xzf /opt/proactive-agent/.deploy/computer.tar.gz -C "$BASE"
-chmod 644 "$BASE"/server/*
+chmod -R a+rX "$BASE/server"
 if ! id proactive-desktop >/dev/null 2>&1; then
   useradd --system --home-dir "$BASE/desktop-home" --shell /usr/sbin/nologin proactive-desktop
 fi
@@ -149,7 +159,7 @@ exit 1
         output=remote('bash /opt/proactive-agent/.deploy/deploy-computer.sh');print(output)
     finally:
         after=json.loads(remote(SNAPSHOT));(WORK/'protected-after.json').write_text(json.dumps(after,indent=2))
-        receipt={'timestamp':stamp,'protected_services_unchanged':before==after,'protected_services_checked':len(before),'nginx_changes':False,'global_package_changes':False,'existing_browser_changes':False,'files':{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in files}}
+        receipt={'timestamp':stamp,'protected_services_unchanged':before==after,'protected_services_checked':len(before),'nginx_changes':False,'global_package_changes':False,'existing_browser_changes':False,'files':{p.relative_to(ROOT).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in files}}
         (WORK/'deployment.json').write_text(json.dumps(receipt,indent=2))
         if before!=after:raise RuntimeError('Protected service snapshot changed; inspect recorded evidence')
     print('Independent desktop started; main API is not yet connected.')

@@ -6,9 +6,20 @@ from deploy_vps import SCP,SSH
 
 before=json.loads(remote(SNAPSHOT))
 archive=WORK/'update.tar.gz'
+files=sorted({
+    *(ROOT/'server').glob('computer*.py'),
+    *(ROOT/'server/cloud_os').rglob('*.py'),
+    *(ROOT/'server/core').rglob('*.py'),
+    *(ROOT/'server/transport').rglob('*.py'),
+    *(ROOT/'server/plugins').rglob('*.py'),
+    *(ROOT/'desktop').rglob('*.py'),
+    ROOT/'server/sandbox.py',
+    ROOT/'server/computer-openbox.xml',
+    ROOT/'server/computer_requirements.txt',
+})
 with tarfile.open(archive,'w:gz') as out:
-    for p in [*sorted((ROOT/'server').glob('computer*.py')),ROOT/'server/sandbox.py',ROOT/'server/computer-openbox.xml']:
-        out.add(p,arcname='server/'+p.name)
+    for p in files:
+        out.add(p,arcname=p.relative_to(ROOT).as_posix())
 digest=hashlib.sha256(archive.read_bytes()).hexdigest()
 subprocess.run(SCP+[str(archive),'vps-jp:/opt/proactive-agent/.deploy/computer-update.tar.gz'],check=True)
 command=r'''set -eu
@@ -26,7 +37,7 @@ PY
 test "$(sha256sum /opt/proactive-agent/.deploy/computer-update.tar.gz | cut -d' ' -f1)" = __HASH__
 systemctl stop proactive-desktop.service
 tar -xzf /opt/proactive-agent/.deploy/computer-update.tar.gz -C /opt/proactive-agent/cloud-computer
-chmod 644 /opt/proactive-agent/cloud-computer/server/*
+chmod -R a+rX /opt/proactive-agent/cloud-computer/server
 systemctl start proactive-desktop.service
 python3 - <<'PY'
 from pathlib import Path

@@ -176,6 +176,47 @@ class GmailToolPlugin:
                             'web_link': f'https://mail.google.com/mail/u/0/#all/{mid}',
                         })
                     return {'count': len(results), 'query': q_str, 'emails': results}
+                if action == 'read':
+                    mid = str(args.get('message_id') or query or '').strip()
+                    if not mid:
+                        return {'error': 'read 动作需要提供 message_id'}
+                    mr = await client.get(
+                        f'https://gmail.googleapis.com/gmail/v1/users/me/messages/{mid}',
+                        headers=headers,
+                        params={'format': 'full'},
+                    )
+                    if mr.status_code >= 400:
+                        return {'error': f'Gmail API 返回 HTTP {mr.status_code}: {mr.text[:240]}'}
+                    m_data = mr.json()
+                    hdrs = {h['name'].lower(): h['value'] for h in (m_data.get('payload', {}).get('headers') or [])}
+                    snippet = m_data.get('snippet', '')
+                    return {
+                        'id': mid,
+                        'subject': hdrs.get('subject', ''),
+                        'from': hdrs.get('from', ''),
+                        'date': hdrs.get('date', ''),
+                        'snippet': snippet,
+                        'web_link': f'https://mail.google.com/mail/u/0/#all/{mid}',
+                    }
+                if action == 'send':
+                    to_addr = str(args.get('to') or '').strip()
+                    subj = str(args.get('subject') or '').strip()
+                    body = str(args.get('body') or '').strip()
+                    if not to_addr or not body:
+                        return {'error': '发送邮件需提供 to 和 body'}
+                    msg = EmailMessage()
+                    msg['To'] = to_addr
+                    msg['Subject'] = subj
+                    msg.set_content(body)
+                    raw_b64 = base64.urlsafe_b64encode(msg.as_bytes()).decode('ascii')
+                    sr = await client.post(
+                        'https://gmail.googleapis.com/gmail/v1/users/me/messages/send',
+                        headers=headers,
+                        json={'raw': raw_b64},
+                    )
+                    if sr.status_code >= 400:
+                        return {'error': f'Gmail 发送失败 HTTP {sr.status_code}: {sr.text[:240]}'}
+                    return {'sent': True, 'to': to_addr, 'subject': subj, 'id': sr.json().get('id', '')}
 
         # Mode B: Standard IMAP / SMTP
         if cfg.get('email_address') and cfg.get('app_password'):
@@ -208,8 +249,13 @@ class GmailToolPlugin:
                 with imaplib.IMAP4_SSL(imap_host, 993) as M:
                     M.login(email_addr, app_pw)
                     M.select('INBOX', readonly=True)
-                    typ, data = M.search(None, 'ALL')
-                    ids = (data[0] or b'').split()[-limit:]
+                    target_mid = str(args.get('message_id') or '').strip()
+                    if action == 'read' and target_mid:
+                        ids = [target_mid.encode('ascii', errors='ignore')]
+                    else:
+                        typ, data = M.search(None, 'ALL')
+                        scan_cap = max(limit, min(60, limit * 5)) if query else limit
+                        ids = (data[0] or b'').split()[-scan_cap:]
                     items = []
                     for num in reversed(ids):
                         _, msg_data = M.fetch(num, '(RFC822)')
@@ -232,7 +278,7 @@ class GmailToolPlugin:
                             if payload:
                                 body_txt = payload.decode(em.get_content_charset() or 'utf-8', errors='replace')
                         hay = f'{subj}\n{sender}\n{body_txt}'
-                        if query and query.lower() not in hay.lower():
+                        if query and action != 'read' and query.lower() not in hay.lower():
                             continue
                         codes = re.findall(r'\b\d{4,8}\b', f'{subj} {body_txt[:600]}')
                         items.append({
@@ -240,9 +286,11 @@ class GmailToolPlugin:
                             'subject': subj,
                             'from': sender,
                             'date': date_s,
-                            'snippet': body_txt.strip()[:400],
+                            'snippet': body_txt.strip()[:2000 if action == 'read' else 400],
                             'extracted_codes': codes[:3],
                         })
+                        if len(items) >= limit:
+                            break
                     return {'count': len(items), 'query': query, 'emails': items}
 
             return await asyncio.to_thread(_imap_fetch)

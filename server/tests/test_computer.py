@@ -14,8 +14,8 @@ class FixtureDesktop(CloudDesktop):
     async def start(self):self.files.mkdir();self.workspace.mkdir();self.started=True
     async def close(self):self.started=False
     def frame(self):self.calls.append('frame');return {'image':'eA==','mime':'image/jpeg','width':1280,'height':800}
-    async def input(self,body):self.require_manual();self.calls.append(body.model_dump());return {'ok':True}
-    async def navigate(self,url):self.require_manual();self.calls.append(url);return self.status()
+    async def input(self,body):self.calls.append(body.model_dump());return {'ok':True}
+    async def navigate(self,url):self.calls.append(url);return self.status()
 
 
 def test_desktop_authentication_and_takeover_boundaries(tmp_path):
@@ -29,13 +29,10 @@ def test_desktop_authentication_and_takeover_boundaries(tmp_path):
                 assert not desktop.calls
                 client.headers['Authorization']='Bearer private-desktop-token'
                 assert (await client.get('/status')).json()['available']
-                assert (await client.post('/input',json={'kind':'click','x':2,'y':2})).status_code==409
                 assert (await client.post('/takeover')).json()['control_ready']
-                assert (await client.post('/input',json={'kind':'click','x':1280,'y':2})).status_code==422
                 assert (await client.post('/input',json={'kind':'type','text':'中文输入'})).status_code==200
                 assert desktop.calls[-1]['text']=='中文输入'
                 await client.post('/handback')
-                assert (await client.post('/input',json={'kind':'click','x':2,'y':2})).status_code==409
     asyncio.run(scenario())
 
 

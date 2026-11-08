@@ -19,8 +19,14 @@ from typing import Any
 
 
 class ContextSearchEngine:
-    OFFLOAD_THRESHOLD_CHARS = 12_000
+    OFFLOAD_THRESHOLD_CHARS = 4_800
     CHUNK_SIZE_CHARS = 1_200
+    MAX_TRANSIENT_TOOL_CONTEXTS = 50
+    TRANSIENT_TOOL_TTL_SECONDS = 48 * 3600
+    MAX_ARCHIVE_CONTEXTS = 100
+    ARCHIVE_TTL_SECONDS = 90 * 86400
+    MAX_MESSAGES_STORE = 1500
+    BLACKBOARD_TTL_SECONDS = 14 * 86400
 
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
@@ -28,7 +34,13 @@ class ContextSearchEngine:
         self._lock = threading.Lock()
         self._indexed_msg_ids: set[str] = set()
         self._fts5_available = False
+        self._write_ops_since_prune = 0
+        self._last_prune_ts = 0.0
         self._init_db()
+        try:
+            self.prune_and_optimize(force_vacuum=False)
+        except Exception:
+            pass
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=10.0, check_same_thread=False)
@@ -190,14 +202,23 @@ class ContextSearchEngine:
         q = (query or '').strip()
         if not q:
             return []
-        terms = [t.strip() for t in re.split(r'[\s,，。；;、|]+', q) if t.strip()]
-        # Also split mixed CJK / English tokens for higher recall
+        terms = [t.strip() for t in re.split(r'[\s,，。；;、|？！?!：:]+', q) if t.strip()]
+        # Split mixed CJK / English tokens and extract CJK sliding bigrams/trigrams for high Chinese recall
         extra: list[str] = []
+        stop_chars = set('的了是在有和与或把被让给向从到对为着过吗呢吧啊呀哦哈嘛什么怎么哪里哪个多少')
         for t in terms:
-            for sub in re.findall(r'[a-zA-Z0-9_.-]{2,}|[\u4e00-\u9fff]{2,6}', t):
+            for sub in re.findall(r'[a-zA-Z0-9_.-]{2,}|[\u4e00-\u9fff]{2,8}', t):
                 if sub not in terms and sub not in extra:
                     extra.append(sub)
-        return (terms + extra)[:10]
+                if '\u4e00' <= sub[0] <= '\u9fff' and len(sub) > 2:
+                    cleaned_cjk = ''.join(ch for ch in sub if ch not in stop_chars)
+                    if len(cleaned_cjk) >= 2 and cleaned_cjk not in terms and cleaned_cjk not in extra:
+                        extra.append(cleaned_cjk)
+                    for i in range(len(sub) - 1):
+                        bg = sub[i:i + 2]
+                        if not any(ch in stop_chars for ch in bg) and bg not in terms and bg not in extra:
+                            extra.append(bg)
+        return (terms + extra)[:12]
 
     def conversation_search(
         self,
@@ -347,6 +368,8 @@ class ContextSearchEngine:
         ctx_id = custom_ctx_id or ('ctx-' + secrets.token_hex(4))
         now = time.time()
         args_json = json.dumps(args or {}, ensure_ascii=False)[:1000]
+        # Store only a short preview in tool_contexts.full_text because full verbatim lines are stored in tool_chunks.
+        preview_text = full_text[:1200]
         chunks: list[tuple[int, str, str]] = []
         lines = full_text.splitlines()
         cur_lines: list[str] = []
@@ -371,12 +394,25 @@ class ContextSearchEngine:
         with self._lock:
             conn = self._connect()
             try:
+                # Deduplicate identical transient tool invocations so repeated read_file / ui_tree calls don't pile up
+                if not custom_ctx_id and tool_name != 'compaction_archive':
+                    dup_rows = conn.execute(
+                        'SELECT ctx_id FROM tool_contexts WHERE bot_id = ? AND tool_name = ? AND args_json = ?',
+                        (bot_id, tool_name, args_json),
+                    ).fetchall()
+                    for dr in dup_rows:
+                        old_cid = str(dr['ctx_id'])
+                        conn.execute('DELETE FROM tool_contexts WHERE ctx_id = ?', (old_cid,))
+                        conn.execute('DELETE FROM tool_chunks WHERE ctx_id = ?', (old_cid,))
+                        if self._fts5_available:
+                            conn.execute('DELETE FROM tool_chunks_fts WHERE ctx_id = ?', (old_cid,))
+
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO tool_contexts(ctx_id, bot_id, tool_name, args_json, full_text, total_chars, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (ctx_id, bot_id, tool_name, args_json, full_text, len(full_text), now),
+                    (ctx_id, bot_id, tool_name, args_json, preview_text, len(full_text), now),
                 )
                 conn.execute('DELETE FROM tool_chunks WHERE ctx_id = ?', (ctx_id,))
                 if self._fts5_available:
@@ -392,8 +428,15 @@ class ContextSearchEngine:
                             (ctx_id, str(c_idx), tool_name, hdr, body),
                         )
                 conn.commit()
+                self._write_ops_since_prune += 1
             finally:
                 conn.close()
+
+        if self._write_ops_since_prune >= 25 or (now - self._last_prune_ts) >= 1800:
+            try:
+                self.prune_and_optimize(force_vacuum=False)
+            except Exception:
+                pass
         return ctx_id
 
     def maybe_offload_tool_output(self, tool_name: str, args: dict, result: Any, bot_id: str = 'companion', turn_id: str = '', **kwargs) -> str:
@@ -424,9 +467,9 @@ class ContextSearchEngine:
             'ctx_id': ctx_id,
             'tool': tool_name,
             'total_chars': len(serialized),
-            'head_preview': serialized[:3600],
+            'head_preview': serialized[:1800],
             'key_highlights': key_lines[:15],
-            'tail_preview': serialized[-1600:],
+            'tail_preview': serialized[-900:],
             'ctx_search_hint': f'该工具完整输出共 {len(serialized)} 字符，已自动存入本地 FTS5 索引库 (ctx_id="{ctx_id}")。如需查阅中间任意细节，请直接调用 ctx_search(query="关键词", ctx_id="{ctx_id}")。',
         }
         return json.dumps(digest, ensure_ascii=False)
@@ -571,3 +614,185 @@ class ContextSearchEngine:
                 return {'deleted': True, 'key': k}
             finally:
                 conn.close()
+
+    def prune_and_optimize(self, force_vacuum: bool = False) -> dict:
+        """
+        Automatic TTL & capacity pruning for SQLite FTS5 ContextSearchEngine:
+        1. Deduplicates identical transient `(bot_id, tool_name, args_json)` tool_contexts and shrinks legacy oversized `full_text` blobs.
+        2. Prunes transient tool outputs older than `TRANSIENT_TOOL_TTL_SECONDS` (48h) or beyond `MAX_TRANSIENT_TOOL_CONTEXTS` (50).
+        3. Preserves `compaction_archive` records up to `ARCHIVE_TTL_SECONDS` (90d) / `MAX_ARCHIVE_CONTEXTS` (100).
+        4. Prunes stale error messages (>3d) and bounds non-summary `messages_store` to `MAX_MESSAGES_STORE` (1500).
+        5. Runs FTS5 `optimize`, `PRAGMA optimize`, WAL checkpoint, and controlled `VACUUM`.
+        """
+        now = time.time()
+        self._last_prune_ts = now
+        self._write_ops_since_prune = 0
+        before_bytes = self.db_path.stat().st_size if self.db_path.exists() else 0
+        deleted_contexts = 0
+        deleted_messages = 0
+        shrunk_blobs = 0
+        need_vacuum = bool(force_vacuum)
+
+        with self._lock:
+            conn = self._connect()
+            try:
+                # 1. Shrink legacy full_text column in tool_contexts (chunks already hold verbatim text)
+                cur = conn.execute(
+                    'UPDATE tool_contexts SET full_text = substr(full_text, 1, 1200) WHERE length(full_text) > 1200'
+                )
+                shrunk_blobs = int(cur.rowcount or 0)
+                if shrunk_blobs > 0:
+                    need_vacuum = True
+
+                # 2. Deduplicate transient tool_contexts with identical (bot_id, tool_name, args_json), keeping newest
+                cur = conn.execute(
+                    """
+                    DELETE FROM tool_contexts
+                    WHERE tool_name != 'compaction_archive'
+                      AND ctx_id NOT IN (
+                          SELECT ctx_id FROM (
+                              SELECT ctx_id,
+                                     ROW_NUMBER() OVER (PARTITION BY bot_id, tool_name, args_json ORDER BY created_at DESC) AS rn
+                              FROM tool_contexts
+                              WHERE tool_name != 'compaction_archive'
+                          ) WHERE rn = 1
+                      )
+                    """
+                )
+                deleted_contexts += int(cur.rowcount or 0)
+
+                # 3. Prune expired or excess transient tool_contexts
+                transient_cutoff = now - self.TRANSIENT_TOOL_TTL_SECONDS
+                cur = conn.execute(
+                    """
+                    DELETE FROM tool_contexts
+                    WHERE tool_name != 'compaction_archive'
+                      AND (
+                          created_at < ?
+                          OR ctx_id NOT IN (
+                              SELECT ctx_id FROM tool_contexts
+                              WHERE tool_name != 'compaction_archive'
+                              ORDER BY created_at DESC
+                              LIMIT ?
+                          )
+                      )
+                    """,
+                    (transient_cutoff, self.MAX_TRANSIENT_TOOL_CONTEXTS),
+                )
+                deleted_contexts += int(cur.rowcount or 0)
+
+                # 4. Bound compaction_archive records to 90 days / 100 entries
+                archive_cutoff = now - self.ARCHIVE_TTL_SECONDS
+                cur = conn.execute(
+                    """
+                    DELETE FROM tool_contexts
+                    WHERE tool_name = 'compaction_archive'
+                      AND (
+                          created_at < ?
+                          OR ctx_id NOT IN (
+                              SELECT ctx_id FROM tool_contexts
+                              WHERE tool_name = 'compaction_archive'
+                              ORDER BY created_at DESC
+                              LIMIT ?
+                          )
+                      )
+                    """,
+                    (archive_cutoff, self.MAX_ARCHIVE_CONTEXTS),
+                )
+                deleted_contexts += int(cur.rowcount or 0)
+
+                # 5. Clean orphaned tool_chunks and tool_chunks_fts
+                cur_ch = conn.execute(
+                    'DELETE FROM tool_chunks WHERE ctx_id NOT IN (SELECT ctx_id FROM tool_contexts)'
+                )
+                if int(cur_ch.rowcount or 0) > 0:
+                    need_vacuum = True
+                if self._fts5_available:
+                    conn.execute(
+                        'DELETE FROM tool_chunks_fts WHERE ctx_id NOT IN (SELECT ctx_id FROM tool_contexts)'
+                    )
+
+                # 6. Prune stale error messages (>3d) & bound non-summary messages_store
+                err_cutoff = now - 3 * 86400
+                cur_m1 = conn.execute(
+                    "DELETE FROM messages_store WHERE kind = 'error' AND created_at < ?",
+                    (err_cutoff,),
+                )
+                deleted_messages += int(cur_m1.rowcount or 0)
+
+                cur_m2 = conn.execute(
+                    """
+                    DELETE FROM messages_store
+                    WHERE kind != 'compact_summary'
+                      AND msg_id NOT IN (
+                          SELECT msg_id FROM messages_store
+                          WHERE kind != 'compact_summary'
+                          ORDER BY created_at DESC
+                          LIMIT ?
+                      )
+                    """,
+                    (self.MAX_MESSAGES_STORE,),
+                )
+                deleted_messages += int(cur_m2.rowcount or 0)
+
+                if deleted_messages > 0:
+                    need_vacuum = True
+                    if self._fts5_available:
+                        conn.execute(
+                            'DELETE FROM messages_fts WHERE msg_id NOT IN (SELECT msg_id FROM messages_store)'
+                        )
+                    cur_ids = conn.execute('SELECT msg_id FROM messages_store')
+                    self._indexed_msg_ids = {str(r['msg_id']) for r in cur_ids.fetchall()}
+
+                # 7. Prune expired blackboard entries (>14d) or excess (>50)
+                bb_cutoff = now - self.BLACKBOARD_TTL_SECONDS
+                conn.execute(
+                    """
+                    DELETE FROM blackboard
+                    WHERE updated_at < ?
+                       OR key NOT IN (
+                           SELECT key FROM blackboard ORDER BY updated_at DESC LIMIT 50
+                       )
+                    """,
+                    (bb_cutoff,),
+                )
+
+                # 8. Optimize FTS5 indexes
+                if self._fts5_available:
+                    try:
+                        conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('optimize')")
+                        conn.execute("INSERT INTO tool_chunks_fts(tool_chunks_fts) VALUES('optimize')")
+                    except sqlite3.Error:
+                        pass
+                try:
+                    conn.execute('PRAGMA optimize;')
+                except sqlite3.Error:
+                    pass
+                conn.commit()
+
+                freelist = int((conn.execute('PRAGMA freelist_count;').fetchone() or [0])[0])
+                if deleted_contexts > 0 or freelist > 48 or before_bytes > 4_500_000:
+                    need_vacuum = True
+            finally:
+                conn.close()
+
+            if need_vacuum:
+                vconn = sqlite3.connect(str(self.db_path), timeout=15.0, isolation_level=None)
+                try:
+                    vconn.execute('VACUUM;')
+                    vconn.execute('PRAGMA wal_checkpoint(TRUNCATE);')
+                except sqlite3.Error:
+                    pass
+                finally:
+                    vconn.close()
+
+        after_bytes = self.db_path.stat().st_size if self.db_path.exists() else 0
+        return {
+            'before_bytes': before_bytes,
+            'after_bytes': after_bytes,
+            'freed_bytes': max(0, before_bytes - after_bytes),
+            'deleted_contexts': deleted_contexts,
+            'deleted_messages': deleted_messages,
+            'shrunk_blobs': shrunk_blobs,
+            'vacuumed': need_vacuum,
+        }

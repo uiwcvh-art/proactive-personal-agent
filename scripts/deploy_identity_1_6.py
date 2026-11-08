@@ -18,7 +18,17 @@ def main():
     apk=ROOT/'android/app/build/outputs/apk/release/app-release.apk'
     assert hashlib.sha256(apk.read_bytes()).hexdigest()==progress['apk_sha256']
     archive=WORK/'identity-server-1.6.tar.gz'
-    files=sorted((ROOT/'server').glob('*.py'))+[ROOT/'server/requirements.txt']
+    files=sorted({
+        *(ROOT/'server').glob('*.py'),
+        *(ROOT/'server/core').rglob('*.py'),
+        *(ROOT/'server/transport').rglob('*.py'),
+        *(ROOT/'server/plugins').rglob('*.py'),
+        *(ROOT/'server/cloud_os').rglob('*.py'),
+        *(ROOT/'desktop').rglob('*.py'),
+        ROOT/'server/requirements.txt',
+        ROOT/'server/computer_requirements.txt',
+        ROOT/'server/computer-openbox.xml',
+    })
     hashes={p.relative_to(ROOT).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
     with tarfile.open(archive,'w:gz') as out:
         for p in files:out.add(p,arcname=p.relative_to(ROOT).as_posix())
@@ -42,12 +52,12 @@ tar -czf .deploy/server-before-identity-{stamp}.tgz server
 cp -p data/state.json .deploy/state-before-identity-{stamp}.json
 (umask 022; venv/bin/python -m pip install --disable-pip-version-check --no-deps --only-binary=:all: Pillow==13.0.0 > .deploy/pillow-1.6-install.log 2>&1)
 tar -xzf .deploy/identity-server-1.6.tar.gz -C /opt/proactive-agent
-chmod 644 server/*.py server/requirements.txt
+chmod -R a+rX server
 venv/bin/python - <<'PY'
 from pathlib import Path
 import PIL
 assert PIL.__version__=='13.0.0'
-for p in Path('server').glob('*.py'):compile(p.read_text('utf-8'),str(p),'exec')
+for p in Path('server').rglob('*.py'):compile(p.read_text('utf-8'),str(p),'exec')
 PY
 systemctl restart proactive-agent.service
 for attempt in 1 2 3 4 5 6 7 8 9 10; do
@@ -81,7 +91,17 @@ assert roster['primary_bot_id'] in {b['id'] for b in roster['bots']}
 assert all('title' in b and 'avatar_version' in b for b in roster['bots'])
 checks=[request('/api/bots/primary','PUT',{'bot_id':'_release_missing_'},False)[0],request('/api/bots/primary','PUT',{'bot_id':'_release_missing_'})[0],request('/api/bots/_release_missing_/identity','PATCH',{'title':'check'})[0],request('/api/bots/_release_missing_/avatar')[0],request('/api/bots/_release_missing_/avatar/generate','POST',{'model':'fixture','prompt':'check'})[0]]
 assert checks==[401,404,404,404,404],checks
-files=sorted((base/'server').glob('*.py'))+[base/'server/requirements.txt']
+files=sorted({
+    *(base/'server').glob('*.py'),
+    *(base/'server/core').rglob('*.py'),
+    *(base/'server/transport').rglob('*.py'),
+    *(base/'server/plugins').rglob('*.py'),
+    *(base/'server/cloud_os').rglob('*.py'),
+    *(base/'desktop').rglob('*.py'),
+    base/'server/requirements.txt',
+    base/'server/computer_requirements.txt',
+    base/'server/computer-openbox.xml',
+})
 print(json.dumps({'checks':checks,'pillow':PIL.__version__,'hashes':{p.relative_to(base).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in files}}))
 PY"""
     live=json.loads(remote(check));assert all(live['hashes'].get(p)==sha for p,sha in hashes.items())

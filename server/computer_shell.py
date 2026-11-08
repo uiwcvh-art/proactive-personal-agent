@@ -5,61 +5,19 @@ use passwordless `sudo`, access `~/.local/root_home` (`/root` mirror), compile c
 and manage files inside its own isolated 1C 1G 10GB virtual computer storage (desktop-home + /tmp)
 while strictly blocking any access to the host system outside the virtual computer boundary.
 """
-import ctypes
 import os
 import resource
 import shutil
 import sys
 from pathlib import Path
+from computer_security import apply_landlock
 
 
 def restrict_virtual_box(desktop_home: str, workspace_root: str):
-    libc = ctypes.CDLL(None, use_errno=True)
-
-    def check(value):
-        if value < 0:
-            raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
-        return value
-
-    abi = check(libc.syscall(444, 0, 0, 1))
-    if abi < 1:
-        raise RuntimeError('Linux Landlock ABI >= 1 required')
-    fs = (1 << min(abi + 12, 15)) - 1
-
-    class Ruleset(ctypes.Structure):
-        _fields_ = [('handled_access_fs', ctypes.c_uint64), ('handled_access_net', ctypes.c_uint64)]
-
-    class Beneath(ctypes.Structure):
-        _pack_ = 1
-        _fields_ = [('allowed_access', ctypes.c_uint64), ('parent_fd', ctypes.c_int32)]
-
-    attr = Ruleset(fs, 0)
-    fd = check(libc.syscall(444, ctypes.byref(attr), ctypes.sizeof(attr), 0))
-
-    def allow(path, rights):
-        if not os.path.exists(path):
-            return
-        p = os.open(path, os.O_PATH | os.O_CLOEXEC)
-        rule = Beneath(rights, p)
-        try:
-            check(libc.syscall(445, fd, 1, ctypes.byref(rule), 0))
-        except OSError:
-            pass
-        finally:
-            os.close(p)
-
-    read_dir = (1 << 0) | (1 << 2) | (1 << 3)
-    read_file = (1 << 0) | (1 << 2)
-    for path in ['/usr', '/bin', '/lib', '/lib64', '/sbin', '/proc', '/sys', '/etc', '/var/cache', '/var/lib/apt', '/var/lib/dpkg']:
-        allow(path, read_dir)
-    # Full read/write/exec inside the virtual computer's dedicated home, workspace, /tmp, /dev/shm, and runtime dir
-    for path in [desktop_home, workspace_root, '/tmp', '/var/tmp', '/dev/pts', '/dev/shm', '/run/proactive-desktop']:
-        allow(path, fs)
-    for dev in ['/dev/null', '/dev/zero', '/dev/urandom', '/dev/random', '/dev/ptmx', '/dev/tty', '/dev/dri']:
-        allow(dev, (1 << 1) | (1 << 2))
-    check(libc.prctl(38, 1, 0, 0, 0))
-    check(libc.syscall(446, fd, 0))
-    os.close(fd)
+    ro = ['/usr', '/bin', '/lib', '/lib64', '/sbin', '/proc', '/sys', '/etc', '/var/cache', '/var/lib/apt', '/var/lib/dpkg']
+    rw = [desktop_home, workspace_root, '/tmp', '/var/tmp', '/dev/pts', '/dev/shm', '/run/proactive-desktop']
+    devs = ['/dev/null', '/dev/zero', '/dev/urandom', '/dev/random', '/dev/ptmx', '/dev/tty', '/dev/dri']
+    apply_landlock(ro, rw, devs, min_abi=1)
 
 
 if __name__ == '__main__':
@@ -82,10 +40,10 @@ if __name__ == '__main__':
                 start_cwd = workspace_root
         os.chdir(start_cwd)
 
-        resource.setrlimit(resource.RLIMIT_CPU, (45, 45))
+        resource.setrlimit(resource.RLIMIT_CPU, (60, 60))
         resource.setrlimit(resource.RLIMIT_FSIZE, (512 * 1024 * 1024,) * 2)
-        resource.setrlimit(resource.RLIMIT_NPROC, (256, 256))
-        resource.setrlimit(resource.RLIMIT_NOFILE, (1024, 1024))
+        resource.setrlimit(resource.RLIMIT_NPROC, (2048, 2048))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (4096, 4096))
         restrict_virtual_box(desktop_home, workspace_root)
 
         venv_dir = os.path.join(desktop_home, 'venv')
@@ -130,6 +88,9 @@ if __name__ == '__main__':
             'XAUTHORITY': os.path.join(desktop_home, '.Xauthority'),
             'DBUS_SESSION_BUS_ADDRESS': 'disabled:',
             'DBUS_SYSTEM_BUS_ADDRESS': 'disabled:',
+            'WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS': '1',
+            'WEBKIT_DISABLE_COMPOSITING_MODE': '1',
+            'WEBKIT_DISABLE_DMABUF_RENDERER': '1',
         }
         if os.path.exists(venv_bin):
             env['VIRTUAL_ENV'] = venv_dir
@@ -144,13 +105,10 @@ if __name__ == '__main__':
             pass
 
         raw_cmd = sys.argv[2]
-        # Close inherited stdout/stderr on background jobs (`cmd &`) so pipes never hang after bash exits
+        # Persist cwd even if raw_cmd calls exit or fails under set -e, and close inherited fds on exit
         wrapped = (
+            f'trap \'__EC=$?; pwd > "{cwd_file}" 2>/dev/null || true; exec >/dev/null 2>&1; exit $__EC\' EXIT\n'
             f'{raw_cmd}\n'
-            f'__EC=$?\n'
-            f'pwd > "{cwd_file}" 2>/dev/null || true\n'
-            f'exec >/dev/null 2>&1\n'
-            f'exit $__EC\n'
         )
         os.execve('/bin/bash', ['bash', '--noprofile', '--norc', '-c', wrapped], env)
     except Exception as error:
