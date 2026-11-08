@@ -1,7 +1,15 @@
 {
-    "notes":  "v2.8.4: 1) 压缩上下文移入左下角「+」菜单，点击后直接在对话框生成归档卡片（显示从多少K浓缩为多少K、记忆存往何处并可一键查看）；2) 快捷选项点按即刻消失，且仅最后一条消息可显示选项防误触；3) 新增主人立体个人印象档案 (personal_impression.md)，主动了解出生/身份/家庭/喜好。",
-    "tag_name":  "v2.8.4",
-    "versionCode":  36,
-    "versionName":  "2.8.4",
-    "sha256":  "da169063094de8a4de24c0a717f14e0630c27f132f58cc0b0d524133bbd27b34"
+  "version": "3.3.0",
+  "version_name": "3.3.0",
+  "versionName": "3.3.0",
+  "tag_name": "v3.3.0",
+  "version_code": 67,
+  "versionCode": 67,
+  "build": 67,
+  "published_at": "2026-11-09T02:46:28.609145+08:00",
+  "apk_sha256": "67dff01a5f0fa7aae9a6708053652efaf93a6c2fd9d564157dd9e96e170ef437",
+  "apk_size": 21011932,
+  "download_url": "/proactive-agent/download/proactive-agent.apk",
+  "notes": "v3.3.0 (Build 67): 全面架构重构与虚拟屏体验修复——修复微信等自绘界面(node_count=0)点击被误判未响应及重复双击 Bug；全模型原生多模态图像直传(零二次OCR跳转)；修复微信小程序跳出虚拟屏到物理主屏、跳回桌面及主屏亮度升高问题；任务结束自动销毁回收虚拟屏释放内存",
+  "body": "v3.3.0 (Build 67): 全面架构重构与虚拟屏体验修复——修复微信等自绘界面(node_count=0)点击被误判未响应及重复双击 Bug；全模型原生多模态图像直传(零二次OCR跳转)；修复微信小程序跳出虚拟屏到物理主屏、跳回桌面及主屏亮度升高问题；任务结束自动销毁回收虚拟屏释放内存"
 }
