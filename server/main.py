@@ -566,20 +566,45 @@ def create_app(data_dir=None, scheduler=True):
         if payload.get('request_id') and ('result' in payload or 'data' in payload):
             brain.resolve_dsh_command(payload)
         caller_dev=str(payload.get('device_id') or payload.get('peer_id') or request.query_params.get('device_id') or '').strip()
-        all_inbox=list(brain.dsh_bridge_info.get('inbox') or [])
-        if caller_dev and caller_dev!='pc_dsh':
-            inbox=[
-                item for item in all_inbox
-                if not item.get('device_id') or item.get('device_id') in ('pc_dsh',caller_dev)
-            ]
-        else:
-            inbox=all_inbox
-        if payload.get('drain') or request.query_params.get('drain') in ('1','true'):
+        wait_sec=min(15.0,max(0.0,float(payload.get('wait_sec') or request.query_params.get('wait_sec') or 0.0)))
+
+        def _pick_inbox()->tuple[list[dict],list[dict]]:
+            cur_all=list(brain.dsh_bridge_info.get('inbox') or [])
+            if caller_dev and caller_dev!='pc_dsh':
+                picked=[
+                    item for item in cur_all
+                    if not item.get('device_id') or item.get('device_id') in ('pc_dsh',caller_dev)
+                ]
+            else:
+                picked=cur_all
+            return cur_all,picked
+
+        all_inbox,inbox=_pick_inbox()
+        if not inbox and wait_sec>0:
+            deadline=time.monotonic()+wait_sec
+            while time.monotonic()<deadline:
+                await asyncio.sleep(0.25)
+                brain.dsh_bridge_info['last_seen']=time.time()
+                brain.dsh_bridge_info['online']=True
+                all_inbox,inbox=_pick_inbox()
+                if inbox:
+                    break
+
+        if inbox and (payload.get('drain') or request.query_params.get('drain') in ('1','true')):
             if caller_dev and caller_dev!='pc_dsh':
                 drained_ids={id(x) for x in inbox}
                 brain.dsh_bridge_info['inbox']=[item for item in all_inbox if id(item) not in drained_ids]
             else:
                 brain.dsh_bridge_info['inbox']=[]
+        if payload.get('slim') or request.query_params.get('slim') in ('1','true'):
+            return {
+                'ok':True,
+                'dsh_online':True,
+                'phone_online':len(clients)>0,
+                'inbox':inbox,
+                'commands':inbox,
+                'time':time.time(),
+            }
         cap=max(1,min(100,int(payload.get('limit') or request.query_params.get('limit') or 3)))
         phone_last_3,phone_last_time=_extract_phone_last_3_dialogs(limit=cap,source='phone')
         return {

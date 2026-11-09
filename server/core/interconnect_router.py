@@ -455,7 +455,9 @@ class InterconnectRouterMixin:
 
         incoming_prompt = (
             f'【跨端/同事 Bot 协作来信 · 发件方：「{sender_label}」(to_bot_id="{cur_node_label}:{from_bot["name"]}")】\n'
-            f'⚠️ 注意：本条消息是由「{sender_label}」发给你的跨端协作消息，不是主人直接发给你的！请直接面向「{sender_label}」回应她刚才说的话，直接用自然语言正文输出你的完整回复（系统会自动将你的正文回复同步送回给「{sender_label}」，请勿再重复调用 send_message 回传！），严禁把回复写成向主人汇报“我已经回过她了”，也不要夹带与本次协作无关的旧话题。\n\n'
+            f'⚠️ 协作响应铁律：\n'
+            f'1. 本条消息是由「{sender_label}」通过 `send_message` 发到你专属会话的协作请求。若对方请你查看本机窗口/屏幕、查消息、跑命令或读文件，你**必须在当前回合立即调用你节点上的真实工具**（如电脑端调用 `dsh_workspace(op="cua_desktop" | "pc_shell")`、手机端调用 `phone_workspace`）获取最新实测结果，严禁不调工具就凭旧记录口头回答！\n'
+            f'2. 执行完所需工具（或无需工具的纯讨论）后，请直接面向「{sender_label}」用自然语言正文输出你的完整答复（系统会自动将你的最终正文同步回传给「{sender_label}」，请勿再重复调用 `send_message` 回传），不要把回复写成向主人汇报“我已经回过她了”。\n\n'
             f'「{sender_label}」对你说：\n{text}'
         )
         deferred_incoming_spec = {

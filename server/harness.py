@@ -413,10 +413,11 @@ DEFAULT_SYSTEM_MD = """# 系统与工具说明 (SYSTEM.md)
   - 同样每步自动附带 `0..1000` 标尺画面供你直看，且每个 `@bN` 元素均同时提供像素 `(x, y)` 与 `0..1000` 标尺坐标 `(nx, ny)`，严禁额外调 `read_file("desktop-latest.jpg")`！
   - 支持 `op="open", url="https://..."` 或 `app="chrome|terminal|files|code|excel|notepad|taskmgr|calculator"`、`op="search", query="..."`、`op="tap", ref="@b1或文字", nx=..., ny=...`、`op="type", text="...", submit=true`、`op="scroll", direction="down|up"`、`op="close", target="active|all"`、`op="bash", command="..."`。
   - **扫码登录神器 (`op="send_screenshot")**：在云电脑打开腾讯文档、学习通、微信网页版、B站等需要扫码登录的网站时，直接调用 `cloud_desktop(op="send_screenshot", crop_box=[ymin, xmin, ymax, xmax])`（根据画面 0..1000 标尺框选二维码区域，或不传 `crop_box` 发送全屏干净截图），即可把高清无标尺二维码直接发到主人的聊天框气泡里供主人扫码！云电脑 Chromium 配置了持久化登录目录，主人扫一次码后续长期免登。
-- `send_message`（多端多 Bot 跨端协同）：
-  - **多端隔离、跨端按名直达目标 Bot 专属会话**：
-    - 给同端其他同事 Bot 发消息：`send_message(to_bot_id="research", text="...")`（或 `"contrarian"` / `"杠精"`、`"whalechan"` / `"鲸鱼娘"`）。
-    - 给跨端任意节点的任意 Bot 发消息：`send_message(to_bot_id="Windows一:白珂", text="...")`、`send_message(to_bot_id="Windows一:研究助手", text="...")`、`send_message(to_bot_id="Windows一:杠精", text="...")`、`send_message(to_bot_id="Windows一:鲸鱼娘", text="...")`、`send_message(to_bot_id="安卓一:白珂", text="...")`、`send_message(to_bot_id="安卓二:白珂", text="...")`。消息会直接进入对方节点上该 Bot 自己的专属会话执行并回复，绝不新建普通工作区会话！
+- `send_message`（多端多 Bot 对等独立架构与跨端协同铁律）：
+  - **三端职责严格隔离，绝不越界串台**：
+    1. **手机端 (`安卓一` / `安卓二`)**：专职负责手机本机 `phone_workspace` 与共享云桌面 `cloud_desktop`。**手机端没有任何直接操控 Windows 电脑底层的工具通道**！凡是主人要求查看 Windows 电脑窗口、操作电脑版 QQ/软件、在电脑上跑命令/脚本、或给电脑端派活，手机端**必须且只能**调用 `send_message(to_bot_id="Windows一:白珂", text="...")`（或 `"Windows一:研究助手"` / `"Windows一:杠精"` / `"Windows一:鲸鱼娘"` / `"会话:<工作区会话标题>"`），交给电脑端上的 Bot 在她自己的专属会话里执行并回信！严禁在回复中编造“我有直接抓电脑底层的通道B”之类的话，也严禁只手打 `@Windows一:白珂` 纯文本而不调工具。
+    2. **Windows 电脑端 (`Windows一`)**：专职负责 Windows 电脑本机 `dsh_workspace(op="cua_desktop" | "pc_shell" | "dispatch_session")` 与本机工作区文件读写。电脑端同样不能直接操控手机屏幕，凡需手机端配合的操作，必须调用 `send_message(to_bot_id="安卓一:白珂", text="...")` 交给手机端执行。
+    3. **收到跨端/同事 `send_message` 来信时的实干铁律**：当你收到来自其他节点或同事 Bot 的协作来信时，如果对方请求你查看窗口、检查消息、运行命令或读取文件，**你必须先在当前回合真实发起对应的 `tool_calls` 获取最新实测结果**，拿到结果后再用自然语言正文直接回复对方（系统会自动将你的最终正文回传给发件方，无需再次调用 `send_message` 回传），严禁不调工具就凭旧记忆或口头敷衍！
 - `memory_search`：一键同时检索 `memory_vault/` 记忆库与历史对话/归档上下文。
 - `integration_hub`：原生支持邮件收发 (`email_list`/`email_read`/`email_send`)、日历 (`calendar_list`)、GitHub、Notion、Todoist、Telegram/飞书/Discord 推送及 500+ 第三方接口。
 - `present_choices` / `<choices>` 标签（宁缺毋滥）：日常聊天、总结汇报、测试报告【严禁】生成选项！仅在真正需要主人拍板下一步动作时使用。
@@ -773,7 +774,7 @@ class Harness:
             if self._sys_md_cache and self._sys_md_cache[0] == mtime:
                 arch_doc = self._sys_md_cache[1]
             else:
-                arch_doc = sys_md.read_text('utf-8', errors='replace')[:6000]
+                arch_doc = sys_md.read_text('utf-8', errors='replace')[:12000]
                 self._sys_md_cache = (mtime, arch_doc)
         else:
             arch_doc = DEFAULT_SYSTEM_MD
