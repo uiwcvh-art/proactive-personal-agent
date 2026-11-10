@@ -135,7 +135,8 @@ public class AgentForegroundService extends Service {
             io.execute(()->{
                 try{
                     if(socket!=null&&sessionKey!=null){
-                        socket.send(SecureTransport.encrypt(sessionKey,new JSONObject().put("type","ping")).toString());
+                        int vdId=RootPhoneHarness.INSTANCE.currentDisplayId();
+                        socket.send(SecureTransport.encrypt(sessionKey,new JSONObject().put("type","ping").put("virtual_display_id",vdId)).toString());
                     }
                 }catch(Exception ignored){}
             });
@@ -248,7 +249,21 @@ public class AgentForegroundService extends Service {
                                     afterPkg=tree.optString("package","");
                                     afterHash=tree.optString("treeHash","");
                                 }
-                                if(tree.has("summary"))res.put("ui_tree",tree.getString("summary")).put("node_count",ncAfter).put("package",afterPkg).put("tree_hash",afterHash);
+                                if(tree.has("summary")){
+                                    res.put("ui_tree",tree.getString("summary"))
+                                        .put("node_count",ncAfter)
+                                        .put("nodeCount",ncAfter)
+                                        .put("package",afterPkg)
+                                        .put("tree_hash",afterHash)
+                                        .put("treeHash",afterHash)
+                                        .put("layoutStable",tree.optBoolean("layoutStable",true))
+                                        .put("settled",tree.optBoolean("settled",true))
+                                        .put("settle_ms",tree.optLong("settle_ms",settleMs))
+                                        .put("densityDpi",tree.optInt("densityDpi",320))
+                                        .put("screenWidthDp",tree.optInt("screenWidthDp",360))
+                                        .put("fontScale",tree.optDouble("fontScale",1.0))
+                                        .put("layout_signature",tree.optString("layout_signature",""));
+                                }
                             }catch(Exception ignored){}
                             long afterFrameSeq=-1L;
                             String afterImgSig="";
@@ -277,7 +292,9 @@ public class AgentForegroundService extends Service {
                 boolean sentViaWs=false;
                 JSONObject reply=new JSONObject();
                 try{
-                    reply.put("type","phone_workspace_result").put("request_id",reqId).put("result",res);
+                    int vdId=RootPhoneHarness.INSTANCE.currentDisplayId();
+                    if(!res.has("virtual_display_id") && vdId>0) res.put("virtual_display_id",vdId);
+                    reply.put("type","phone_workspace_result").put("request_id",reqId).put("virtual_display_id",vdId).put("result",res);
                     if(socket!=null&&sessionKey!=null){
                         sentViaWs=socket.send(SecureTransport.encrypt(sessionKey,reply).toString());
                     }

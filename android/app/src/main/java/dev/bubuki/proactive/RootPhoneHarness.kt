@@ -2,11 +2,9 @@ package dev.bubuki.proactive
 
 import android.content.Context
 import android.content.Intent
-import android.graphics.Rect
 import android.os.Build
 import android.os.PowerManager
 import android.os.SystemClock
-import android.util.Xml
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -16,8 +14,6 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
-import org.xmlpull.v1.XmlPullParser
-import java.io.StringReader
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
@@ -34,21 +30,32 @@ internal data class RootPhoneState(
     val active: Boolean get() = phase in listOf("running", "waiting_user")
     val displayCreated: Boolean get() = runCatching { JSONObject(display).optBoolean("created") }.getOrDefault(false)
     val displayId: Int get() = runCatching { JSONObject(display).let { it.optInt("displayId", it.optInt("display_id", -1)) } }.getOrDefault(-1)
+    val currentPackage: String?
+        get() = PulseAccessibilityService.getCachedSnapshot(displayId)?.activePackage?.takeIf { it.isNotBlank() }
+            ?: runCatching { JSONObject(display).optString("package", "").takeIf { it.isNotBlank() } }.getOrNull()
 }
 
 /**
- * Root virtual display workspace with:
- * - Accessibility UI Tree first (`ui_tree`, `tap_node`, `type_node`) and coordinate hard-tap (`tap`) last
- * - Screen-dim wake lock (`KeepAwake`) while display is active so the phone/virtual display never auto-locks
- * - Automatic virtual display release 2.5s after task completion or after 45s of inactivity
- * - Multi-layer caching for launcher apps, component resolution, and UI tree snapshots
+ * [Module] RootPhoneHarness
+ * [Responsibility] Root virtual display workspace state machine, lifecycle & power management
+ *                  (`KeepAwake`, idle watchdog, auto-release), live preview polling, sub-2ms
+ *                  1:1 touch streaming, command router (`command`), and local phone agent loop
+ *                  (`submit`, `stop`, `resume`).
+ *                  Delegates high-level Accessibility node actions, file transfers, shell,
+ *                  notifications, and launcher package resolution to RootPhoneHarnessActions.kt.
+ * [Public API]
+ *   - RootPhoneHarness.changes: StateFlow<RootPhoneState>
+ *   - initialize(base) / status(base) / history(base) / deviceInfo(base)
+ *   - command(base, input) / sendLiveTouch(base, action, x, y) / scheduleAutoRelease(base, delayMs, toForeground)
+ *   - submit(base, bot, goal, history, recordUserMessage) / submitFromBridge(base, bot, goal)
+ *   - stop(base) / resume(base) / isVirtualDisplayActive() / currentDisplayId()
  */
 object RootPhoneHarness {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val state = MutableStateFlow(RootPhoneState())
+    internal val state = MutableStateFlow(RootPhoneState())
     internal val changes: StateFlow<RootPhoneState> = state.asStateFlow()
     private var context: Context? = null
-    private var privilege: PrivilegeManager? = null
+    internal var privilege: PrivilegeManager? = null
     private var initialized = false
     private var job: Job? = null
     private var previewJob: Job? = null
@@ -67,17 +74,52 @@ object RootPhoneHarness {
     private val loaded = CompletableDeferred<Unit>()
     private val submitLock = Mutex()
 
-    // Multi-layer caches for fast 0ms lookups
-    @Volatile private var cachedLauncherApps: List<PhoneApp> = emptyList()
-    @Volatile private var appsCachedAtElapsed: Long = 0L
-    @Volatile private var shellCwd: String = "/sdcard"
-    private const val APPS_CACHE_TTL_MS = 5 * 60 * 1000L
+    // Multi-layer caches for fast 0ms lookups (shared with RootPhoneHarnessActions)
+    @Volatile internal var cachedLauncherApps: List<PhoneApp> = emptyList()
+    @Volatile internal var appsCachedAtElapsed: Long = 0L
+    @Volatile internal var shellCwd: String = "/sdcard"
+    internal const val APPS_CACHE_TTL_MS = 5 * 60 * 1000L
     private const val IDLE_AUTO_RELEASE_MS = 45_000L
-    private val resolvedComponentCache = ConcurrentHashMap<String, String>()
+    internal val resolvedComponentCache = ConcurrentHashMap<String, String>()
 
     @JvmStatic fun isVirtualDisplayActive(): Boolean {
         val st = state.value
         return st.displayCreated || st.active
+    }
+
+    @JvmStatic fun currentDisplayId(): Int {
+        return state.value.displayId
+    }
+
+    @JvmStatic fun launchFromVirtualHome(base: Context, displayId: Int, component: String) {
+        initialize(base)
+        runCatching {
+            command(
+                base.applicationContext,
+                JSONObject()
+                    .put("op", "launch")
+                    .put("component", component)
+                    .put("manual", true)
+            )
+        }
+    }
+
+    internal fun listLaunchableApps(base: Context, forceRefresh: Boolean = false): List<PhoneApp> {
+        initialize(base)
+        val apps = queryLauncherApps(base.applicationContext, forceRefresh)
+        state.update { it.copy(apps = apps) }
+        return apps
+    }
+
+    internal fun shallowCopyWithoutImage(src: JSONObject): JSONObject {
+        val out = JSONObject()
+        val keys = src.keys()
+        while (keys.hasNext()) {
+            val k = keys.next()
+            if (k == "image" || k == "_image_b64") continue
+            out.put(k, src.opt(k))
+        }
+        return out
     }
 
     @JvmStatic fun initialize(base: Context) {
@@ -120,7 +162,6 @@ object RootPhoneHarness {
     private fun acquireKeepAwake(base: Context) {
         runCatching {
             synchronized(setupLock) {
-                // Strictly use PARTIAL_WAKE_LOCK (CPU only) so virtual display tasks NEVER touch or brighten the physical screen!
                 val wl = screenWakeLock ?: base.applicationContext.getSystemService(PowerManager::class.java)
                     .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Pulse:VirtualDisplayCpu")
                     .apply { setReferenceCounted(false) }
@@ -151,11 +192,10 @@ object RootPhoneHarness {
             delay(delayMs.coerceIn(500L, 15000L))
             val cur = state.value
             if (!cur.active) {
-                val keepForMusic = isMusicActiveInWorkspace(base)
                 runCatching {
                     command(
                         base.applicationContext,
-                        JSONObject().put("op", "release").put("destroy", !keepForMusic)
+                        JSONObject().put("op", "release").put("destroy", false)
                     )
                 }
             }
@@ -173,9 +213,6 @@ object RootPhoneHarness {
         }
     }
 
-    /**
-     * Sub-2ms 1:1 live finger touch stream (`down` / `move` / `up` / `cancel`) for zero-latency scrolling!
-     */
     @JvmStatic fun sendLiveTouch(base: Context, action: String, x: Int, y: Int) {
         initialize(base)
         val now = SystemClock.elapsedRealtime()
@@ -206,106 +243,21 @@ object RootPhoneHarness {
                 delay(5000L)
                 val cur = state.value
                 val disp = runCatching { JSONObject(cur.display) }.getOrNull()
-                if (disp == null || !disp.optBoolean("created")) break
+                if (disp == null || (!disp.optBoolean("created") && !disp.optBoolean("allocated"))) break
                 if (cur.active) {
                     lastActivityElapsed = SystemClock.elapsedRealtime()
                     continue
                 }
                 val idleMs = SystemClock.elapsedRealtime() - lastActivityElapsed
                 if (idleMs >= IDLE_AUTO_RELEASE_MS) {
-                    runCatching { command(appContext, JSONObject().put("op", "release")) }
+                    runCatching { command(appContext, JSONObject().put("op", "release").put("destroy", false)) }
                     break
                 }
             }
         }
     }
 
-    @JvmStatic fun deviceInfo(base: Context): JSONObject {
-        val out = JSONObject().put("ok", true).put("op", "device_info")
-        runCatching {
-            val bm = base.getSystemService(android.os.BatteryManager::class.java)
-            val intent = base.registerReceiver(null, android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-            val level = bm?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY)
-                ?: intent?.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1) ?: -1
-            val statusInt = intent?.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1) ?: -1
-            val charging = statusInt == android.os.BatteryManager.BATTERY_STATUS_CHARGING ||
-                statusInt == android.os.BatteryManager.BATTERY_STATUS_FULL ||
-                (bm?.isCharging == true)
-            val tempTenths = intent?.getIntExtra(android.os.BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
-            out.put("battery", JSONObject()
-                .put("level", level)
-                .put("charging", charging)
-                .put("temp_c", if (tempTenths > 0) tempTenths / 10.0 else 0.0)
-            )
-        }
-        runCatching {
-            val am = base.getSystemService(android.app.ActivityManager::class.java)
-            val mi = android.app.ActivityManager.MemoryInfo()
-            am?.getMemoryInfo(mi)
-            out.put("memory", JSONObject()
-                .put("total_mb", mi.totalMem / (1024 * 1024))
-                .put("avail_mb", mi.availMem / (1024 * 1024))
-                .put("low_memory", mi.lowMemory)
-            )
-        }
-        runCatching {
-            val stat = android.os.StatFs(android.os.Environment.getExternalStorageDirectory().path)
-            val freeGb = (stat.availableBytes.toDouble() / (1024.0 * 1024.0 * 1024.0) * 10.0).toInt() / 10.0
-            val totalGb = (stat.totalBytes.toDouble() / (1024.0 * 1024.0 * 1024.0) * 10.0).toInt() / 10.0
-            out.put("storage", JSONObject().put("free_gb", freeGb).put("total_gb", totalGb))
-        }
-        runCatching {
-            val cm = base.getSystemService(android.net.ConnectivityManager::class.java)
-            val caps = cm?.activeNetwork?.let { cm.getNetworkCapabilities(it) }
-            val netType = when {
-                caps == null -> "none"
-                caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
-                caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
-                else -> "other"
-            }
-            out.put("network", JSONObject().put("connected", caps != null).put("type", netType))
-        }
-        runCatching {
-            val pm = base.getSystemService(PowerManager::class.java)
-            val km = base.getSystemService(android.app.KeyguardManager::class.java)
-            val audio = base.getSystemService(android.media.AudioManager::class.java)
-            val ringer = when (audio?.ringerMode) {
-                android.media.AudioManager.RINGER_MODE_SILENT -> "silent"
-                android.media.AudioManager.RINGER_MODE_VIBRATE -> "vibrate"
-                else -> "normal"
-            }
-            out.put("screen", JSONObject()
-                .put("interactive", pm?.isInteractive == true)
-                .put("locked", km?.isKeyguardLocked == true)
-                .put("ringer_mode", ringer)
-                .put("music_active", audio?.isMusicActive == true)
-            )
-        }
-        out.put("device", JSONObject()
-            .put("brand", Build.BRAND)
-            .put("model", Build.MODEL)
-            .put("sdk", Build.VERSION.SDK_INT)
-            .put("root", privilege?.isRootGrantedFast() == true)
-        )
-        return out
-    }
-
-    private fun resolveLatestPhoneFile(): java.io.File? {
-        val dirs = listOf(
-            java.io.File("/sdcard/Download/WeiXin"),
-            java.io.File("/sdcard/Download"),
-            java.io.File("/sdcard/Pictures/Screenshots"),
-            java.io.File("/sdcard/DCIM/Screenshots"),
-            java.io.File("/sdcard/Android/data/com.tencent.mm/MicroMsg/Download")
-        )
-        val candidates = mutableListOf<java.io.File>()
-        for (d in dirs) {
-            if (d.exists() && d.isDirectory) {
-                d.listFiles()?.filter { it.isFile && it.length() > 0 && !it.name.startsWith(".") }?.let { candidates.addAll(it) }
-            }
-        }
-        return candidates.maxByOrNull { it.lastModified() }
-    }
+    @JvmStatic fun deviceInfo(base: Context): JSONObject = buildDeviceInfo(base)
 
     @JvmStatic fun status(base: Context): JSONObject {
         initialize(base); val current = state.value
@@ -313,7 +265,7 @@ object RootPhoneHarness {
         if (!status.optBoolean("root")) {
             status = runCatching { privilege!!.probe() }.getOrDefault(status)
         }
-        val saved = SecurePrefs.read(base); val config = modelConfig(saved)
+        val saved = SecurePrefs.readFast(base); val config = modelConfig(saved)
         state.update {
             it.copy(
                 root = status.optBoolean("root"),
@@ -348,252 +300,75 @@ object RootPhoneHarness {
             "close", "destroy", "stop_display", "promote", "expand_to_foreground", "to_foreground", "fullscreen" -> "release"
             "dump", "tree", "nodes", "read_screen" -> "ui_tree"
             "click_node" -> "tap_node"
-            "input_node", "set_text" -> "type_node"
+            "input_node", "set_text", "type" -> "type_node"
             "exec", "cmd", "bash" -> "shell"
             "phone_info", "battery" -> "device_info"
             "files" -> "list_files"
             "open_url" -> "open_uri"
             "wait", "sleep" -> "delay"
             "get_notifications", "recent_notifications", "notifs", "notification" -> "notifications"
+            "get_clipboard", "read_clipboard" -> "clipboard_get"
+            "set_clipboard", "write_clipboard" -> "clipboard_set"
             else -> rawOp
         }
-        if (operation == "device_info") {
-            return deviceInfo(base)
-        }
-        if (operation == "list_files") {
-            val dirPath = input.optString("path", "/sdcard/Download").trim().ifBlank { "/sdcard/Download" }
-            val limit = input.optInt("limit", 25).coerceIn(1, 100)
-            val dir = java.io.File(dirPath)
-            val arr = JSONArray()
-            val files = dir.listFiles()?.sortedByDescending { it.lastModified() }
-            if (files != null && files.isNotEmpty()) {
-                for (f in files.take(limit)) {
-                    arr.put(JSONObject()
-                        .put("name", f.name)
-                        .put("path", f.absolutePath)
-                        .put("is_dir", f.isDirectory)
-                        .put("bytes", if (f.isFile) f.length() else 0L)
-                        .put("mtime", f.lastModified() / 1000)
-                    )
+        when (operation) {
+            "device_info" -> return deviceInfo(base)
+            "list_files" -> return executeListFiles(input)
+            "pull_file" -> return executePullFile(base, input)
+            "push_file" -> return executePushFile(base, input)
+            "shell" -> return executeShellAction(base, input)
+            "notifications" -> return executeNotificationsAction(base, input)
+            "clipboard", "clipboard_get", "clipboard_set" -> {
+                if (!privilege!!.isRootGrantedFast()) {
+                    val probed = privilege!!.probe()
+                    if (!probed.optBoolean("root")) throw Exception("尚未取得 Root 授权，请在手机的 Root 管理器中允许此应用")
                 }
-            } else if (privilege!!.isRootGrantedFast() || runCatching { privilege!!.probe().optBoolean("root") }.getOrDefault(false)) {
-                val safeP = "'" + dirPath.replace("'", "'\\''") + "'"
-                val lsRes = privilege!!.execute(JSONObject().put("op", "shell").put("command", "ls -lt $safeP | head -n ${limit + 1}"))
-                return JSONObject().put("ok", true).put("op", "list_files").put("path", dirPath).put("ls_output", lsRes.optString("output", ""))
+                return privilege!!.execute(JSONObject(input.toString()).put("op", operation))
             }
-            return JSONObject().put("ok", true).put("op", "list_files").put("path", dirPath).put("files", arr)
-        }
-        if (operation == "pull_file") {
-            val rawPath = input.optString("path", input.optString("target", "latest")).trim()
-            val source = input.optString("source", "workspace").trim().lowercase().let { if (it == "computer") "computer" else "workspace" }
-            val targetFile = if (rawPath.isBlank() || rawPath == "latest" || rawPath == "latest_download") {
-                resolveLatestPhoneFile()
-            } else {
-                java.io.File(rawPath)
+            "delay" -> {
+                val ms = input.optLong("delay_ms", input.optLong("ms", 600L)).coerceIn(50L, 5000L)
+                try { Thread.sleep(ms) } catch (ignored: InterruptedException) {}
+                return JSONObject().put("uid", 0).put("ok", true).put("op", "delay").put("delay_ms", ms)
             }
-            var stagedCopy: java.io.File? = null
-            try {
-                val uploadFile = if (targetFile != null && targetFile.exists() && targetFile.canRead() && targetFile.length() > 0) {
-                    targetFile
-                } else if (rawPath.isNotBlank() && rawPath != "latest" && (privilege!!.isRootGrantedFast() || runCatching { privilege!!.probe().optBoolean("root") }.getOrDefault(false))) {
-                    val baseName = rawPath.substringAfterLast('/').ifBlank { "pulled_file" }
-                    val tmp = java.io.File(base.cacheDir, baseName)
-                    val safeSrc = "'" + rawPath.replace("'", "'\\''") + "'"
-                    val safeDst = "'" + tmp.absolutePath.replace("'", "'\\''") + "'"
-                    privilege!!.execute(JSONObject().put("op", "shell").put("command", "cp $safeSrc $safeDst && chmod 644 $safeDst"))
-                    if (!tmp.exists() || tmp.length() == 0L) throw Exception("手机端未找到或无法读取文件: $rawPath")
-                    stagedCopy = tmp
-                    tmp
-                } else {
-                    throw Exception("手机端未找到可读取文件: ${rawPath.ifBlank { "/sdcard/Download" }}")
-                }
-                val receipt = CloudFiles.upload(base, android.net.Uri.fromFile(uploadFile), source)
-                return JSONObject()
-                    .put("ok", true)
-                    .put("op", "pull_file")
-                    .put("phone_path", targetFile?.absolutePath ?: rawPath)
-                    .put("workspace_path", receipt.optString("path"))
-                    .put("name", receipt.optString("name", uploadFile.name))
-                    .put("bytes", receipt.optLong("bytes", uploadFile.length()))
-                    .put("sha256", receipt.optString("sha256"))
-            } finally {
-                stagedCopy?.delete()
-            }
-        }
-        if (operation == "push_file") {
-            val rawPath = input.optString("path", input.optString("target", "")).trim()
-            if (rawPath.isEmpty()) throw Exception("push_file 需要提供 path")
-            val source = input.optString("source", "workspace").trim().lowercase().let { if (it == "computer") "computer" else "workspace" }
-            val receipt = CloudFiles.download(base, source, rawPath)
-            val name = receipt.optString("name")
-            val phonePath = receipt.optString("path").ifBlank { "/sdcard/Download/DeepSeek Claw/$name" }
-            return JSONObject()
-                .put("ok", true)
-                .put("op", "push_file")
-                .put("name", name)
-                .put("bytes", receipt.optLong("bytes"))
-                .put("uri", receipt.optString("uri"))
-                .put("phone_path", phonePath)
-        }
-        // Direct Zero-Idle-Battery Root/Local shell execution (stateful cwd, no virtual display creation or wakelock!)
-        if (operation == "shell") {
-            var cmdStr = input.optString("command", input.optString("cmd", input.optString("text", ""))).trim()
-            if (cmdStr.isEmpty()) throw Exception("请提供要执行的 shell command")
-            var currentDisp = JSONObject(state.value.display).optInt("displayId", -1)
-            val dispInf = JSONObject(state.value.imageInfo.ifBlank { state.value.display })
-            val dW = dispInf.optInt("width", 720).coerceAtLeast(1)
-            val dH = dispInf.optInt("height", 1600).coerceAtLeast(1)
-            if (cmdStr.contains("uiautomator", ignoreCase = true) && cmdStr.contains("dump", ignoreCase = true)) {
-                if (currentDisp <= 0) throw Exception("先创建独立工作区")
-                val treeJson = readUiTreeForDisplay(currentDisp, dW, dH, forceRefresh = true)
-                return treeJson.put("output", treeJson.optString("summary", ""))
-            }
-            // Guard against bare `am start` or `input keyevent KEYCODE_HOME` hijacking physical Display 0!
-            if (Regex("""\bam\s+start\b""").containsMatchIn(cmdStr) && !cmdStr.contains("--display")) {
-                if (currentDisp <= 0) {
-                    val created = command(base, JSONObject().put("op", "create"))
-                    currentDisp = created.optInt("displayId", -1)
-                }
-                if (currentDisp > 0) {
-                    cmdStr = cmdStr.replaceFirst(Regex("""\bam\s+start\b"""), "am start --display $currentDisp")
-                }
-            }
-            val safeCwd = "'" + shellCwd.replace("'", "'\\''") + "'"
-            val wrappedCmd = "cd $safeCwd 2>/dev/null || cd /sdcard; $cmdStr; echo ''; echo '__PULSE_CWD__:'\$(pwd)"
-            val hasRoot = privilege!!.isRootGrantedFast() || runCatching { privilege!!.probe().optBoolean("root") }.getOrDefault(false)
-            val rawRes = if (hasRoot) {
-                privilege!!.execute(JSONObject().put("op", "shell").put("command", wrappedCmd))
-            } else {
-                val proc = ProcessBuilder("sh", "-c", wrappedCmd).redirectErrorStream(true).start()
-                val finished = proc.waitFor(15, java.util.concurrent.TimeUnit.SECONDS)
-                if (!finished) proc.destroyForcibly()
-                val outTxt = runCatching { proc.inputStream.bufferedReader().readText() }.getOrDefault("")
-                JSONObject().put("uid", android.os.Process.myUid()).put("exit_code", if (finished) proc.exitValue() else 124).put("output", outTxt)
-            }
-            var rawOut = rawRes.optString("output", "")
-            val markerIdx = rawOut.lastIndexOf("__PULSE_CWD__:")
-            if (markerIdx >= 0) {
-                val newCwd = rawOut.substring(markerIdx + "__PULSE_CWD__:".length).trim().lineSequence().firstOrNull()?.trim().orEmpty()
-                if (newCwd.startsWith("/")) shellCwd = newCwd
-                rawOut = rawOut.substring(0, markerIdx).trimEnd()
-            }
-            if (rawOut.length > 16000) {
-                rawOut = rawOut.take(12000) + "\n...[输出过长已截断，原长 ${rawOut.length} 字符]...\n" + rawOut.takeLast(3000)
-            }
-            rawRes.put("output", rawOut).put("cwd", shellCwd).put("ok", true)
-            return rawRes
-        }
-        if (operation == "delay") {
-            val ms = input.optLong("delay_ms", input.optLong("ms", 600L)).coerceIn(50L, 5000L)
-            try { Thread.sleep(ms) } catch (ignored: InterruptedException) {}
-            return JSONObject().put("uid", 0).put("ok", true).put("op", "delay").put("delay_ms", ms)
-        }
-        if (operation == "batch") {
-            val steps = input.optJSONArray("steps") ?: JSONArray()
-            var lastRes = JSONObject().put("uid", 0).put("ok", true)
-            for (i in 0 until minOf(steps.length(), 10)) {
-                val st = steps.optJSONObject(i) ?: continue
-                if (st.optString("op") == "batch") continue
-                lastRes = command(base, st)
-                if (i + 1 < steps.length()) {
-                    try { Thread.sleep(220L) } catch (ignored: InterruptedException) {}
-                }
-            }
-            return lastRes
-        }
-        if (operation == "auto_release") {
-            val curDisp = runCatching { JSONObject(state.value.display).optInt("displayId", -1) }.getOrDefault(-1)
-            if (!state.value.displayCreated && curDisp <= 0) {
-                return JSONObject().put("uid", 0).put("ok", true).put("noop", true).put("created", false)
-            }
-            val toFg = input.optBoolean("to_foreground", false)
-            scheduleAutoRelease(base, input.optLong("delay_ms", 2500L), toFg)
-            return JSONObject().put("scheduled_release", true).put("to_foreground", toFg)
-        }
-        if (operation == "release") {
-            val curDisp = runCatching { JSONObject(state.value.display).optInt("displayId", -1) }.getOrDefault(-1)
-            if (!state.value.displayCreated && curDisp <= 0) {
-                autoReleaseJob?.cancel()
-                idleWatchJob?.cancel()
-                stopLivePreview()
-                releaseKeepAwake()
-                return JSONObject().put("uid", 0).put("ok", true).put("noop", true).put("created", false)
-            }
-        }
-        if (operation == "notifications") {
-            val filterQ = input.optString("app", input.optString("query", input.optString("package", ""))).trim()
-            val limit = input.optInt("limit", 25).coerceIn(1, 80)
-            if (!AgentNotificationListener.isConnected()) {
-                runCatching {
-                    if (privilege!!.isRootGrantedFast() || privilege!!.probe().optBoolean("root")) {
-                        privilege!!.execute(
-                            JSONObject()
-                                .put("op", "shell")
-                                .put("command", "cmd notification allow_listener ${base.packageName}/${base.packageName}.AgentNotificationListener")
-                        )
-                        Thread.sleep(180)
+            "batch" -> {
+                val steps = input.optJSONArray("steps") ?: JSONArray()
+                var lastRes = JSONObject().put("uid", 0).put("ok", true)
+                for (i in 0 until minOf(steps.length(), 10)) {
+                    val st = steps.optJSONObject(i) ?: continue
+                    if (st.optString("op") == "batch") continue
+                    lastRes = command(base, st)
+                    if (i + 1 < steps.length()) {
+                        try { Thread.sleep(220L) } catch (ignored: InterruptedException) {}
                     }
                 }
+                return lastRes
             }
-            var items = AgentNotificationListener.getRecentNotifications(base, filterQ, limit)
-            if (items.length() == 0) {
-                runCatching {
-                    if (privilege!!.isRootGrantedFast() || privilege!!.probe().optBoolean("root")) {
-                        val dumpRes = privilege!!.execute(
-                            JSONObject()
-                                .put("op", "shell")
-                                .put("command", "dumpsys notification --noredact | grep -E 'NotificationRecord\\(|pkg=|android\\.title=|android\\.text=|android\\.bigText=' | head -n 260")
-                        )
-                        val rawOut = dumpRes.optString("output", dumpRes.optString("stdout", ""))
-                        val parsed = JSONArray()
-                        var curPkg = ""
-                        var curTitle = ""
-                        var curText = ""
-                        fun flushRecord() {
-                            if (curPkg.isNotBlank() && curPkg != base.packageName && curPkg != "android" && curPkg != "com.android.systemui" && (curTitle.isNotBlank() || curText.isNotBlank())) {
-                                val appLabel = AgentNotificationListener.resolveAppName(base, curPkg)
-                                val hay = "$appLabel $curPkg $curTitle $curText".lowercase()
-                                if (filterQ.isBlank() || hay.contains(filterQ.lowercase())) {
-                                    parsed.put(
-                                        JSONObject()
-                                            .put("package", curPkg)
-                                            .put("app", appLabel)
-                                            .put("title", curTitle)
-                                            .put("text", curText)
-                                            .put("active", true)
-                                    )
-                                }
-                            }
-                            curTitle = ""
-                            curText = ""
-                        }
-                        for (line in rawOut.lineSequence()) {
-                            val s = line.trim()
-                            if (s.contains("NotificationRecord(")) {
-                                flushRecord()
-                                val m = Regex("pkg=([^\\s:]+)").find(s)
-                                curPkg = m?.groupValues?.get(1) ?: ""
-                            } else if (s.startsWith("android.title=")) {
-                                curTitle = s.substringAfter("android.title=").removePrefix("String (").removeSuffix(")").trim()
-                            } else if (s.startsWith("android.bigText=") && s != "android.bigText=null") {
-                                val bt = s.substringAfter("android.bigText=").removePrefix("String (").removeSuffix(")").trim()
-                                if (bt.isNotBlank() && bt != "null") curText = bt
-                            } else if (s.startsWith("android.text=") && curText.isBlank()) {
-                                val tx = s.substringAfter("android.text=").removePrefix("String (").removeSuffix(")").trim()
-                                if (tx != "null") curText = tx
-                            }
-                            if (parsed.length() >= limit) break
-                        }
-                        flushRecord()
-                        if (parsed.length() > 0) items = parsed
-                    }
+            "auto_release" -> {
+                val curDisp = runCatching { JSONObject(state.value.display).optInt("displayId", -1) }.getOrDefault(-1)
+                if (!state.value.displayCreated && curDisp <= 0) {
+                    return JSONObject().put("uid", 0).put("ok", true).put("noop", true).put("created", false)
+                }
+                val toFg = input.optBoolean("to_foreground", false)
+                scheduleAutoRelease(base, input.optLong("delay_ms", 2500L), toFg)
+                return JSONObject().put("scheduled_release", true).put("to_foreground", toFg)
+            }
+            "release" -> {
+                val curDisp = runCatching { JSONObject(state.value.display).optInt("displayId", -1) }.getOrDefault(-1)
+                if (!state.value.displayCreated && curDisp <= 0) {
+                    autoReleaseJob?.cancel()
+                    idleWatchJob?.cancel()
+                    stopLivePreview()
+                    releaseKeepAwake()
+                    return JSONObject()
+                        .put("uid", 0)
+                        .put("ok", true)
+                        .put("noop", true)
+                        .put("released", true)
+                        .put("already_released", true)
+                        .put("created", false)
+                        .put("displayId", curDisp)
                 }
             }
-            return JSONObject()
-                .put("ok", true)
-                .put("listener_connected", AgentNotificationListener.isConnected())
-                .put("count", items.length())
-                .put("notifications", items)
         }
         if (operation != "preview" && operation != "status" && operation != "release") {
             touchActivity()
@@ -624,276 +399,41 @@ object RootPhoneHarness {
         var currentDisplay = JSONObject(state.value.display).let {
             if (it.optBoolean("created", false)) it.optInt("displayId", -1) else -1
         }
-        if (currentDisplay <= 0 && operation in listOf("ui_tree", "tap", "tap_node", "tap_and_type", "swipe", "text", "type_node", "key", "long_press", "capture")) {
-            val dispObj = JSONObject(state.value.display)
-            if (dispObj.optBoolean("allocated", false) && dispObj.optInt("displayId", -1) > 0) {
-                runCatching {
-                    val woke = command(base, JSONObject().put("op", "create"))
-                    currentDisplay = woke.optInt("displayId", -1)
-                }
+        val virtualDisplayOps = setOf("ui_tree", "tap", "tap_node", "tap_and_type", "swipe", "text", "type_node", "key", "long_press", "capture", "launch", "open_uri", "resize")
+        if (currentDisplay <= 0 && operation in virtualDisplayOps) {
+            runCatching {
+                val skipHome = operation == "launch" || operation == "open_uri"
+                val woke = command(base, JSONObject().put("op", "create").put("skip_home", skipHome))
+                currentDisplay = woke.optInt("displayId", -1)
+            }
+            if (currentDisplay <= 0) {
+                throw Exception("虚拟屏尚未创建成功 (display_not_created, displayId=$currentDisplay)，请检查 Root 权限后重试")
             }
         }
-        var dispInfo = JSONObject(state.value.imageInfo.ifBlank { state.value.display })
+        var dispInfo = JSONObject(state.value.display.ifBlank { state.value.imageInfo })
         var dispW = dispInfo.optInt("width", 720).coerceAtLeast(1)
-        var dispH = dispInfo.optInt("height", 1600).coerceAtLeast(1)
+        var dispH = dispInfo.optInt("height", 1584).coerceAtLeast(1)
 
-        fun resolveGridOrNorm(cmdObj: JSONObject) {
-            if (cmdObj.has("start_x") && !cmdObj.has("x1")) cmdObj.put("x1", cmdObj.optInt("start_x"))
-            if (cmdObj.has("start_y") && !cmdObj.has("y1")) cmdObj.put("y1", cmdObj.optInt("start_y"))
-            if (cmdObj.has("end_x") && !cmdObj.has("x2")) cmdObj.put("x2", cmdObj.optInt("end_x"))
-            if (cmdObj.has("end_y") && !cmdObj.has("y2")) cmdObj.put("y2", cmdObj.optInt("end_y"))
-            val dir = cmdObj.optString("direction", "").trim().lowercase()
-            if (operation == "swipe" && dir.isNotEmpty() && !cmdObj.has("x2")) {
-                val cx = dispW / 2
-                val cy = dispH / 2
-                when (dir) {
-                    "up" -> { cmdObj.put("x1", cx); cmdObj.put("y1", (dispH * 0.72).toInt()); cmdObj.put("x2", cx); cmdObj.put("y2", (dispH * 0.25).toInt()) }
-                    "down" -> { cmdObj.put("x1", cx); cmdObj.put("y1", (dispH * 0.28).toInt()); cmdObj.put("x2", cx); cmdObj.put("y2", (dispH * 0.75).toInt()) }
-                    "left" -> { cmdObj.put("x1", (dispW * 0.80).toInt()); cmdObj.put("y1", cy); cmdObj.put("x2", (dispW * 0.20).toInt()); cmdObj.put("y2", cy) }
-                    "right" -> { cmdObj.put("x1", (dispW * 0.20).toInt()); cmdObj.put("y1", cy); cmdObj.put("x2", (dispW * 0.80).toInt()); cmdObj.put("y2", cy) }
-                }
-            }
-            val grid = cmdObj.optString("grid", "").trim().uppercase()
-            if (grid.length in 2..3 && grid[0] in 'A'..'F') {
-                val colIdx = grid[0] - 'A'
-                val rowIdx = (grid.substring(1).toIntOrNull() ?: 1).coerceIn(1, 10) - 1
-                cmdObj.put("x", ((colIdx + 0.5) / 6.0 * dispW).toInt().coerceIn(1, (dispW - 2).coerceAtLeast(1)))
-                cmdObj.put("y", ((rowIdx + 0.5) / 10.0 * dispH).toInt().coerceIn(1, (dispH - 2).coerceAtLeast(1)))
-                return
-            }
-            val isNormFlag = cmdObj.optBoolean("normalized", false) || cmdObj.optString("coord_space", "") == "normalized"
-            if (cmdObj.has("nx") && cmdObj.has("ny")) {
-                val nx = cmdObj.optDouble("nx", 500.0).coerceIn(0.0, 1000.0)
-                val ny = cmdObj.optDouble("ny", 500.0).coerceIn(0.0, 1000.0)
-                cmdObj.put("x", (nx / 1000.0 * dispW).toInt().coerceIn(1, (dispW - 2).coerceAtLeast(1)))
-                cmdObj.put("y", (ny / 1000.0 * dispH).toInt().coerceIn(1, (dispH - 2).coerceAtLeast(1)))
-            } else if (!cmdObj.has("grid") && cmdObj.has("x") && cmdObj.has("y")) {
-                val rx = cmdObj.optInt("x", 0)
-                val ry = cmdObj.optInt("y", 0)
-                if (isNormFlag || ((rx > dispW || ry > dispH) && rx <= 1000 && ry <= 1000)) {
-                    cmdObj.put("x", (rx / 1000.0 * dispW).toInt().coerceIn(1, (dispW - 2).coerceAtLeast(1)))
-                    cmdObj.put("y", (ry / 1000.0 * dispH).toInt().coerceIn(1, (dispH - 2).coerceAtLeast(1)))
-                } else {
-                    cmdObj.put("x", rx.coerceIn(0, (dispW - 1).coerceAtLeast(0)))
-                    cmdObj.put("y", ry.coerceIn(0, (dispH - 1).coerceAtLeast(0)))
-                }
-            }
-            if (cmdObj.has("nx1") && cmdObj.has("ny1")) {
-                cmdObj.put("x1", (cmdObj.optDouble("nx1", 500.0).coerceIn(0.0, 1000.0) / 1000.0 * dispW).toInt().coerceIn(1, (dispW - 2).coerceAtLeast(1)))
-                cmdObj.put("y1", (cmdObj.optDouble("ny1", 500.0).coerceIn(0.0, 1000.0) / 1000.0 * dispH).toInt().coerceIn(1, (dispH - 2).coerceAtLeast(1)))
-            } else if (cmdObj.has("x1") && cmdObj.has("y1")) {
-                val rx1 = cmdObj.optInt("x1", 0)
-                val ry1 = cmdObj.optInt("y1", 0)
-                if (isNormFlag || ((rx1 > dispW || ry1 > dispH) && rx1 <= 1000 && ry1 <= 1000)) {
-                    cmdObj.put("x1", (rx1 / 1000.0 * dispW).toInt().coerceIn(1, (dispW - 2).coerceAtLeast(1)))
-                    cmdObj.put("y1", (ry1 / 1000.0 * dispH).toInt().coerceIn(1, (dispH - 2).coerceAtLeast(1)))
-                } else {
-                    cmdObj.put("x1", rx1.coerceIn(0, (dispW - 1).coerceAtLeast(0)))
-                    cmdObj.put("y1", ry1.coerceIn(0, (dispH - 1).coerceAtLeast(0)))
-                }
-            }
-            if (cmdObj.has("nx2") && cmdObj.has("ny2")) {
-                cmdObj.put("x2", (cmdObj.optDouble("nx2", 500.0).coerceIn(0.0, 1000.0) / 1000.0 * dispW).toInt().coerceIn(1, (dispW - 2).coerceAtLeast(1)))
-                cmdObj.put("y2", (cmdObj.optDouble("ny2", 500.0).coerceIn(0.0, 1000.0) / 1000.0 * dispH).toInt().coerceIn(1, (dispH - 2).coerceAtLeast(1)))
-            } else if (cmdObj.has("x2") && cmdObj.has("y2")) {
-                val rx2 = cmdObj.optInt("x2", 0)
-                val ry2 = cmdObj.optInt("y2", 0)
-                if (isNormFlag || ((rx2 > dispW || ry2 > dispH) && rx2 <= 1000 && ry2 <= 1000)) {
-                    cmdObj.put("x2", (rx2 / 1000.0 * dispW).toInt().coerceIn(1, (dispW - 2).coerceAtLeast(1)))
-                    cmdObj.put("y2", (ry2 / 1000.0 * dispH).toInt().coerceIn(1, (dispH - 2).coerceAtLeast(1)))
-                } else {
-                    cmdObj.put("x2", rx2.coerceIn(0, (dispW - 1).coerceAtLeast(0)))
-                    cmdObj.put("y2", ry2.coerceIn(0, (dispH - 1).coerceAtLeast(0)))
-                }
-            }
-        }
-        resolveGridOrNorm(input)
+        resolveGridOrNormCoords(operation, input, dispW, dispH)
 
         if (operation == "tap_and_type") {
-            if (currentDisplay <= 0) throw Exception("先创建独立工作区")
-            val ref = input.optString("ref", input.optString("node", "")).trim()
-            val targetLabel = input.optString("target", input.optString("label", input.optString("hint", ""))).trim()
-            val resId = input.optString("id", input.optString("view_id", input.optString("resource_id", ""))).trim()
-            val txt = input.optString("text", input.optString("value", ""))
-            var resolvedNode: PulseAccessibilityService.CachedNode? = null
-            if (!input.has("x") || !input.has("y")) {
-                if (ref.isNotEmpty() || targetLabel.isNotEmpty() || resId.isNotEmpty()) {
-                    resolvedNode = PulseAccessibilityService.resolveTargetNode(currentDisplay, dispW, dispH, ref, targetLabel, resId)
-                    if (resolvedNode == null) {
-                        readUiTreeForDisplay(currentDisplay, dispW, dispH, forceRefresh = true)
-                        resolvedNode = PulseAccessibilityService.resolveTargetNode(currentDisplay, dispW, dispH, ref, targetLabel, resId)
-                    }
-                }
-                if (resolvedNode == null) {
-                    var snap = PulseAccessibilityService.getCachedSnapshot(currentDisplay)
-                    if (snap == null || snap.nodes.isEmpty()) {
-                        readUiTreeForDisplay(currentDisplay, dispW, dispH, forceRefresh = true)
-                        snap = PulseAccessibilityService.getCachedSnapshot(currentDisplay)
-                    }
-                    resolvedNode = snap?.nodes?.firstOrNull { n ->
-                        n.editable || n.role.equals("EditText", ignoreCase = true) ||
-                            n.text.contains("搜索") || n.text.contains("输入") ||
-                            n.hint.contains("搜索") || n.hint.contains("输入")
-                    }
-                }
-            }
-            val tx = if (input.has("x")) input.optInt("x") else (resolvedNode?.centerX ?: throw Exception("未识别到输入框节点，请先调用 ui_tree 或指定输入框 ref/坐标"))
-            val ty = if (input.has("y")) input.optInt("y") else (resolvedNode?.centerY ?: throw Exception("未识别到输入框节点，请先调用 ui_tree 或指定输入框 ref/坐标"))
-            privilege!!.execute(JSONObject().put("op", "tap").put("display_id", currentDisplay).put("x", tx).put("y", ty))
-            state.update { it.copy(lastTouchX = tx, lastTouchY = ty, lastTouchTime = System.currentTimeMillis()) }
-            FloatingVirtualDisplay.onWorkspaceStateChanged(base.applicationContext, state.value)
-            Thread.sleep(320)
-            var typeRes = JSONObject()
-            if (txt.isNotEmpty()) {
-                var a11yOk = false
-                if (resolvedNode != null && resolvedNode.editable) {
-                    a11yOk = PulseAccessibilityService.performAccessibilityAction(currentDisplay, resolvedNode, "set_text", txt)
-                }
-                if (!a11yOk) {
-                    readUiTreeForDisplay(currentDisplay, dispW, dispH, forceRefresh = true)
-                    val newEdit = PulseAccessibilityService.getCachedSnapshot(currentDisplay)?.nodes?.firstOrNull { it.editable || it.role.equals("EditText", ignoreCase = true) }
-                    if (newEdit != null) {
-                        a11yOk = PulseAccessibilityService.performAccessibilityAction(currentDisplay, newEdit, "set_text", txt)
-                    }
-                }
-                typeRes = if (a11yOk) {
-                    JSONObject().put("ok", true).put("typed", true).put("method", "accessibility_set_text")
-                } else {
-                    privilege!!.execute(JSONObject().put("op", "text").put("display_id", currentDisplay).put("text", txt))
-                }
-            }
-            if (input.optBoolean("submit", false) || input.optBoolean("press_enter", false) || input.optBoolean("send", false)) {
-                Thread.sleep(200)
-                privilege!!.execute(JSONObject().put("op", "key").put("display_id", currentDisplay).put("key", "enter"))
-            }
-            return JSONObject()
-                .put("uid", 0)
-                .put("ok", true)
-                .put("op", "tap_and_type")
-                .put("ref", resolvedNode?.ref ?: ref)
-                .put("x", tx)
-                .put("y", ty)
-                .put("tapped", JSONObject().put("x", tx).put("y", ty))
-                .put("typed", typeRes)
+            return executeTapAndTypeAction(base, input, currentDisplay, dispW, dispH)
         }
-
-        // 1. Primary operation: Read Accessibility / UI Node Tree (`ui_tree`)
         if (operation == "ui_tree") {
-            if (currentDisplay <= 0) throw Exception("虚拟屏尚未启动任何应用，请先调用 launch 打开目标应用")
+            if (currentDisplay <= 0) throw Exception("虚拟屏尚未就绪，请先调用 launch 打开目标应用")
             lastCaptureRotation = null
             val treeJson = readUiTreeForDisplay(currentDisplay, dispW, dispH, forceRefresh = input.optBoolean("refresh", true))
             state.update { it.copy(lastTreeSummary = treeJson.optString("summary", "")) }
-            return treeJson
+            return treeJson.put("created", true).put("displayId", currentDisplay).put("display_id", currentDisplay)
         }
-
-        // 2. Primary node-based click (`tap_node`) or `tap` with `ref` / `text` / `id` instead of raw (x,y)
         if (operation == "tap_node" || (operation == "tap" && !input.has("x") && (input.has("ref") || input.has("text") || input.has("id") || input.has("target")))) {
-            if (currentDisplay <= 0) throw Exception("先创建独立工作区")
-            val ref = input.optString("ref", input.optString("node", "")).trim()
-            val text = input.optString("text", input.optString("target", input.optString("label", ""))).trim()
-            val resId = input.optString("id", input.optString("resource_id", "")).trim()
-            var node = PulseAccessibilityService.resolveTargetNode(currentDisplay, dispW, dispH, ref, text, resId)
-            if (node == null) {
-                readUiTreeForDisplay(currentDisplay, dispW, dispH, forceRefresh = true)
-                node = PulseAccessibilityService.resolveTargetNode(currentDisplay, dispW, dispH, ref, text, resId)
-            }
-            if (node == null) {
-                throw Exception("在当前无障碍节点树中未找到目标节点 (ref=$ref, text=$text, id=$resId)；请先调用 ui_tree 核对最新节点，或改用 swipe 滚动页面 / 最后用 tap(x,y) 硬点")
-            }
-            val beforeHash = PulseAccessibilityService.getCachedSnapshot(currentDisplay)?.treeHash.orEmpty()
-            val a11yClicked = PulseAccessibilityService.performAccessibilityAction(currentDisplay, node, "click")
-            var needCenterTap = !a11yClicked
-            if (a11yClicked) {
-                // Verify whether ACTION_CLICK actually changed the UI tree (ListView / custom OnTouchListener rows often ignore ACTION_CLICK)
-                try { Thread.sleep(130L) } catch (ignored: InterruptedException) {}
-                val checkTree = PulseAccessibilityService.dumpDisplayTree(currentDisplay, dispW, dispH, forceRefresh = true, waitMs = 160L)
-                if (checkTree == null || checkTree.optString("treeHash") == beforeHash) {
-                    needCenterTap = true
-                }
-            }
-            val tapRes = if (needCenterTap) {
-                privilege!!.execute(JSONObject().put("op", "tap").put("display_id", currentDisplay).put("x", node.centerX).put("y", node.centerY))
-            } else {
-                JSONObject().put("uid", 0).put("displayId", currentDisplay).put("clicked", true)
-            }
-            val nowTs = System.currentTimeMillis()
-            state.update { it.copy(lastTouchX = node.centerX, lastTouchY = node.centerY, lastTouchTime = nowTs) }
-            FloatingVirtualDisplay.onWorkspaceStateChanged(base.applicationContext, state.value)
-            return tapRes
-                .put("clicked", true)
-                .put("method", if (!needCenterTap) "accessibility_node" else "node_center_tap")
-                .put("ref", node.ref)
-                .put("role", node.role)
-                .put("label", node.text.ifBlank { node.desc })
-                .put("x", node.centerX)
-                .put("y", node.centerY)
+            return executeTapNodeAction(base, input, currentDisplay, dispW, dispH)
         }
-
-        // 3. Node-based text input (`type_node`) or `text` with automatic Accessibility `set_text` priority
         if (operation == "type_node" || operation == "text") {
-            if (currentDisplay <= 0) throw Exception("先创建独立工作区")
-            val ref = input.optString("ref", input.optString("node", "")).trim()
-            val targetLabel = input.optString("target", input.optString("hint", "")).trim()
-            val resId = input.optString("id", input.optString("resource_id", "")).trim()
-            val contentText = input.optString("text", input.optString("value", ""))
-            if (contentText.isEmpty()) throw Exception("text/type_node 需要提供要输入的 text")
-            var node = if (ref.isNotEmpty() || targetLabel.isNotEmpty() || resId.isNotEmpty()) {
-                PulseAccessibilityService.resolveTargetNode(currentDisplay, dispW, dispH, ref, targetLabel, resId)
-            } else {
-                PulseAccessibilityService.getCachedSnapshot(currentDisplay)?.nodes?.firstOrNull { it.editable }
-            }
-            if (node == null) {
-                readUiTreeForDisplay(currentDisplay, dispW, dispH, forceRefresh = true)
-                node = if (ref.isNotEmpty() || targetLabel.isNotEmpty() || resId.isNotEmpty()) {
-                    PulseAccessibilityService.resolveTargetNode(currentDisplay, dispW, dispH, ref, targetLabel, resId)
-                } else {
-                    PulseAccessibilityService.getCachedSnapshot(currentDisplay)?.nodes?.firstOrNull { it.editable }
-                }
-            }
-            if (node != null) {
-                if (ref.isNotEmpty() || targetLabel.isNotEmpty() || resId.isNotEmpty()) {
-                    runCatching {
-                        privilege!!.execute(JSONObject().put("op", "tap").put("display_id", currentDisplay).put("x", node.centerX).put("y", node.centerY))
-                        Thread.sleep(150L)
-                    }
-                }
-                val a11yTyped = PulseAccessibilityService.performAccessibilityAction(currentDisplay, node, "set_text", contentText)
-                if (a11yTyped) {
-                    if (input.optBoolean("submit", false) || input.optBoolean("press_enter", false) || input.optBoolean("send", false)) {
-                        Thread.sleep(200)
-                        privilege!!.execute(JSONObject().put("op", "key").put("display_id", currentDisplay).put("key", "enter"))
-                    }
-                    return JSONObject()
-                        .put("uid", 0)
-                        .put("typed", true)
-                        .put("method", "accessibility_set_text")
-                        .put("ref", node.ref)
-                        .put("characters", contentText.length)
-                }
-            }
-            // Fallback to clipboard paste on display
-            val pasteRes = privilege!!.execute(JSONObject().put("op", "text").put("display_id", currentDisplay).put("text", contentText))
-            if (input.optBoolean("submit", false) || input.optBoolean("press_enter", false) || input.optBoolean("send", false)) {
-                Thread.sleep(200)
-                privilege!!.execute(JSONObject().put("op", "key").put("display_id", currentDisplay).put("key", "enter"))
-            }
-            return pasteRes.put("method", "clipboard_paste").put("ref", node?.ref.orEmpty())
+            return executeTypeNodeAction(input, currentDisplay, dispW, dispH)
         }
-
         if (operation == "long_press" && !input.has("x") && (input.has("ref") || input.has("text") || input.has("id") || input.has("target"))) {
-            if (currentDisplay <= 0) throw Exception("先创建独立工作区")
-            val ref = input.optString("ref", input.optString("node", "")).trim()
-            val text = input.optString("text", input.optString("target", input.optString("label", ""))).trim()
-            val resId = input.optString("id", input.optString("resource_id", "")).trim()
-            var node = PulseAccessibilityService.resolveTargetNode(currentDisplay, dispW, dispH, ref, text, resId)
-            if (node == null) {
-                readUiTreeForDisplay(currentDisplay, dispW, dispH, forceRefresh = true)
-                node = PulseAccessibilityService.resolveTargetNode(currentDisplay, dispW, dispH, ref, text, resId)
-            }
-            if (node == null) {
-                throw Exception("在当前无障碍节点树中未找到长按目标节点 (ref=$ref, text=$text, id=$resId)")
-            }
-            input.put("x", node.centerX).put("y", node.centerY)
+            resolveLongPressNodeCoords(input, currentDisplay, dispW, dispH)
         }
 
         val command = JSONObject(input.toString())
@@ -904,18 +444,18 @@ object RootPhoneHarness {
             val resolved = resolveLaunchComponent(base, rawComp)
             command.put("component", resolved)
             if (currentDisplay <= 0) {
-                val created = command(base, JSONObject().put("op", "create"))
+                val created = command(base, JSONObject().put("op", "create").put("skip_home", true))
                 currentDisplay = created.optInt("displayId", -1)
-                dispInfo = JSONObject(state.value.imageInfo.ifBlank { state.value.display })
+                dispInfo = JSONObject(state.value.display.ifBlank { state.value.imageInfo })
                 dispW = dispInfo.optInt("width", 720).coerceAtLeast(1)
-                dispH = dispInfo.optInt("height", 1600).coerceAtLeast(1)
+                dispH = dispInfo.optInt("height", 1584).coerceAtLeast(1)
             }
             lastCaptureRotation = null
         } else if (operation == "open_uri") {
             val uri = command.optString("uri", command.optString("url", command.optString("text", ""))).trim()
             if (uri.isEmpty()) throw Exception("请提供要打开的 URI/URL")
             if (currentDisplay <= 0) {
-                val created = command(base, JSONObject().put("op", "create"))
+                val created = command(base, JSONObject().put("op", "create").put("skip_home", true))
                 currentDisplay = created.optInt("displayId", -1)
             }
             lastCaptureRotation = null
@@ -923,16 +463,109 @@ object RootPhoneHarness {
             lastCaptureRotation = null
         }
         if (operation in listOf("capture", "tap", "long_press", "swipe", "text", "key", "launch", "open_uri", "resize")) {
-            if (currentDisplay <= 0) throw Exception("虚拟屏尚未启动任何应用，请先调用 launch 打开目标应用")
+            if (currentDisplay <= 0) throw Exception("虚拟屏尚未启动任何应用 (display_not_created)，请先调用 launch 打开目标应用")
             if (command.has("display_id") && command.getInt("display_id") != currentDisplay) throw Exception("displayId 不属于当前工作区")
             command.put("display_id", currentDisplay)
             if (operation in listOf("tap", "long_press", "swipe") && !input.optBoolean("manual")) lastCaptureRotation?.let { command.put("expected_rotation", it) }
         }
+        val beforeKeyHash = if (operation == "key" && currentDisplay > 0) {
+            (PulseAccessibilityService.getCachedSnapshot(currentDisplay)
+                ?: PulseAccessibilityService.dumpDisplayTree(currentDisplay, dispW, dispH, forceRefresh = false, waitMs = 150L)?.let {
+                    PulseAccessibilityService.getCachedSnapshot(currentDisplay)
+                })?.treeHash.orEmpty()
+        } else ""
         try {
             val result = privilege!!.execute(command)
             if (result.optInt("uid", -1) != 0) throw Exception("拒绝非 Root 的手机执行结果")
-            val image = result.optString("image")
-            val clean = JSONObject(result.toString()); clean.remove("image")
+            if (operation == "key" && currentDisplay > 0) {
+                try { Thread.sleep(240L) } catch (ignored: InterruptedException) {}
+                var afterTree = readUiTreeForDisplay(currentDisplay, dispW, dispH, forceRefresh = true, waitMs = 450L)
+                var afterHash = afterTree.optString("treeHash")
+                if (beforeKeyHash.isNotEmpty() && afterHash == beforeKeyHash) {
+                    val keyCode = result.optInt("keycode", 4).let { if (it > 0) it else 4 }
+                    runCatching {
+                        privilege!!.execute(
+                            JSONObject()
+                                .put("op", "shell")
+                                .put("command", "input -d $currentDisplay keyevent $keyCode")
+                        )
+                    }
+                    try { Thread.sleep(260L) } catch (ignored: InterruptedException) {}
+                    afterTree = readUiTreeForDisplay(currentDisplay, dispW, dispH, forceRefresh = true, waitMs = 500L)
+                    afterHash = afterTree.optString("treeHash")
+                }
+                val consumed = beforeKeyHash.isEmpty() || afterHash != beforeKeyHash
+                val summary = afterTree.optString("summary", "")
+                state.update { it.copy(lastTreeSummary = summary) }
+                result.put("key_consumed", consumed)
+                    .put("tree_hash_before", beforeKeyHash)
+                    .put("tree_hash_after", afterHash)
+                    .put("treeHash", afterHash)
+                    .put("tree_hash", afterHash)
+                    .put("package", afterTree.optString("package", "unknown"))
+                    .put("nodeCount", afterTree.optInt("nodeCount", 0))
+                    .put("layoutStable", afterTree.optBoolean("layoutStable", false))
+                    .put("settled", afterTree.optBoolean("settled", false))
+                    .put("settle_ms", afterTree.optLong("settle_ms", 0L))
+                    .put("densityDpi", 320)
+                    .put("screenWidthDp", 360)
+                    .put("fontScale", 1.0)
+                    .put("ui_tree", summary)
+            } else if ((operation == "launch" || operation == "open_uri") && currentDisplay > 0) {
+                try { Thread.sleep(280L) } catch (ignored: InterruptedException) {}
+                var launchTree = readUiTreeForDisplay(currentDisplay, dispW, dispH, forceRefresh = true, waitMs = 950L)
+                if (launchTree.optInt("nodeCount", 0) == 0 || launchTree.optString("package", "unknown") == "unknown") {
+                    try { Thread.sleep(260L) } catch (ignored: InterruptedException) {}
+                    launchTree = readUiTreeForDisplay(currentDisplay, dispW, dispH, forceRefresh = true, waitMs = 650L)
+                }
+                val pkg = launchTree.optString("package", "unknown")
+                val cnt = launchTree.optInt("nodeCount", 0)
+                val summary = launchTree.optString("summary", "")
+                val lHash = launchTree.optString("treeHash", "")
+                state.update { it.copy(lastTreeSummary = summary) }
+                result.put("launched", pkg.isNotBlank() && pkg != "unknown" && cnt > 0)
+                    .put("package", pkg)
+                    .put("nodeCount", cnt)
+                    .put("treeHash", lHash)
+                    .put("tree_hash", lHash)
+                    .put("layoutStable", launchTree.optBoolean("layoutStable", false))
+                    .put("settled", launchTree.optBoolean("settled", false))
+                    .put("settle_ms", launchTree.optLong("settle_ms", 0L))
+                    .put("densityDpi", 320)
+                    .put("screenWidthDp", 360)
+                    .put("fontScale", 1.0)
+                    .put("likely_blank", launchTree.optBoolean("likely_blank", cnt == 0))
+                    .put("layout_signature", launchTree.optString("layout_signature", ""))
+                    .put("ui_tree", summary)
+            } else if (operation in listOf("tap", "swipe", "long_press", "capture") && currentDisplay > 0 && !input.optBoolean("manual", false)) {
+                val waitForSettle = if (operation == "capture") 280L else 450L
+                if (operation != "capture") {
+                    try { Thread.sleep(220L) } catch (ignored: InterruptedException) {}
+                }
+                val afterTree = readUiTreeForDisplay(currentDisplay, dispW, dispH, forceRefresh = true, waitMs = waitForSettle)
+                val summary = afterTree.optString("summary", "")
+                val aHash = afterTree.optString("treeHash", "")
+                state.update { it.copy(lastTreeSummary = summary) }
+                result.put("package", afterTree.optString("package", "unknown"))
+                    .put("nodeCount", afterTree.optInt("nodeCount", 0))
+                    .put("treeHash", aHash)
+                    .put("tree_hash", aHash)
+                    .put("layoutStable", afterTree.optBoolean("layoutStable", false))
+                    .put("settled", afterTree.optBoolean("settled", false))
+                    .put("settle_ms", afterTree.optLong("settle_ms", 0L))
+                    .put("densityDpi", 320)
+                    .put("screenWidthDp", 360)
+                    .put("fontScale", 1.0)
+                    .put("likely_blank", afterTree.optBoolean("likely_blank", false))
+                    .put("layout_signature", afterTree.optString("layout_signature", ""))
+                    .put("ui_tree", summary)
+                attachLatestDisplayFrame(result, currentDisplay)
+            }
+            if (operation in listOf("launch", "open_uri", "key") && currentDisplay > 0) {
+                attachLatestDisplayFrame(result, currentDisplay)
+            }
+            val image = result.optString("image").ifBlank { result.optString("_image_b64") }
+            val clean = shallowCopyWithoutImage(result)
             if (operation == "capture" && !input.optBoolean("manual")) lastCaptureRotation = result.optInt("rotation")
             val touchX = when (operation) {
                 "tap" -> command.optInt("x", -1)
@@ -983,107 +616,6 @@ object RootPhoneHarness {
         }
     }
 
-    private fun readUiTreeForDisplay(displayId: Int, dispW: Int, dispH: Int, forceRefresh: Boolean): JSONObject {
-        if (!PulseAccessibilityService.isConnected()) {
-            runCatching { privilege?.probe() }
-            val waitDeadline = SystemClock.uptimeMillis() + 300L
-            while (!PulseAccessibilityService.isConnected() && SystemClock.uptimeMillis() < waitDeadline) {
-                try { Thread.sleep(60L) } catch (ignored: InterruptedException) { break }
-            }
-        }
-        // Strictly read Accessibility windows on the virtual display (`displayId > 0`) with a 420ms anti-redraw bound
-        // (NEVER fall back to `dumpsys activity top`, which freezes Android's system_server and foreground UI thread!)
-        PulseAccessibilityService.dumpDisplayTree(displayId, dispW, dispH, forceRefresh, waitMs = 420L)?.let {
-            return it.put("uid", 0).put("source", "accessibility_windows")
-        }
-        val emptySnap = PulseAccessibilityService.updateSnapshotFromExternal(displayId, emptyList(), "", dispW, dispH)
-        return PulseAccessibilityService.snapshotToJson(emptySnap, fromCache = false)
-            .put("uid", 0)
-            .put("source", "empty")
-    }
-
-    private fun queryLauncherApps(base: Context, forceRefresh: Boolean = false): List<PhoneApp> {
-        val now = SystemClock.elapsedRealtime()
-        if (!forceRefresh && cachedLauncherApps.isNotEmpty() && now - appsCachedAtElapsed < APPS_CACHE_TTL_MS) {
-            return cachedLauncherApps
-        }
-        val launcher = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-        val fresh = base.packageManager.queryIntentActivities(launcher, 0)
-            .filter { it.activityInfo.packageName != base.packageName }
-            .map { PhoneApp(it.loadLabel(base.packageManager).toString(), it.activityInfo.packageName + "/" + it.activityInfo.name) }
-            .distinctBy { it.component }
-            .sortedBy { it.name }
-        cachedLauncherApps = fresh
-        appsCachedAtElapsed = now
-        return fresh
-    }
-
-    private fun resolveLaunchComponent(base: Context, query: String): String {
-        if (query.isBlank()) throw Exception("请提供要打开的应用名或组件名")
-        val qTrim = query.trim()
-        resolvedComponentCache[qTrim]?.let { return it }
-        if (qTrim.contains("/") && qTrim.matches(Regex("[A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+"))) {
-            resolvedComponentCache[qTrim] = qTrim
-            return qTrim
-        }
-        val apps = state.value.apps.ifEmpty { queryLauncherApps(base).also { list -> state.update { it.copy(apps = list) } } }
-        val qLower = qTrim.lowercase()
-        val stripped = qLower
-            .replace(Regex("^(oppo|vivo|小米|miui|hyperos|华为|huawei|荣耀|honor|一加|oneplus|realme|真我|红米|redmi|三星|samsung|系统|手机|自带)\\s*"), "")
-            .replace(Regex("(app|客户端|应用)$"), "")
-            .trim()
-            .ifBlank { qLower }
-
-        val aliasPackages = mapOf(
-            "微信" to "com.tencent.mm", "wechat" to "com.tencent.mm",
-            "b站" to "tv.danmaku.bili", "bilibili" to "tv.danmaku.bili", "哔哩哔哩" to "tv.danmaku.bili",
-            "qq" to "com.tencent.mobileqq",
-            "网易云" to "com.netease.cloudmusic", "网易云音乐" to "com.netease.cloudmusic",
-            "qq音乐" to "com.tencent.qqmusic",
-            "健康" to "com.heytap.health", "运动健康" to "com.heytap.health",
-            "淘宝" to "com.taobao.taobao", "支付宝" to "com.eg.android.AlipayGphone",
-            "高德" to "com.autonavi.minimap", "高德地图" to "com.autonavi.minimap",
-            "美团" to "com.sankuai.meituan", "小红书" to "com.xingin.xhs",
-            "抖音" to "com.ss.android.ugc.aweme", "知乎" to "com.zhihu.android"
-        )
-        val aliasPkg = aliasPackages[qLower] ?: aliasPackages[stripped]
-        if (aliasPkg != null) {
-            apps.firstOrNull { it.component.substringBefore("/").equals(aliasPkg, ignoreCase = true) }?.let {
-                resolvedComponentCache[qTrim] = it.component
-                return it.component
-            }
-        }
-
-        // 1. Exact package match or exact name match (raw or brand-stripped)
-        apps.firstOrNull {
-            val pkg = it.component.substringBefore("/").lowercase()
-            val nm = it.name.lowercase()
-            pkg == qLower || nm == qLower || nm == stripped
-        }?.let {
-            resolvedComponentCache[qTrim] = it.component
-            return it.component
-        }
-        // 2. Bidirectional substring match on app name or package name
-        apps.firstOrNull {
-            val nm = it.name.lowercase()
-            val comp = it.component.lowercase()
-            nm.contains(qLower) || nm.contains(stripped) ||
-                (nm.length >= 2 && (qLower.contains(nm) || stripped.contains(nm))) ||
-                comp.contains(qLower)
-        }?.let {
-            resolvedComponentCache[qTrim] = it.component
-            return it.component
-        }
-        // 3. Fallback via PackageManager getLaunchIntentForPackage
-        base.packageManager.getLaunchIntentForPackage(qTrim)?.component?.let {
-            val comp = it.packageName + "/" + it.className
-            resolvedComponentCache[qTrim] = comp
-            return comp
-        }
-        val sampleApps = apps.take(25).joinToString("、") { it.name }
-        throw Exception("未在手机上找到应用「$qTrim」；已安装的部分应用有：$sampleApps（也可调用 op=\"apps\" 搜索）")
-    }
-
     private fun startLivePreview(appContext: Context) {
         if (previewJob?.isActive == true) return
         lastPreviewSequence = -1L
@@ -1092,24 +624,29 @@ object RootPhoneHarness {
                 val sinceTouch = SystemClock.elapsedRealtime() - lastLiveTouchElapsed
                 val sinceAct = SystemClock.elapsedRealtime() - lastActivityElapsed
                 val pipVisible = FloatingVirtualDisplay.isPreviewVisible()
+                if (!pipVisible) {
+                    delay(1800L)
+                    val disp = runCatching { JSONObject(state.value.display) }.getOrNull()
+                    if (disp == null || !disp.optBoolean("created")) break
+                    continue
+                }
                 val pollInterval = when {
-                    !pipVisible && !state.value.active -> 1500L
-                    sinceTouch < 1200L -> 48L  // ~20fps responsive mode while user finger is dragging inside PiP
-                    sinceAct < 3500L -> 140L   // ~7fps during agent operations (prevents IPC & main-thread contention!)
-                    else -> 380L               // ~2.6fps low-overhead idle preview
+                    sinceTouch < 1000L -> 70L
+                    sinceAct < 3000L -> 550L
+                    else -> 1500L
                 }
                 delay(pollInterval)
                 val disp = runCatching { JSONObject(state.value.display) }.getOrNull()
                 if (disp == null || !disp.optBoolean("created")) break
-                if (!FloatingVirtualDisplay.isPreviewVisible() && !state.value.active) continue
+                if (!FloatingVirtualDisplay.isPreviewVisible()) continue
                 runCatching {
                     val res = privilege?.execute(JSONObject().put("op", "preview").put("since", lastPreviewSequence)) ?: return@runCatching
                     if (!res.optBoolean("created")) return@runCatching
                     val seq = res.optLong("frameSequence", -1L)
                     if (seq >= 0) lastPreviewSequence = seq
-                    val img = res.optString("image")
+                    val img = res.optString("image").ifBlank { res.optString("_image_b64") }
                     if (img.isNotBlank() && img != state.value.image) {
-                        val clean = JSONObject(res.toString()).apply { remove("image") }
+                        val clean = shallowCopyWithoutImage(res)
                         state.update { it.copy(image = img, imageInfo = clean.toString()) }
                     }
                 }
@@ -1203,7 +740,6 @@ object RootPhoneHarness {
                 withContext(NonCancellable) {
                     persist(); broadcast()
                     if (!waiting) {
-                        // Automatically close the virtual display 2.5s after task completion (like Mika!)
                         scheduleAutoRelease(base, 2500L)
                         withContext(Dispatchers.Main) { base.stopService(Intent(base, RootPhoneService::class.java)) }
                     }

@@ -28,12 +28,12 @@ class PulseAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         runCatching {
             serviceInfo?.let { info ->
-                // Subscribe ONLY to low-frequency window state transitions instead of TYPES_ALL_MASK,
+                // Subscribe to window state transitions & window changes instead of TYPES_ALL_MASK,
                 // and avoid FEEDBACK_SPOKEN / FLAG_REQUEST_ENHANCED_WEB_ACCESSIBILITY so we never
                 // trigger system-wide TalkBack/WebView accessibility overhead or high-frequency scroll/content IPC wakeups.
-                info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or AccessibilityEvent.TYPE_WINDOWS_CHANGED
                 info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
-                info.notificationTimeout = 500L
+                info.notificationTimeout = 80L
                 info.flags = (info.flags or
                     AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS or
                     AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
@@ -101,7 +101,11 @@ class PulseAccessibilityService : AccessibilityService() {
         val activePackage: String,
         val nodes: List<CachedNode>,
         val summaryText: String,
-        val byRef: Map<String, CachedNode>
+        val byRef: Map<String, CachedNode>,
+        val screenW: Int = 720,
+        val screenH: Int = 1584,
+        val layoutStable: Boolean = true,
+        val settleMs: Long = 0L
     )
 
     companion object {
@@ -119,7 +123,15 @@ class PulseAccessibilityService : AccessibilityService() {
 
         @JvmStatic
         @JvmOverloads
-        fun updateSnapshotFromExternal(displayId: Int, nodes: List<CachedNode>, activePkg: String, screenW: Int = 720, screenH: Int = 1600): CachedSnapshot {
+        fun updateSnapshotFromExternal(
+            displayId: Int,
+            nodes: List<CachedNode>,
+            activePkg: String,
+            screenW: Int = 720,
+            screenH: Int = 1584,
+            layoutStable: Boolean = true,
+            settleMs: Long = 0L
+        ): CachedSnapshot {
             val hash = computeTreeHash(nodes, activePkg)
             val summary = formatCompactSummary(displayId, activePkg, hash, nodes, screenW, screenH)
             val snap = CachedSnapshot(
@@ -129,7 +141,11 @@ class PulseAccessibilityService : AccessibilityService() {
                 activePackage = activePkg,
                 nodes = nodes,
                 summaryText = summary,
-                byRef = nodes.associateBy { it.ref }
+                byRef = nodes.associateBy { it.ref },
+                screenW = screenW,
+                screenH = screenH,
+                layoutStable = layoutStable,
+                settleMs = settleMs
             )
             snapshotCache[displayId] = snap
             return snap
@@ -142,10 +158,20 @@ class PulseAccessibilityService : AccessibilityService() {
             AccessibilityWindowInfo.TYPE_SPLIT_SCREEN_DIVIDER
         )
 
+        @JvmStatic
+        @JvmOverloads
+        fun dumpTreeJson(
+            displayId: Int,
+            screenW: Int,
+            screenH: Int,
+            forceRefresh: Boolean = false,
+            waitMs: Long = 750L
+        ): JSONObject? = dumpDisplayTree(displayId, screenW, screenH, forceRefresh, waitMs)
+
         /**
          * Reads the Accessibility node tree strictly on [displayId] (`> 0`) using `windowsOnAllDisplays`.
-         * Waits up to [waitMs] if the virtual display is in the middle of an Activity transition so it
-         * never returns empty prematurely or leaks the user's main screen (Display 0).
+         * Waits up to [waitMs] and performs two-phase layout stability sampling so transient mid-animation
+         * or two-stage configuration reflow frames are settled before returning.
          */
         @JvmStatic
         @JvmOverloads
@@ -154,25 +180,29 @@ class PulseAccessibilityService : AccessibilityService() {
             screenW: Int,
             screenH: Int,
             forceRefresh: Boolean = false,
-            waitMs: Long = 420L
+            waitMs: Long = 750L
         ): JSONObject? {
             if (displayId <= 0) return null
             if (!forceRefresh) {
                 val cached = snapshotCache[displayId]
-                if (cached != null && System.currentTimeMillis() - cached.timestampMs < 240L && cached.nodes.isNotEmpty()) {
+                if (cached != null && System.currentTimeMillis() - cached.timestampMs < 240L && cached.nodes.isNotEmpty() && cached.layoutStable) {
                     return snapshotToJson(cached, fromCache = true)
                 }
             }
-            val deadline = SystemClock.uptimeMillis() + waitMs.coerceIn(0L, 750L)
+            val startUptime = SystemClock.uptimeMillis()
+            val deadline = startUptime + waitMs.coerceIn(0L, 1600L)
             val wSafe = screenW.coerceAtLeast(1)
             val hSafe = screenH.coerceAtLeast(1)
             val screenRect = Rect(0, 0, wSafe, hSafe)
             val maxContainerArea = (wSafe.toLong() * hSafe.toLong() * 65L) / 100L
             val maxRowHeight = (hSafe * 22) / 100
             var lastEmptySnap: CachedSnapshot? = null
+            var prevNodes: List<CachedNode>? = null
+            var prevPkg = ""
 
             while (true) {
                 val svc = instance
+                var hasAnyRoot = false
                 if (svc != null) {
                     val allWindows: SparseArray<List<AccessibilityWindowInfo>>? = try {
                         svc.windowsOnAllDisplays
@@ -190,17 +220,20 @@ class PulseAccessibilityService : AccessibilityService() {
                         val collected = ArrayList<CachedNode>(80)
                         var activePkg = ""
                         var nextIdx = 1
+                        val hasExternalAppWin = contentWindows.any { win ->
+                            val p = try { win.root?.packageName?.toString().orEmpty() } catch (_: Throwable) { "" }
+                            p.isNotBlank() && p != "dev.bubuki.proactive"
+                        }
 
                         fun collectFromWindows(strictVisible: Boolean) {
                             var visitedNodes = 0
                             for (win in contentWindows) {
                                 val root = try { win.root } catch (t: Throwable) { null } ?: continue
+                                hasAnyRoot = true
                                 val winPkg = root.packageName?.toString().orEmpty()
-                                val winTitle = try { win.title?.toString().orEmpty() } catch (t: Throwable) { "" }
-                                // Skip our own main chat UI if it ever lands on the virtual display, but allow DisplayTestActivity
-                                if (winPkg == "dev.bubuki.proactive" && !winTitle.contains("测试", ignoreCase = true) && !winTitle.contains("Test", ignoreCase = true)) {
-                                    val firstChildId = try { root.getChild(0)?.viewIdResourceName.orEmpty() } catch (t: Throwable) { "" }
-                                    if (firstChildId.isEmpty() && contentWindows.size > 1) continue
+                                // Skip our VirtualDisplay Home Screen (`DisplayTestActivity`) whenever an external app window is above it
+                                if (winPkg == "dev.bubuki.proactive" && hasExternalAppWin) {
+                                    continue
                                 }
                                 if (activePkg.isEmpty() && winPkg.isNotBlank() && win.type == AccessibilityWindowInfo.TYPE_APPLICATION) {
                                     activePkg = winPkg
@@ -302,20 +335,57 @@ class PulseAccessibilityService : AccessibilityService() {
                         }
 
                         collectFromWindows(strictVisible = true)
-                        if (collected.size < 2 && activePkg != "com.tencent.mm") {
+                        if (collected.size < 2) {
                             collected.clear()
                             nextIdx = 1
                             collectFromWindows(strictVisible = false)
                         }
-                        val snap = updateSnapshotFromExternal(displayId, collected, activePkg, wSafe, hSafe)
-                        if (collected.isNotEmpty() || SystemClock.uptimeMillis() >= deadline) {
+                        if (activePkg.isEmpty() || (activePkg == "dev.bubuki.proactive" && hasExternalAppWin)) {
+                            val topPkg = try { DisplayInputHelper.topPackageOnDisplay(displayId) } catch (_: Throwable) { "" }
+                            if (topPkg.isNotBlank() && topPkg != "dev.bubuki.proactive") {
+                                activePkg = topPkg
+                            }
+                        }
+
+                        if (collected.isNotEmpty() && activePkg.isNotBlank()) {
+                            val isStable = if (!forceRefresh) {
+                                true
+                            } else if (prevNodes != null && activePkg == prevPkg && collected.size == prevNodes!!.size) {
+                                val checkCount = minOf(6, collected.size)
+                                (0 until checkCount).all { idx ->
+                                    val a = prevNodes!![idx]
+                                    val b = collected[idx]
+                                    kotlin.math.abs(a.centerX - b.centerX) <= 6 &&
+                                        kotlin.math.abs(a.centerY - b.centerY) <= 6 &&
+                                        a.role == b.role &&
+                                        a.text == b.text
+                                }
+                            } else {
+                                false
+                            }
+
+                            if (isStable || SystemClock.uptimeMillis() + 135L >= deadline) {
+                                val settledFlag = isStable || prevNodes == null
+                                val elapsed = (SystemClock.uptimeMillis() - startUptime).coerceAtLeast(0L)
+                                val snap = updateSnapshotFromExternal(displayId, collected, activePkg, wSafe, hSafe, layoutStable = settledFlag, settleMs = elapsed)
+                                return snapshotToJson(snap, fromCache = false)
+                            }
+                            prevNodes = ArrayList(collected)
+                            prevPkg = activePkg
+                            try { Thread.sleep(140L) } catch (ignored: InterruptedException) { break }
+                            continue
+                        }
+
+                        val elapsed = (SystemClock.uptimeMillis() - startUptime).coerceAtLeast(0L)
+                        val snap = updateSnapshotFromExternal(displayId, collected, activePkg, wSafe, hSafe, layoutStable = false, settleMs = elapsed)
+                        if (SystemClock.uptimeMillis() >= deadline) {
                             return snapshotToJson(snap, fromCache = false)
                         }
                         lastEmptySnap = snap
                     }
                 }
                 if (SystemClock.uptimeMillis() >= deadline) break
-                try { Thread.sleep(110L) } catch (ignored: InterruptedException) { break }
+                try { Thread.sleep(if (!hasAnyRoot) 60L else 80L) } catch (ignored: InterruptedException) { break }
             }
             return lastEmptySnap?.let { snapshotToJson(it, fromCache = false) }
         }
@@ -357,60 +427,165 @@ class PulseAccessibilityService : AccessibilityService() {
          * (or refreshes the tree if needed).
          */
         @JvmStatic
+        @JvmOverloads
         fun resolveTargetNode(
             displayId: Int,
             screenW: Int,
             screenH: Int,
             ref: String?,
             text: String?,
-            resourceId: String?
+            resourceId: String?,
+            preferEditable: Boolean = false
         ): CachedNode? {
             var snap = snapshotCache[displayId]
-            if (snap == null || System.currentTimeMillis() - snap.timestampMs > 15000L) {
-                dumpDisplayTree(displayId, screenW, screenH, forceRefresh = true)
-                snap = snapshotCache[displayId]
+            if (snap != null && snap.nodes.isNotEmpty() && System.currentTimeMillis() - snap.timestampMs <= 30000L) {
+                matchNodeInSnapshot(snap, ref, text, resourceId, preferEditable)?.let { return it }
             }
-            if (snap == null) return null
-            return matchNodeInSnapshot(snap, ref, text, resourceId)
+            dumpDisplayTree(displayId, screenW, screenH, forceRefresh = true)
+            snap = snapshotCache[displayId] ?: return null
+            return matchNodeInSnapshot(snap, ref, text, resourceId, preferEditable)
         }
 
+        @JvmOverloads
         internal fun matchNodeInSnapshot(
             snap: CachedSnapshot,
             ref: String?,
             text: String?,
-            resourceId: String?
+            resourceId: String?,
+            preferEditable: Boolean = false
         ): CachedNode? {
-            val cleanRef = ref?.trim().orEmpty().let { if (it.matches(Regex("e\\d+"))) "@$it" else it }
+            val refRegex = Regex("^@?e\\d+$", RegexOption.IGNORE_CASE)
+            val rawRefCandidate = listOfNotNull(ref?.trim(), text?.trim(), resourceId?.trim())
+                .firstOrNull { it.isNotEmpty() && it.matches(refRegex) }
+                .orEmpty()
+            val cleanRef = if (rawRefCandidate.isNotEmpty()) {
+                val digits = rawRefCandidate.removePrefix("@").lowercase()
+                "@$digits"
+            } else ""
             if (cleanRef.startsWith("@e")) {
-                snap.byRef[cleanRef]?.let { return it }
+                val byRefNode = snap.byRef[cleanRef]
+                if (byRefNode != null) {
+                    if (preferEditable && !byRefNode.editable && !byRefNode.role.equals("EditText", ignoreCase = true)) {
+                        val childEdit = snap.nodes.firstOrNull {
+                            (it.editable || it.role.equals("EditText", ignoreCase = true)) && (
+                                Rect.intersects(byRefNode.bounds, it.bounds) ||
+                                    kotlin.math.abs(it.centerY - byRefNode.centerY) <= 48
+                                )
+                        }
+                        if (childEdit != null) return childEdit
+                    }
+                    return byRefNode
+                }
             }
-            val qText = text?.trim().orEmpty()
-            val qId = resourceId?.trim()?.substringAfterLast('/').orEmpty()
-            if (qId.isNotEmpty()) {
-                snap.nodes.firstOrNull { it.resourceId.equals(qId, ignoreCase = true) && it.clickable }?.let { return it }
-                snap.nodes.firstOrNull { it.resourceId.contains(qId, ignoreCase = true) }?.let { return it }
+            val qText = text?.trim()?.takeIf { !it.matches(refRegex) }.orEmpty()
+            val qId = resourceId?.trim()?.takeIf { !it.matches(refRegex) }?.substringAfterLast('/').orEmpty()
+            val qTextAsId = qText.substringAfterLast('/')
+            if (qText.isEmpty() && qId.isEmpty()) return null
+
+            val screenArea = (snap.screenW.coerceAtLeast(1).toLong() * snap.screenH.coerceAtLeast(1).toLong()).coerceAtLeast(1L)
+            val queryHasBreadcrumbSep = qText.contains(">") || qText.contains("›") || qText.contains("/")
+            var bestNode: CachedNode? = null
+            var bestScore = Int.MIN_VALUE
+
+            for (n in snap.nodes) {
+                var score = 0
+                var matched = false
+                val nodeResId = n.resourceId.substringAfterLast('/')
+
+                if (qId.isNotEmpty() && nodeResId.isNotEmpty()) {
+                    if (nodeResId.equals(qId, ignoreCase = true)) {
+                        score += 950
+                        matched = true
+                    } else if (nodeResId.contains(qId, ignoreCase = true)) {
+                        score += 480
+                        matched = true
+                    }
+                }
+
+                if (qText.isNotEmpty()) {
+                    // Full-field match: also match qText against resourceId (19-1: e.g. target="sb_form_q" or "search_src_text")
+                    if (nodeResId.isNotEmpty()) {
+                        if (nodeResId.equals(qTextAsId, ignoreCase = true)) {
+                            score += 950
+                            matched = true
+                        } else if (qTextAsId.length >= 3 && nodeResId.contains(qTextAsId, ignoreCase = true)) {
+                            score += 480
+                            matched = true
+                        }
+                    }
+
+                    val labels = listOf(n.text, n.desc, n.hint).filter { it.isNotBlank() }
+                    var bestTextMatch = 0
+                    var matchedLabel = ""
+                    for (lbl in labels) {
+                        val mScore = when {
+                            lbl.equals(qText, ignoreCase = true) -> 1000
+                            lbl.startsWith(qText, ignoreCase = true) || lbl.endsWith(qText, ignoreCase = true) -> 550
+                            lbl.contains(qText, ignoreCase = true) -> 350
+                            else -> 0
+                        }
+                        if (mScore > bestTextMatch) {
+                            bestTextMatch = mScore
+                            matchedLabel = lbl
+                        }
+                    }
+                    if (bestTextMatch > 0) {
+                        score += bestTextMatch
+                        matched = true
+                        // Breadcrumb / path noise penalty (17-5): e.g. "显示与亮度 > 显示大小" when searching "显示与亮度"
+                        if (!queryHasBreadcrumbSep && matchedLabel.length > qText.length &&
+                            (matchedLabel.contains(">") || matchedLabel.contains("›") || matchedLabel.contains(" -> ") || matchedLabel.contains(" / "))
+                        ) {
+                            score -= 500
+                        }
+                        val lenDiff = (matchedLabel.length - qText.length).coerceAtLeast(0)
+                        score -= (lenDiff * 5).coerceAtMost(250)
+                    }
+                }
+
+                if (!matched) continue
+
+                if (preferEditable) {
+                    if (n.editable || n.role.equals("EditText", ignoreCase = true)) {
+                        score += 850
+                    } else {
+                        score -= 400
+                    }
+                    if (nodeResId.contains("edit", ignoreCase = true) ||
+                        nodeResId.contains("search", ignoreCase = true) ||
+                        nodeResId.contains("input", ignoreCase = true) ||
+                        nodeResId.contains("form", ignoreCase = true)
+                    ) {
+                        score += 220
+                    }
+                }
+
+                if (n.clickable) score += 150
+                when (n.role) {
+                    "Button", "Text", "CheckBox", "EditText" -> score += 100
+                    "LinearLayout", "ViewGroup", "FrameLayout", "RelativeLayout", "Scroll", "View" -> score -= 200
+                }
+                val area = n.bounds.width().toLong() * n.bounds.height().toLong()
+                if (area > (screenArea * 15L) / 100L) {
+                    score -= 150
+                }
+
+                if (score > bestScore) {
+                    bestScore = score
+                    bestNode = n
+                }
             }
-            if (qText.isNotEmpty()) {
-                // 1. Exact match on clickable/editable node
-                snap.nodes.firstOrNull {
-                    (it.clickable || it.editable) &&
-                        (it.text.equals(qText, ignoreCase = true) || it.desc.equals(qText, ignoreCase = true) || it.hint.equals(qText, ignoreCase = true))
-                }?.let { return it }
-                // 2. Exact match on any node
-                snap.nodes.firstOrNull {
-                    it.text.equals(qText, ignoreCase = true) || it.desc.equals(qText, ignoreCase = true) || it.hint.equals(qText, ignoreCase = true)
-                }?.let { return it }
-                // 3. Substring match on clickable/editable node
-                snap.nodes.firstOrNull {
-                    (it.clickable || it.editable) &&
-                        (it.text.contains(qText, ignoreCase = true) || it.desc.contains(qText, ignoreCase = true) || it.hint.contains(qText, ignoreCase = true))
-                }?.let { return it }
-                // 4. Substring match on any node
-                snap.nodes.firstOrNull {
-                    it.text.contains(qText, ignoreCase = true) || it.desc.contains(qText, ignoreCase = true) || it.hint.contains(qText, ignoreCase = true)
-                }?.let { return it }
+
+            if (preferEditable && bestNode != null && !bestNode.editable && !bestNode.role.equals("EditText", ignoreCase = true)) {
+                val childEdit = snap.nodes.firstOrNull {
+                    (it.editable || it.role.equals("EditText", ignoreCase = true)) && (
+                        Rect.intersects(bestNode.bounds, it.bounds) ||
+                            kotlin.math.abs(it.centerY - bestNode.centerY) <= 48
+                        )
+                }
+                if (childEdit != null) return childEdit
             }
-            return null
+            return bestNode
         }
 
         /**
@@ -425,11 +600,14 @@ class PulseAccessibilityService : AccessibilityService() {
             val contentWindows = windows
                 .filter { it.displayId == displayId && it.type !in SKIPPED_WINDOW_TYPES }
                 .sortedByDescending { it.layer }
+            val hasExternalAppWin = contentWindows.any { win ->
+                val p = try { win.root?.packageName?.toString().orEmpty() } catch (_: Throwable) { "" }
+                p.isNotBlank() && p != "dev.bubuki.proactive"
+            }
             for (win in contentWindows) {
                 val root = try { win.root } catch (t: Throwable) { null } ?: continue
                 val winPkg = root.packageName?.toString().orEmpty()
-                val winTitle = try { win.title?.toString().orEmpty() } catch (t: Throwable) { "" }
-                if (winPkg == "dev.bubuki.proactive" && !winTitle.contains("测试", ignoreCase = true) && !winTitle.contains("Test", ignoreCase = true) && contentWindows.size > 1) continue
+                if (winPkg == "dev.bubuki.proactive" && hasExternalAppWin) continue
                 val rootRect = Rect()
                 try { root.getBoundsInScreen(rootRect) } catch (t: Throwable) {}
                 val screenClip = Rect(0, 0, rootRect.right.coerceAtLeast(1080), rootRect.bottom.coerceAtLeast(1920))
@@ -459,11 +637,17 @@ class PulseAccessibilityService : AccessibilityService() {
                                 clicked
                             }
                             "set_text" -> {
-                                found.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                                val editTarget = if (found.isEditable || found.className?.toString()?.contains("EditText", ignoreCase = true) == true) {
+                                    found
+                                } else {
+                                    findEditableDescendant(found, 0) ?: found.parent?.let { findEditableDescendant(it, 0) } ?: found
+                                }
+                                editTarget.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                                editTarget.performAction(AccessibilityNodeInfo.ACTION_CLICK)
                                 val args = Bundle().apply {
                                     putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, inputText.orEmpty())
                                 }
-                                found.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                                editTarget.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
                             }
                             else -> false
                         }
@@ -473,6 +657,20 @@ class PulseAccessibilityService : AccessibilityService() {
                 }
             }
             return false
+        }
+
+        private fun findEditableDescendant(node: AccessibilityNodeInfo?, depth: Int): AccessibilityNodeInfo? {
+            if (node == null || depth > 8) return null
+            if (node.isEditable || node.className?.toString()?.contains("EditText", ignoreCase = true) == true) {
+                return node
+            }
+            val count = try { node.childCount } catch (t: Throwable) { 0 }
+            for (i in 0 until count) {
+                val child = try { node.getChild(i) } catch (t: Throwable) { null } ?: continue
+                val found = findEditableDescendant(child, depth + 1)
+                if (found != null) return found
+            }
+            return null
         }
 
         private fun findLiveNode(
@@ -487,19 +685,24 @@ class PulseAccessibilityService : AccessibilityService() {
             try { node.getBoundsInScreen(raw) } catch (t: Throwable) {}
             val r = Rect(raw)
             r.intersect(screenClip)
-            if (kotlin.math.abs(r.centerX() - target.centerX) <= 14 && kotlin.math.abs(r.centerY() - target.centerY) <= 14) {
+            val resId = node.viewIdResourceName?.substringAfterLast('/')?.trim().orEmpty()
+            if (target.resourceId.isNotEmpty() && resId.equals(target.resourceId, ignoreCase = true) &&
+                kotlin.math.abs(r.centerY() - target.centerY) <= 180
+            ) {
+                return node
+            }
+            if (kotlin.math.abs(r.centerX() - target.centerX) <= 28 && kotlin.math.abs(r.centerY() - target.centerY) <= 28) {
                 val txt = node.text?.toString()?.trim().orEmpty()
                 val desc = node.contentDescription?.toString()?.trim().orEmpty()
                 val hint = node.hintText?.toString()?.trim().orEmpty()
-                val resId = node.viewIdResourceName?.substringAfterLast('/')?.trim().orEmpty()
                 val clickable = node.isClickable || node.isLongClickable || node.isContextClickable
                 if (
-                    (target.resourceId.isNotEmpty() && resId == target.resourceId) ||
+                    (target.resourceId.isNotEmpty() && resId.equals(target.resourceId, ignoreCase = true)) ||
                     (txt.isNotEmpty() && txt == target.text) ||
                     (desc.isNotEmpty() && desc == target.desc) ||
                     (hint.isNotEmpty() && hint == target.hint) ||
                     (node.isEditable && target.editable) ||
-                    (clickable == target.clickable && kotlin.math.abs(r.width() - target.bounds.width()) <= 20)
+                    (clickable == target.clickable && kotlin.math.abs(r.width() - target.bounds.width()) <= 24)
                 ) {
                     return node
                 }
@@ -575,12 +778,25 @@ class PulseAccessibilityService : AccessibilityService() {
         internal fun snapshotToJson(snap: CachedSnapshot, fromCache: Boolean): JSONObject {
             val arr = JSONArray()
             snap.nodes.forEach { arr.put(it.toJson()) }
+            val settled = snap.layoutStable && snap.nodes.isNotEmpty() && snap.activePackage.isNotBlank()
+            val likelyBlank = snap.nodes.isEmpty() || snap.activePackage.isBlank()
+            val pkgSafe = snap.activePackage.ifBlank { "unknown" }
+            val layoutSig = "${snap.screenW}x${snap.screenH}_${pkgSafe}_${snap.treeHash}_n${snap.nodes.size}"
             return JSONObject()
                 .put("displayId", snap.displayId)
-                .put("package", snap.activePackage)
+                .put("package", pkgSafe)
                 .put("treeHash", snap.treeHash)
+                .put("tree_hash", snap.treeHash)
                 .put("cached", fromCache)
                 .put("nodeCount", snap.nodes.size)
+                .put("settled", settled)
+                .put("layoutStable", settled)
+                .put("settle_ms", if (fromCache) 0L else snap.settleMs)
+                .put("densityDpi", 320)
+                .put("screenWidthDp", 360)
+                .put("fontScale", 1.0)
+                .put("likely_blank", likelyBlank)
+                .put("layout_signature", layoutSig)
                 .put("summary", snap.summaryText)
                 .put("nodes", arr)
         }

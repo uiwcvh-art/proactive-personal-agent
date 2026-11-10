@@ -1,15 +1,15 @@
 {
-  "version": "3.3.0",
-  "version_name": "3.3.0",
-  "versionName": "3.3.0",
-  "tag_name": "v3.3.0",
-  "version_code": 67,
-  "versionCode": 67,
-  "build": 67,
-  "published_at": "2026-11-09T02:46:28.609145+08:00",
-  "apk_sha256": "67dff01a5f0fa7aae9a6708053652efaf93a6c2fd9d564157dd9e96e170ef437",
-  "apk_size": 21011932,
+  "version": "3.5.7",
+  "version_name": "3.5.7",
+  "versionName": "3.5.7",
+  "tag_name": "v3.5.7",
+  "version_code": 76,
+  "versionCode": 76,
+  "build": 76,
+  "published_at": "2026-11-11T02:46:39.729732+08:00",
+  "apk_sha256": "95a22efa7e69cbb0b964a17835bf73a218f2a495cb1ebde95caea3a75b4c8490",
+  "apk_size": 21105384,
   "download_url": "/proactive-agent/download/proactive-agent.apk",
-  "notes": "v3.3.0 (Build 67): 全面架构重构与虚拟屏体验修复——修复微信等自绘界面(node_count=0)点击被误判未响应及重复双击 Bug；全模型原生多模态图像直传(零二次OCR跳转)；修复微信小程序跳出虚拟屏到物理主屏、跳回桌面及主屏亮度升高问题；任务结束自动销毁回收虚拟屏释放内存",
-  "body": "v3.3.0 (Build 67): 全面架构重构与虚拟屏体验修复——修复微信等自绘界面(node_count=0)点击被误判未响应及重复双击 Bug；全模型原生多模态图像直传(零二次OCR跳转)；修复微信小程序跳出虚拟屏到物理主屏、跳回桌面及主屏亮度升高问题；任务结束自动销毁回收虚拟屏释放内存"
+  "notes": "v3.5.7 (Build 76): 虚拟屏专属独立屏桌面（DisplayTestActivity 4列日常优先应用网格+不误触实时过滤搜索栏，彻底禁用 AOSP SecondaryDisplayLauncher）；修正 FLAG_OWN_DISPLAY_GROUP (1<<11) 与 720x1584@320dpi (360dp) 几何规格及 wm size/density reset；消除 treeHash/tree_hash 与 change_summary/ui_tree 状态冲突；type/submit 多步执行透明回执（steps_executed + submit_triggered_navigation）",
+  "body": "v3.5.7 (Build 76): 虚拟屏专属独立屏桌面（DisplayTestActivity 4列日常优先应用网格+不误触实时过滤搜索栏，彻底禁用 AOSP SecondaryDisplayLauncher）；修正 FLAG_OWN_DISPLAY_GROUP (1<<11) 与 720x1584@320dpi (360dp) 几何规格及 wm size/density reset；消除 treeHash/tree_hash 与 change_summary/ui_tree 状态冲突；type/submit 多步执行透明回执（steps_executed + submit_triggered_navigation）"
 }

@@ -90,9 +90,13 @@
 
         <activity
             android:name=".DisplayTestActivity"
-            android:exported="false"
+            android:exported="true"
+            android:label="独立屏桌面"
+            android:launchMode="singleTask"
             android:theme="@style/AppTheme"
             android:taskAffinity="dev.bubuki.proactive.cua"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|uiMode|density"
+            android:windowSoftInputMode="stateAlwaysHidden|adjustPan"
             android:resizeableActivity="true" />
 
         <service android:name=".AgentForegroundService" android:exported="false" android:foregroundServiceType="specialUse">

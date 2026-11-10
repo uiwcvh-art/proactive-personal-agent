@@ -475,3 +475,159 @@ def test_action_promise_and_fake_write_interception_plus_scroll_loop_tolerance(e
     assert brain._matches_requested_app_package("QQ", "com.tencent.mobileqq") is True
     assert brain._matches_requested_app_package("微信", "com.tencent.mm") is True
 
+
+def test_phone_workspace_b64_strip_and_settle_and_vault_history_purge(env):
+    import asyncio
+    app, c = env
+    brain = app.state.brain
+    vault = app.state.vault
+    harness = brain.harness
+
+    # 1. (16-2) Verify delete_file with purge=True deletes both the note and all .history backups
+    vault.write("notes/temp-sensitive-test.md", "# 初始内容 v1\n测试段落1")
+    vault.write("notes/temp-sensitive-test.md", "# 修改内容 v2\n测试段落2")
+    hist_before = vault.history("notes/temp-sensitive-test.md")
+    assert len(hist_before) >= 1
+    del_res = asyncio.run(harness.execute("delete_file", {"path": "memory_vault/notes/temp-sensitive-test.md", "purge": True}))
+    assert del_res["ok"] is True
+    assert del_res["purged"] is True
+    assert len(del_res.get("purged_history_backups") or []) >= 1
+    assert len(vault.history("notes/temp-sensitive-test.md")) == 0
+
+    # 2. (14-6, 17-1, 18-1, 18-3, 18-4, 18-5) Verify phone_workspace shell slimming, key retry, tree settle, and zero base64 bloat
+    rpc_step = {"key_calls": 0, "tap_settled": False}
+
+    async def fake_phone_rpc(op, args, timeout=32.0):
+        if op == "shell":
+            return {
+                "ok": True,
+                "output": "uid=0(root)",
+                "exit_code": 0,
+                "dpi": 293,
+                "swDp": 384,
+                "rotation": 0,
+                "tier": "compact",
+                "isolatedFocus": True,
+                "allocated": True,
+                "created": True,
+                "displayId": 20,
+            }
+        if op == "tap_node":
+            # First frame returns transient empty tree (18-3)
+            rpc_step["tap_settled"] = True
+            return {
+                "ok": True,
+                "displayId": 20,
+                "package": "unknown",
+                "node_count": 0,
+                "summary": "[虚拟屏 #20 704x1552 package=unknown count=0 treeHash=811c9dc5]",
+            }
+        if op == "key":
+            rpc_step["key_calls"] += 1
+            return {
+                "ok": True,
+                "displayId": 20,
+                "package": "com.android.launcher",
+                "node_count": 12,
+                "ui_tree": "[虚拟屏 #20 704x1552 package=com.android.launcher count=12 treeHash=same111]",
+            }
+        if op == "ui_tree":
+            if rpc_step["key_calls"] >= 2:
+                return {
+                    "ok": True,
+                    "displayId": 20,
+                    "package": "com.android.settings",
+                    "node_count": 18,
+                    "ui_tree": "[虚拟屏 #20 704x1552 package=com.android.settings count=18 treeHash=changed222]\n@e1 设置",
+                }
+            if rpc_step["tap_settled"]:
+                return {
+                    "ok": True,
+                    "displayId": 20,
+                    "package": "com.android.launcher",
+                    "node_count": 45,
+                    "ui_tree": "[虚拟屏 #20 704x1552 package=com.android.launcher count=45 treeHash=e27b2fc1]\n@e18 速览",
+                }
+            return {
+                "ok": True,
+                "displayId": 20,
+                "package": "com.android.launcher",
+                "node_count": 12,
+                "ui_tree": "[虚拟屏 #20 704x1552 package=com.android.launcher count=12 treeHash=same111]",
+            }
+        return {"ok": True, "displayId": 20}
+
+    brain._raw_phone_rpc = fake_phone_rpc
+
+    # 2a. Shell output must not contain virtual display metadata (14-6)
+    sh_out = asyncio.run(brain._tool_phone_workspace({"op": "shell", "command": "id"}))
+    assert sh_out == {"ok": True, "op": "shell", "output": "uid=0(root)", "exit_code": 0}
+    for bad_k in ("dpi", "swDp", "rotation", "tier", "isolatedFocus", "allocated", "created", "displayId"):
+        assert bad_k not in sh_out
+
+    # 2b. Tap with transient empty tree must settle and overwrite top-level package/node_count/ui_tree without _image_b64 (17-1, 18-3, 18-4)
+    tap_out = asyncio.run(brain._tool_phone_workspace({"op": "tap", "target": "@e18"}))
+    assert tap_out["package"] == "com.android.launcher"
+    assert tap_out["node_count"] == 45
+    assert "treeHash=e27b2fc1" in tap_out["ui_tree"]
+    assert "summary" not in tap_out
+    assert tap_out["before_action"]["package"] == "unknown"
+    assert "_image_b64" not in tap_out
+    assert "_multimodal_b64" not in tap_out
+    assert len(json.dumps(tap_out, ensure_ascii=False)) < 3000
+
+    # 2c. Press back when first attempt doesn't change treeHash auto-retries and reports key_consumed=True (18-1)
+    rpc_step["tap_settled"] = False
+    brain._last_phone_tree_hash = "com.android.launcher:same111"
+    key_out = asyncio.run(brain._tool_phone_workspace({"op": "press", "key": "back"}))
+    assert rpc_step["key_calls"] == 2
+    assert key_out["key_consumed"] is True
+    assert key_out["tree_hash_before"] == "com.android.launcher:same111"
+    assert key_out["tree_hash_after"] == "com.android.settings:changed222"
+
+    # 2d. maybe_offload_tool_output strips any residual _image_b64 so ctx_offloaded is never triggered by images (17-1 / 18-4)
+    fake_heavy = {"ok": True, "op": "ui_tree", "ui_tree": "@e1 按钮", "_image_b64": "A" * 160000}
+    serialized_tool = brain.context_search.maybe_offload_tool_output("phone_workspace", {"op": "ui_tree"}, fake_heavy)
+    parsed_tool = json.loads(serialized_tool)
+    assert "_image_b64" not in parsed_tool
+    assert parsed_tool.get("ctx_offloaded") is not True
+    assert parsed_tool.get("_image_attached") is True
+    assert parsed_tool.get("_image_chars_stripped") == 160000
+    assert len(serialized_tool) < 1000
+
+    # 3. (19-1, 19-2, 19-3, 19-5) Verify WebView/EditText type matching (@eN / id / hint), error screenshot stripping, and single tree normalization
+    brain._parse_and_cache_phone_nodes({
+        "width": 1080,
+        "height": 2400,
+        "ui_tree": (
+            "[虚拟屏 #20 1080x2400 package=com.android.chrome count=3 treeHash=bing123]\n"
+            "@e1 [View] \"Bing\" click norm=(500,120)\n"
+            "@e2 [EditText] \"Search the web\" id=sb_form_q click,edit norm=(480,260)\n"
+            "@e3 [Button] \"Search\" id=sb_form_go click norm=(880,260)"
+        ),
+    })
+    m_by_ref = brain._match_phone_node(target_q="@e2", for_type=True)
+    m_by_id = brain._match_phone_node(target_q="sb_form_q", for_type=True)
+    m_by_hint = brain._match_phone_node(target_q="Search the web", for_type=True)
+    assert m_by_ref and m_by_ref["id"] == "sb_form_q"
+    assert m_by_id and m_by_id["ref"] == "@e2"
+    assert m_by_hint and m_by_hint["ref"] == "@e2"
+
+    # 4. Verify treeHash == tree_hash, change_summary consistency after retry_tree, and tap_and_type steps_executed
+    assert tap_out["treeHash"] == "e27b2fc1"
+    assert tap_out["tree_hash"] == "e27b2fc1"
+    assert "com.android.launcher" in tap_out["change_summary"]
+    assert "unknown" not in tap_out["change_summary"]
+    assert tap_out["densityDpi"] == 320
+    assert tap_out["screenWidthDp"] == 360
+    assert tap_out["fontScale"] == 1.0
+
+    type_out = asyncio.run(brain._tool_phone_workspace({"op": "type", "target": "@e2", "text": "WeChat", "submit": True}))
+    assert type_out["ok"] is True
+    assert isinstance(type_out.get("steps_executed"), list) and len(type_out["steps_executed"]) == 3
+    assert [s["op"] for s in type_out["steps_executed"]] == ["tap", "text", "key"]
+    assert type_out["treeHash"] == type_out["tree_hash"]
+
+
+
+
