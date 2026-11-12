@@ -787,8 +787,14 @@ class PulseAccessibilityService : AccessibilityService() {
             val likelyBlank = snap.nodes.isEmpty() || snap.activePackage.isBlank()
             val pkgSafe = snap.activePackage.ifBlank { "unknown" }
             val layoutSig = "${snap.screenW}x${snap.screenH}_${pkgSafe}_${snap.treeHash}_n${snap.nodes.size}"
-            val realDpi = DisplayInputHelper.queryDisplayRealSize(snap.displayId)?.optInt("dpi", 0)?.takeIf { it > 0 }
-                ?: ((snap.screenW * 160) / 360).coerceIn(240, 640)
+            val realDpi = runCatching {
+                val dm = instance?.getSystemService(android.hardware.display.DisplayManager::class.java)
+                val disp = dm?.getDisplay(snap.displayId) ?: dm?.getDisplay(android.view.Display.DEFAULT_DISPLAY)
+                val metrics = android.util.DisplayMetrics()
+                @Suppress("DEPRECATION")
+                disp?.getRealMetrics(metrics)
+                metrics.densityDpi.takeIf { it in 120..800 }
+            }.getOrNull() ?: ((snap.screenW * 160) / 360).coerceIn(240, 640)
             val realSwDp = ((snap.screenW * 160f) / realDpi).toInt().coerceAtLeast(320)
             return JSONObject()
                 .put("displayId", snap.displayId)

@@ -676,8 +676,8 @@ internal fun RootPhoneHarness.executeTapNodeAction(
         .put("display_id", currentDisplay)
         .put("width", dispW)
         .put("height", dispH)
-        .put("densityDpi", afterTree.optInt("densityDpi", ((dispW * 160) / 360).coerceIn(240, 640)))
-        .put("screenWidthDp", afterTree.optInt("screenWidthDp", 360))
+        .put("densityDpi", finalTree.optInt("densityDpi", ((dispW * 160) / 360).coerceIn(240, 640)))
+        .put("screenWidthDp", finalTree.optInt("screenWidthDp", 360))
         .put("fontScale", 1.0)
         .put("clicked", true)
         .put("method", if (!needCenterTap) "accessibility_node" else "node_center_tap")
@@ -767,8 +767,8 @@ internal fun RootPhoneHarness.executeTypeNodeAction(
                 .put("display_id", currentDisplay)
                 .put("width", dispW)
                 .put("height", dispH)
-                .put("densityDpi", ((dispW * 160) / 420).coerceIn(240, 640))
-                .put("screenWidthDp", 420)
+                .put("densityDpi", afterTree.optInt("densityDpi", ((dispW * 160) / 360).coerceIn(240, 640)))
+                .put("screenWidthDp", afterTree.optInt("screenWidthDp", 360))
                 .put("fontScale", 1.0)
                 .put("typed", true)
                 .put("method", "accessibility_set_text")
@@ -784,6 +784,7 @@ internal fun RootPhoneHarness.executeTypeNodeAction(
                 .put("settle_ms", afterTree.optLong("settle_ms", 0L))
                 .put("layout_signature", afterTree.optString("layout_signature", ""))
                 .put("ui_tree", summary)
+                .also { attachLatestDisplayFrame(it, currentDisplay) }
         }
     }
     if (node == null && hasExplicitQuery) {

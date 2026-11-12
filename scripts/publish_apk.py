@@ -11,7 +11,7 @@ digest=hashlib.sha256(apk.read_bytes()).hexdigest()
 gradle_txt=(ROOT/'android/app/build.gradle').read_text('utf-8')
 ver_name=re.search(r"versionName\s+'([^']+)'",gradle_txt).group(1)
 ver_code=int(re.search(r"versionCode\s+(\d+)",gradle_txt).group(1))
-notes=f"v{ver_name} (Build {ver_code}): 1) 虚拟屏底层彻底重构：根治微信/支付宝抢占主屏前台与主屏莫名退回桌面 Bug，固定独立屏桌面根任务防止返回串栈，修复返回键连发 4 次问题；2) 主页横幅、对话顶栏与工具菜单全面新增一键「销毁虚拟屏」，AI 侧 close/release 真正彻底销毁虚拟屏且零残留；3) Agent Loop 与流式状态机大改：移除 DSH/Codex 后置总结抹除与重跑 Bug，修复未调工具提前停机；4) 引擎级持久目标模式 (/goal)：自动持续拉起 AI 直至显式调用 complete_goal 宣布目标完成；5) 升级虚拟屏 1080P 高清视觉截图并硬拦截修改系统深浅色/主屏设置"
+notes=f"v{ver_name} (Build {ver_code}): 1) 手机虚拟屏 CUA 大修：放开第三方应用 .MainActivity/.LauncherActivity 限制，仅拦截本客户端主界面；2) 修复悬窗点击红色关闭后在后台轮次中被重新拉起反复弹窗及误触销毁；3) 强制 tap/swipe/capture 刷新 fresh=true 画面帧并对齐真实 dpi/swDp，彻底消除点击前后画面错位；4) 黑板机制修复：@司工 不再回显至主助理聊天栏"
 release_meta={
     'version':ver_name,
     'version_name':ver_name,
