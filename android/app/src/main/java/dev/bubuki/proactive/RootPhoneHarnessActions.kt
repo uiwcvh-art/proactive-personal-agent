@@ -62,14 +62,27 @@ internal fun RootPhoneHarness.buildDeviceInfo(base: Context): JSONObject {
     }
     runCatching {
         val cm = base.getSystemService(android.net.ConnectivityManager::class.java)
-        val caps = cm?.activeNetwork?.let { cm.getNetworkCapabilities(it) }
+        val activeCaps = cm?.activeNetwork?.let { cm.getNetworkCapabilities(it) }
+        val allCaps = runCatching {
+            cm?.allNetworks?.mapNotNull { cm.getNetworkCapabilities(it) }.orEmpty()
+        }.getOrDefault(emptyList())
+        val hasWifi = activeCaps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true ||
+            allCaps.any { it.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) && it.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) }
+        val hasCellular = activeCaps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) == true ||
+            allCaps.any { it.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) && it.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) }
+        val hasVpn = activeCaps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) == true ||
+            allCaps.any { it.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) }
         val netType = when {
-            caps == null -> "none"
-            caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
-            caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+            activeCaps == null && allCaps.isEmpty() -> "none"
+            hasWifi -> "wifi"
+            hasCellular -> "cellular"
             else -> "other"
         }
-        out.put("network", JSONObject().put("connected", caps != null).put("type", netType))
+        out.put("network", JSONObject()
+            .put("connected", activeCaps != null || allCaps.isNotEmpty())
+            .put("type", netType)
+            .put("vpn", hasVpn)
+        )
     }
     runCatching {
         val pm = base.getSystemService(PowerManager::class.java)
@@ -87,11 +100,18 @@ internal fun RootPhoneHarness.buildDeviceInfo(base: Context): JSONObject {
             .put("music_active", audio?.isMusicActive == true)
         )
     }
+    val suPaths = listOf("/system/bin/su", "/system/xbin/su", "/sbin/su", "/debug_ramdisk/su", "/data/adb/magisk", "/data/adb/ksu", "/data/adb/ap")
+    val suBinaryPresent = suPaths.any { runCatching { java.io.File(it).exists() }.getOrDefault(false) }
+    val rootReady = privilege?.let { priv ->
+        if (priv.isRootGrantedFast()) true
+        else runCatching { priv.probe().optBoolean("root", false) }.getOrDefault(false)
+    } ?: false
     out.put("device", JSONObject()
         .put("brand", Build.BRAND)
         .put("model", Build.MODEL)
         .put("sdk", Build.VERSION.SDK_INT)
-        .put("root", privilege?.isRootGrantedFast() == true)
+        .put("root", rootReady)
+        .put("su_binary_present", suBinaryPresent || rootReady)
     )
     return out
 }
@@ -214,11 +234,53 @@ internal fun RootPhoneHarness.executePushFile(base: Context, input: JSONObject):
         .put("phone_path", phonePath)
 }
 
+private fun sandboxShellCommandToDisplay(rawCmd: String, displayId: Int): String {
+    var s = rawCmd
+    s = s.replace(Regex("""--display\s+0\b"""), "--display $displayId")
+    s = s.replace(Regex("""\bam\s+start(?:-activity)?\b(?![^;&|\n]*--display\b)""")) { "${it.value} --display $displayId" }
+    s = s.replace(Regex("""\bcmd\s+activity\s+start(?:-activity)?\b(?![^;&|\n]*--display\b)""")) { "${it.value} --display $displayId" }
+    s = s.replace(Regex("""\binput\s+-d\s+0\b"""), "input -d $displayId")
+    s = s.replace(Regex("""\binput\s+(?!-d\b)(tap|swipe|keyevent|text|motionevent|press|roll|draganddrop)\b""")) {
+        "input -d $displayId ${it.groupValues[1]}"
+    }
+    s = s.replace(
+        Regex("""\binput(?:\s+-d\s+\d+)?\s+keyevent\s+(?:--longpress\s+)?(?:3|KEYCODE_HOME|187|KEYCODE_APP_SWITCH)\b"""),
+        "am start --display $displayId -f 0x14000000 -n dev.bubuki.proactive/.DisplayTestActivity"
+    )
+    s = s.replace(Regex("""\bscreencap\s+-d\s+0\b"""), "screencap -d $displayId")
+    s = s.replace(Regex("""\bscreencap\b(?!\s+-d\b)"""), "screencap -d $displayId")
+    return s
+}
+
 internal fun RootPhoneHarness.executeShellAction(base: Context, input: JSONObject): JSONObject {
     var cmdStr = input.optString("command", input.optString("cmd", input.optString("text", ""))).trim()
     if (cmdStr.isEmpty()) throw Exception("请提供要执行的 shell command")
-    val dispObj = runCatching { JSONObject(state.value.display) }.getOrNull()
-    val currentDisp = if (dispObj?.optBoolean("created", false) == true) dispObj.optInt("displayId", -1) else -1
+    val waitingForeground = state.value.phase == "waiting_user"
+    if (Regex("""\bcmd\s+uimode\b|\bservice\s+call\s+uimode\b|\bsettings\s+put\s+(?:system|secure|global)\s+(?:ui_night_mode|screen_brightness|screen_off_timeout|font_scale|user_rotation|accelerometer_rotation|default_input_method|enabled_input_methods)\b""", RegexOption.IGNORE_CASE).containsMatchIn(cmdStr)) {
+        throw Exception("安全沙箱已拦截全局系统设置修改指令（严禁修改主屏深浅色 Night mode、亮度、字体缩放或输入法等系统全局设置）")
+    }
+    if (!waitingForeground && Regex("""\bmonkey\b""", RegexOption.IGNORE_CASE).containsMatchIn(cmdStr)) {
+        throw Exception("安全沙箱已拦截 monkey 指令（monkey 会直接操作主屏幕 Display 0），请改用 phone_workspace(op=\"open\") 或 am start")
+    }
+    if (!waitingForeground && Regex("""(?:--display|-d)\s+0\b""", RegexOption.IGNORE_CASE).containsMatchIn(cmdStr)) {
+        throw Exception("安全沙箱已拦截指向主屏幕 (Display 0) 的指令，严禁在未接管状态下操作或启动应用到 Display 0")
+    }
+    var dispObj = runCatching { JSONObject(state.value.display) }.getOrNull()
+    var currentDisp = if (dispObj?.optBoolean("created", false) == true) dispObj.optInt("displayId", -1) else -1
+    val touchesDisplayUi = Regex(
+        """\b(input|screencap|uiautomator)\b|\bam\s+(start|display)\b|\bcmd\s+activity\s+start|\bwm\s+(size|density|overscan|user-rotation)\b""",
+        RegexOption.IGNORE_CASE
+    ).containsMatchIn(cmdStr)
+    if (!waitingForeground && touchesDisplayUi && currentDisp <= 0) {
+        runCatching {
+            val woke = command(base, JSONObject().put("op", "create").put("skip_home", false))
+            currentDisp = woke.optInt("displayId", -1)
+            dispObj = runCatching { JSONObject(state.value.display) }.getOrNull()
+        }
+        if (currentDisp <= 0) {
+            throw Exception("虚拟屏尚未就绪 (displayId=$currentDisp)，安全沙箱已禁止 shell 指令操作或截取主屏幕 (Display 0)")
+        }
+    }
     val dW = dispObj?.optInt("width", 720)?.coerceAtLeast(1) ?: 720
     val dH = dispObj?.optInt("height", 1600)?.coerceAtLeast(1) ?: 1600
     val isBareUiautomatorDump = cmdStr.startsWith("uiautomator", ignoreCase = true) &&
@@ -233,14 +295,28 @@ internal fun RootPhoneHarness.executeShellAction(base: Context, input: JSONObjec
             .put("output", treeJson.optString("summary", ""))
             .put("cwd", shellCwd)
     }
-    if (currentDisp > 0 && Regex("""\bam\s+start\b""").containsMatchIn(cmdStr) && !cmdStr.contains("--display")) {
-        cmdStr = cmdStr.replaceFirst(Regex("""\bam\s+start\b"""), "am start --display $currentDisp")
+    if (!waitingForeground && currentDisp > 0) {
+        if (Regex("""\bwm\s+(size|density|overscan|user-rotation)\b""", RegexOption.IGNORE_CASE).containsMatchIn(cmdStr) &&
+            !Regex("""-d\s+$currentDisp\b""").containsMatchIn(cmdStr)
+        ) {
+            throw Exception("安全沙箱已拦截未绑定虚拟屏 (-d $currentDisp) 的 wm 显示参数修改指令，禁止修改主屏幕分辨率/DPI")
+        }
+        cmdStr = sandboxShellCommandToDisplay(cmdStr, currentDisp)
     }
     val safeCwd = "'" + shellCwd.replace("'", "'\\''") + "'"
     val wrappedCmd = "cd $safeCwd 2>/dev/null || cd /sdcard; $cmdStr; echo ''; echo '__PULSE_CWD__:'\$(pwd)"
     val hasRoot = privilege!!.isRootGrantedFast() || runCatching { privilege!!.probe().optBoolean("root") }.getOrDefault(false)
     val rawRes = if (hasRoot) {
-        privilege!!.execute(JSONObject().put("op", "shell").put("command", wrappedCmd))
+        try {
+            privilege!!.execute(JSONObject().put("op", "shell").put("command", wrappedCmd))
+        } catch (rpcErr: Throwable) {
+            // Fallback to direct `su -c` if the RootDisplayServer RPC pipe is restarting
+            val proc = ProcessBuilder("su", "-c", wrappedCmd).redirectErrorStream(true).start()
+            val finished = proc.waitFor(20, java.util.concurrent.TimeUnit.SECONDS)
+            if (!finished) proc.destroyForcibly()
+            val outTxt = runCatching { proc.inputStream.bufferedReader().readText() }.getOrDefault("")
+            JSONObject().put("uid", 0).put("exit_code", if (finished) proc.exitValue() else 124).put("output", outTxt).put("direct_su_fallback", true)
+        }
     } else {
         val proc = ProcessBuilder("sh", "-c", wrappedCmd).redirectErrorStream(true).start()
         val finished = proc.waitFor(15, java.util.concurrent.TimeUnit.SECONDS)
@@ -515,8 +591,8 @@ internal fun RootPhoneHarness.executeTapAndTypeAction(
         .put("display_id", currentDisplay)
         .put("width", dispW)
         .put("height", dispH)
-        .put("densityDpi", 320)
-        .put("screenWidthDp", 360)
+        .put("densityDpi", afterTree.optInt("densityDpi", ((dispW * 160) / 360).coerceIn(240, 640)))
+        .put("screenWidthDp", afterTree.optInt("screenWidthDp", 360))
         .put("fontScale", 1.0)
         .put("op", "tap_and_type")
         .put("ref", resolvedNode?.ref ?: ref)
@@ -600,8 +676,8 @@ internal fun RootPhoneHarness.executeTapNodeAction(
         .put("display_id", currentDisplay)
         .put("width", dispW)
         .put("height", dispH)
-        .put("densityDpi", 320)
-        .put("screenWidthDp", 360)
+        .put("densityDpi", afterTree.optInt("densityDpi", ((dispW * 160) / 360).coerceIn(240, 640)))
+        .put("screenWidthDp", afterTree.optInt("screenWidthDp", 360))
         .put("fontScale", 1.0)
         .put("clicked", true)
         .put("method", if (!needCenterTap) "accessibility_node" else "node_center_tap")
@@ -691,8 +767,8 @@ internal fun RootPhoneHarness.executeTypeNodeAction(
                 .put("display_id", currentDisplay)
                 .put("width", dispW)
                 .put("height", dispH)
-                .put("densityDpi", 320)
-                .put("screenWidthDp", 360)
+                .put("densityDpi", ((dispW * 160) / 420).coerceIn(240, 640))
+                .put("screenWidthDp", 420)
                 .put("fontScale", 1.0)
                 .put("typed", true)
                 .put("method", "accessibility_set_text")
@@ -730,8 +806,8 @@ internal fun RootPhoneHarness.executeTypeNodeAction(
         .put("display_id", currentDisplay)
         .put("width", dispW)
         .put("height", dispH)
-        .put("densityDpi", 320)
-        .put("screenWidthDp", 360)
+        .put("densityDpi", afterTree.optInt("densityDpi", ((dispW * 160) / 360).coerceIn(240, 640)))
+        .put("screenWidthDp", afterTree.optInt("screenWidthDp", 360))
         .put("fontScale", 1.0)
         .put("typed", true)
         .put("method", "clipboard_paste")
@@ -772,7 +848,7 @@ internal fun RootPhoneHarness.resolveLongPressNodeCoords(
 internal fun RootPhoneHarness.attachLatestDisplayFrame(target: JSONObject, displayId: Int): JSONObject {
     if (displayId <= 0 || target.optString("image").isNotBlank()) return target
     runCatching {
-        val snap = privilege?.execute(JSONObject().put("op", "preview").put("since", -1)) ?: return@runCatching
+        val snap = privilege?.execute(JSONObject().put("op", "preview").put("since", -1).put("fresh", true)) ?: return@runCatching
         val img = snap.optString("image")
         if (img.isNotBlank()) {
             target.put("image", img)

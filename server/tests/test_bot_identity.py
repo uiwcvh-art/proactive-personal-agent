@@ -71,7 +71,7 @@ def test_primary_replacement_really_routes_curiosity_and_survives_restart(tmp_pa
         response = client.post('/api/trigger-curiosity').json()
         assert response['bot_id'] == bot['id'] and response['notify'] is False
         assert response['id'] not in app.state.store.state['pending']
-        assert original['id'] in app.state.store.state['pending']
+        assert original['id'] not in app.state.store.state['pending']
         assert client.get('/api/bots').json()['primary_bot_id'] == bot['id']
         assert client.post('/api/chat',json={'text':'默认对话也进入主助手'}).json()['bot_id'] == bot['id']
         assert client.post('/api/research',json={}).json()['bot_id'] == bot['id']

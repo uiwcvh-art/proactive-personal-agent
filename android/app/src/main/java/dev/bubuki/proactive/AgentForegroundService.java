@@ -18,12 +18,29 @@ public class AgentForegroundService extends Service {
     static volatile boolean running=false;
     static volatile long phoneAbortUntilMs=0L;
     static void abortPhoneCommands(Context ctx){
-        phoneAbortUntilMs=System.currentTimeMillis()+5000L;
+        phoneAbortUntilMs=System.currentTimeMillis()+2500L;
         try{
             if(RootPhoneHarness.isVirtualDisplayActive()){
-                RootPhoneHarness.stop(ctx);
+                RootPhoneHarness.stop(ctx, false);
             }
         }catch(Exception ignored){}
+    }
+    static void onUserForceClosedVirtualDisplay(Context ctx){
+        phoneAbortUntilMs=System.currentTimeMillis()+10000L;
+        try{
+            if(RootPhoneHarness.isVirtualDisplayActive()){
+                RootPhoneHarness.stop(ctx, false);
+            }
+        }catch(Exception ignored){}
+        if(ctx!=null){
+            final Context appCtx=ctx.getApplicationContext();
+            new Thread(()->{
+                try{
+                    new SecureTransport(appCtx).request("POST","/api/stop",
+                        new JSONObject().put("bot_id","all").put("source",SecureTransport.getNodeSource(appCtx)),null);
+                }catch(Exception ignored){}
+            },"vd-force-stop").start();
+        }
     }
     private static volatile Ringtone activeAlarmRingtone=null;
     private static volatile Vibrator activeVibrator=null;
@@ -199,15 +216,7 @@ public class AgentForegroundService extends Service {
                         long beforeFrameSeq=-1L;
                         String beforeImgSig="";
                         if(Arrays.asList("capture","ui_tree","dump","tap","tap_node","tap_and_type","long_press","batch","swipe","text","type_node","key","launch","open_uri","open_url").contains(op)){
-                            JSONObject st=RootPhoneHarness.status(this);
-                            if(!st.optBoolean("root")){
-                                RootPhoneHarness.command(this,new JSONObject().put("op","connect"));
-                                st=RootPhoneHarness.status(this);
-                            }
-                            JSONObject disp=st.optJSONObject("display");
-                            if(disp!=null && disp.optBoolean("created",false)){
-                                dispIdForSnap=disp.optInt("displayId",-1);
-                            }
+                            dispIdForSnap=RootPhoneHarness.currentDisplayId();
                             if(dispIdForSnap>0){
                                 PulseAccessibilityService.CachedSnapshot prevSnap=PulseAccessibilityService.getCachedSnapshot(dispIdForSnap);
                                 if(prevSnap!=null){
@@ -224,58 +233,61 @@ public class AgentForegroundService extends Service {
                             }
                         }
                         res=RootPhoneHarness.command(this,input);
-                        if(Arrays.asList("ui_tree","dump","tree","nodes","read_screen").contains(op)){
+                        if(Arrays.asList("ui_tree","dump","tree","nodes","read_screen").contains(op) && !res.has("image")){
                             try{
-                                JSONObject snap=RootPhoneHarness.command(this,new JSONObject().put("op","preview").put("since",-1));
+                                JSONObject snap=RootPhoneHarness.command(this,new JSONObject().put("op","preview").put("since",-1).put("fresh",true));
                                 if(snap.has("image"))res.put("image",snap.getString("image")).put("width",snap.optInt("width",540)).put("height",snap.optInt("height",1200));
                             }catch(Exception ignored){}
                         }
                         if(Arrays.asList("launch","open_uri","open_url","tap","tap_node","tap_and_type","long_press","batch","swipe","text","type_node","key").contains(op)){
-                            long settleMs=(op.equals("launch")||op.equals("open_uri")||op.equals("open_url")) ? 820L : (op.equals("swipe") ? 460L : 350L);
-                            Thread.sleep(settleMs);
-                            int ncAfter=0;
-                            String afterPkg="";
-                            String afterHash="";
-                            try{
-                                JSONObject tree=RootPhoneHarness.command(this,new JSONObject().put("op","ui_tree").put("refresh",true));
-                                ncAfter=tree.optInt("nodeCount",0);
-                                afterPkg=tree.optString("package","");
-                                afterHash=tree.optString("treeHash","");
-                                // If launch is still on splash screen (<=1 node), wait once more for home screen to settle
-                                if((op.equals("launch")||op.equals("open_uri")||op.equals("open_url"))&&ncAfter<=1){
-                                    Thread.sleep(480L);
-                                    tree=RootPhoneHarness.command(this,new JSONObject().put("op","ui_tree").put("refresh",true));
+                            int ncAfter=res.optInt("nodeCount",res.optInt("node_count",-1));
+                            String afterPkg=res.optString("package","");
+                            String afterHash=res.optString("treeHash",res.optString("tree_hash",""));
+                            boolean needTreeFetch=!res.has("ui_tree") || ncAfter<0 || ((op.equals("launch")||op.equals("open_uri")||op.equals("open_url")) && ncAfter<=1);
+                            if(needTreeFetch){
+                                long settleMs=(op.equals("launch")||op.equals("open_uri")||op.equals("open_url")) ? 480L : 260L;
+                                Thread.sleep(settleMs);
+                                try{
+                                    JSONObject tree=RootPhoneHarness.command(this,new JSONObject().put("op","ui_tree").put("refresh",true));
                                     ncAfter=tree.optInt("nodeCount",0);
                                     afterPkg=tree.optString("package","");
                                     afterHash=tree.optString("treeHash","");
-                                }
-                                if(tree.has("summary")){
-                                    res.put("ui_tree",tree.getString("summary"))
-                                        .put("node_count",ncAfter)
-                                        .put("nodeCount",ncAfter)
-                                        .put("package",afterPkg)
-                                        .put("tree_hash",afterHash)
-                                        .put("treeHash",afterHash)
-                                        .put("layoutStable",tree.optBoolean("layoutStable",true))
-                                        .put("settled",tree.optBoolean("settled",true))
-                                        .put("settle_ms",tree.optLong("settle_ms",settleMs))
-                                        .put("densityDpi",tree.optInt("densityDpi",320))
-                                        .put("screenWidthDp",tree.optInt("screenWidthDp",360))
-                                        .put("fontScale",tree.optDouble("fontScale",1.0))
-                                        .put("layout_signature",tree.optString("layout_signature",""));
-                                }
-                            }catch(Exception ignored){}
-                            long afterFrameSeq=-1L;
+                                    if(tree.has("summary")){
+                                        res.put("ui_tree",tree.getString("summary"))
+                                            .put("node_count",ncAfter)
+                                            .put("nodeCount",ncAfter)
+                                            .put("package",afterPkg)
+                                            .put("tree_hash",afterHash)
+                                            .put("treeHash",afterHash)
+                                            .put("layoutStable",tree.optBoolean("layoutStable",true))
+                                            .put("settled",tree.optBoolean("settled",true))
+                                            .put("settle_ms",tree.optLong("settle_ms",settleMs))
+                                            .put("densityDpi",tree.optInt("densityDpi",320))
+                                            .put("screenWidthDp",tree.optInt("screenWidthDp",360))
+                                            .put("fontScale",tree.optDouble("fontScale",1.0))
+                                            .put("layout_signature",tree.optString("layout_signature",""));
+                                    }
+                                }catch(Exception ignored){}
+                            }else{
+                                res.put("node_count",ncAfter);
+                            }
+                            long afterFrameSeq=res.optLong("frameSequence",-1L);
                             String afterImgSig="";
-                            try{
-                                JSONObject snap=RootPhoneHarness.command(this,new JSONObject().put("op","preview").put("since",-1));
-                                afterFrameSeq=snap.optLong("frameSequence",-1L);
-                                if(snap.has("image")){
-                                    String aImg=snap.getString("image");
-                                    if(!aImg.isEmpty()) afterImgSig=aImg.length()+":"+aImg.hashCode();
-                                    res.put("image",aImg).put("width",snap.optInt("width",540)).put("height",snap.optInt("height",1200));
-                                }
-                            }catch(Exception ignored){}
+                            String existingImg=res.optString("image","");
+                            if(!existingImg.isEmpty()){
+                                afterImgSig=existingImg.length()+":"+existingImg.hashCode();
+                            }else{
+                                try{
+                                    JSONObject snap=RootPhoneHarness.command(this,new JSONObject().put("op","preview").put("since",-1).put("fresh",true));
+                                    afterFrameSeq=snap.optLong("frameSequence",-1L);
+                                    if(snap.has("image")){
+                                        String aImg=snap.getString("image");
+                                        if(!aImg.isEmpty()) afterImgSig=aImg.length()+":"+aImg.hashCode();
+                                        res.put("image",aImg).put("width",snap.optInt("width",540)).put("height",snap.optInt("height",1200));
+                                    }
+                                }catch(Exception ignored){}
+                            }
+                            if(ncAfter<0) ncAfter=0;
                             boolean visualChanged=(afterFrameSeq>0 && afterFrameSeq!=beforeFrameSeq) || (!afterImgSig.isEmpty() && !afterImgSig.equals(beforeImgSig));
                             boolean treeChanged=beforeHash.isEmpty() || !afterHash.equals(beforeHash) || !afterPkg.equals(beforePkg) || beforeNodes!=ncAfter;
                             boolean changed=treeChanged || visualChanged;
@@ -316,7 +328,7 @@ public class AgentForegroundService extends Service {
                 if(!id.isEmpty()&&!text.isEmpty()&&!notified.contains(id)&&!kind.equals("stopped")){
                     String botId=m.optString("bot_id","companion");
                     String botName=m.optString("from_bot_name","").trim();
-                    if(botName.isEmpty()) botName="companion".equals(botId)?"白珂":botId;
+                    if(botName.isEmpty()) botName="companion".equals(botId)?"主助理":botId;
                     String title="curiosity".equals(kind)?(botName+" · 主动搭话"):botName;
                     notifyCustom(id,title,text.length()>260?text.substring(0,260)+"…":text,botId);
                     notified.add(id);

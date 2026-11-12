@@ -95,10 +95,33 @@ class DesktopControllerMixin:
             pass
         return clean_res
 
+    async def _stage_pc_file_to_cloud_workspace(self, raw_p: str) -> Path | None:
+        if not raw_p or not self.is_dsh_online():
+            return None
+        pc_res = await self._raw_dsh_rpc('pc_fs', {'fs_op': 'read_file', 'path': raw_p, 'base64': True}, timeout=25.0)
+        if not isinstance(pc_res, dict) or not pc_res.get('ok'):
+            return None
+        b64 = str(pc_res.get('_multimodal_b64') or pc_res.get('data_b64') or '').strip()
+        if b64:
+            raw_bytes = base64.b64decode(b64.split(',')[-1])
+        elif isinstance(pc_res.get('content'), str):
+            raw_bytes = pc_res['content'].encode('utf-8')
+        else:
+            return None
+        safe_name = re.sub(r'[^a-zA-Z0-9._\u4e00-\u9fa5-]', '_', Path(raw_p.replace('\\', '/')).name) or 'pc-file.bin'
+        staged = self.harness.root / 'uploads' / safe_name
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_bytes(raw_bytes)
+        return staged
+
     async def _tool_cloud_desktop(self, args: dict):
         if self.computer is None:
             return {'error': '云桌面组件未挂载'}
-        op = str(args.get('op') or 'status').strip().lower()
+        op = str(args.get('op') or args.get('action') or 'status').strip().lower()
+        if op == 'open_url':
+            op = 'navigate'
+        elif op == 'browser_snapshot':
+            op = 'screenshot'
         if op == 'open':
             target_val = str(args.get('url') or args.get('uri') or args.get('target') or args.get('app') or args.get('text') or '').strip()
             if target_val.startswith(('http://', 'https://')) or ('.' in target_val and ' ' not in target_val and not target_val.startswith('/')):
@@ -144,12 +167,15 @@ class DesktopControllerMixin:
                     'bytes': receipt.get('bytes', 0),
                 }
             if op == 'push_file':
-                rel_p = str(args.get('path') or args.get('target') or args.get('text') or '').strip()
-                if rel_p.startswith('workspace/'):
-                    rel_p = rel_p[len('workspace/'):]
-                src_file = (self.harness.root / rel_p).resolve()
+                orig_p = str(args.get('path') or args.get('target') or args.get('text') or '').strip()
+                rel_p = orig_p[len('workspace/'):] if orig_p.startswith('workspace/') else orig_p
+                src_file = (self.harness.root / rel_p).resolve() if not re.match(r'^[A-Za-z]:[/\\]', orig_p) else Path('__nonexistent__')
                 if not src_file.is_file() or not src_file.is_relative_to(self.harness.root.resolve()):
-                    return {'ok': False, 'error': f'工作区文件不存在: {rel_p}'}
+                    staged = await self._stage_pc_file_to_cloud_workspace(orig_p)
+                    if staged is None or not staged.is_file():
+                        return {'ok': False, 'error': f'工作区文件不存在: {orig_p}'}
+                    src_file = staged
+                    rel_p = f'uploads/{staged.name}'
                 receipt = await self.computer.client.upload_file(src_file)
                 return {
                     'ok': True,
@@ -342,7 +368,7 @@ class DesktopControllerMixin:
         dialogs: list[dict] = []
         cur_u = ''
         cur_t = ''
-        cur_b = '白珂'
+        cur_b = '主助理'
         scan_window = max(60, cap * 4)
         filtered_msgs = [m for m in all_msgs if normalize_node_source(m.get('source')) == target_src][-scan_window:]
         for m in filtered_msgs:
@@ -353,7 +379,7 @@ class DesktopControllerMixin:
             ts = float(m.get('created_at') or m.get('time') or 0)
             t_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts)) if ts > 0 else ''
             b_id = str(m.get('bot_id') or 'companion')
-            b_name = str(m.get('from_bot_name') or bot_names.get(b_id) or '白珂')
+            b_name = str(m.get('from_bot_name') or bot_names.get(b_id) or '主助理')
             if role == 'user':
                 if cur_u:
                     dialogs.append({
@@ -365,7 +391,7 @@ class DesktopControllerMixin:
                     })
                 cur_u = txt
                 cur_t = t_str
-                cur_b = bot_names.get(b_id, '白珂')
+                cur_b = bot_names.get(b_id, '主助理')
             elif role == 'assistant':
                 dialogs.append({
                     'time': t_str or cur_t,
@@ -574,6 +600,11 @@ class DesktopControllerMixin:
             }
 
         peer_status = (target_peer.get('status') if isinstance(target_peer, dict) and isinstance(target_peer.get('status'), dict) else None) or self.dsh_bridge_info.get('status') or {}
+        if self.dsh_dispatch and not self.is_dsh_online() and op not in ('status', 'list_sessions'):
+            for _ in range(4):
+                await asyncio.sleep(0.5)
+                if self.is_dsh_online():
+                    break
         if self.dsh_dispatch and self.is_dsh_online():
             if op == 'status' and not self.dsh_bridge_info.get('ws_connected') and peer_status:
                 return {'ok': True, 'pc_online': True, 'device_id': target_id, **peer_status}
@@ -678,7 +709,11 @@ class DesktopControllerMixin:
         }
 
     async def _tool_dsh_workspace(self, args: dict) -> dict:
-        op = str(args.get('op') or 'status').strip().lower()
+        op = str(args.get('op') or args.get('action') or 'status').strip().lower()
+        if op == 'open_url':
+            op = 'navigate'
+        elif op == 'browser_snapshot':
+            op = 'screenshot'
         if op in ('list', 'sessions'):
             op = 'list_sessions'
         elif op in ('inspect', 'read', 'context', 'tools'):
@@ -706,13 +741,38 @@ class DesktopControllerMixin:
             to_spec = f'{default_node}:{target_bot_arg}' if target_bot_arg and ':' not in target_bot_arg else (target_bot_arg or default_node)
             return await self._tool_send_message({'to_bot_id': to_spec, 'text': msg_text})
 
+        # Enforce symmetric cross-device isolation (P0-6): phone nodes cannot directly execute PC tools
+        cur_node_src = normalize_node_source(self.source_context.get() or 'phone')
+        if cur_node_src in ('phone', 'phone2') and op not in ('status', 'send_message'):
+            return {
+                'ok': False,
+                'error': '你当前位于「安卓一」，不能直接调用电脑端的 dsh_workspace 工具操控电脑本机！请调用 send_message(to_bot_id="Windows一", text="...") 直接发消息让「Windows一」自己执行并回复你。',
+            }
+
         if op == 'cua_desktop':
             nested = args.get('args') if isinstance(args.get('args'), dict) else {}
-            cua_action = str(args.get('action') or args.get('tool') or nested.get('action') or nested.get('tool') or 'list_windows').strip()
+            cua_action = str(args.get('action') or args.get('tool') or nested.get('action') or nested.get('tool') or 'inspect').strip()
+            if cua_action in ('send_screenshot', 'share_image', 'send_qr', 'send_image'):
+                clean_p = self.harness.root / 'cua-clean.jpg'
+                if not clean_p.exists():
+                    snap_res = await self._tool_dsh_workspace({'op': 'cua_desktop', 'action': 'inspect'})
+                    if not clean_p.exists():
+                        return {'ok': False, 'error': '未能获取电脑真机窗口当前截图'}
+                raw_clean = clean_p.read_bytes()
+                crop_box = (args.get('crop_box') or nested.get('crop_box')) if isinstance(args.get('crop_box') or nested.get('crop_box'), list) else None
+                media_url = self._prepare_chat_screenshot(raw_clean, crop_box=crop_box, prefix='pc-cua-shot')
+                return {
+                    'ok': bool(media_url),
+                    'op': 'cua_desktop',
+                    'action': 'send_screenshot',
+                    'chat_image_url': media_url,
+                    'cropped': bool(crop_box),
+                    'note': f'已将电脑真机干净无标尺截图直接挂载到本轮聊天回复气泡上（{media_url}）！',
+                }
             try:
-                cur_bot_name = get_assistant(self.store, self.bot_context.get()).get('name') or '白珂'
+                cur_bot_name = get_assistant(self.store, self.bot_context.get()).get('name') or '主助理'
             except Exception:
-                cur_bot_name = '白珂'
+                cur_bot_name = '主助理'
             merged_cua_args = {**nested, **{k: v for k, v in args.items() if k != 'args'}, 'action': cua_action, 'tool': cua_action, 'bot_name': cur_bot_name}
             res = await self._raw_dsh_rpc('cua_desktop', merged_cua_args, timeout=float(args.get('timeout_sec') or 35.0))
             if isinstance(res, dict):
@@ -722,9 +782,30 @@ class DesktopControllerMixin:
                     first_img = imgs[0] if isinstance(imgs[0], dict) else {}
                     b64_data = str(first_img.get('data') or '').strip()
                     if b64_data:
-                        res['_multimodal_b64'] = b64_data
-                        res['_multimodal_mime'] = str(first_img.get('mimeType') or 'image/png')
-                        res['_multimodal_caption'] = f'【Windows 电脑真机窗口实时画面 (action={cua_action})】'
+                        try:
+                            raw_img = base64.b64decode(b64_data.split(',')[-1])
+                            (self.harness.root / 'cua-clean.jpg').write_bytes(raw_img)
+                            annotated_bytes, iw, ih = draw_vision_ruler_overlay(
+                                raw_img,
+                                a11y_summary='',
+                                screen_w=0,
+                                screen_h=0,
+                            )
+                            (self.harness.root / 'cua-latest.jpg').write_bytes(annotated_bytes)
+                            res['saved_screenshot'] = 'cua-latest.jpg'
+                            res['_multimodal_b64'] = base64.b64encode(annotated_bytes).decode('ascii')
+                            res['_multimodal_mime'] = 'image/jpeg'
+                            res['_multimodal_caption'] = (
+                                f'【Windows 电脑真机窗口实时画面 (action={cua_action}, 尺寸={iw}x{ih})】\n'
+                                '1. 画面上、下、左、右四边均已绘制与手机端完全一致的 `0..1000` 归一化坐标标尺（顶部/底部 `X:100..900`，左侧/右侧 `Y:100..900`）。\n'
+                                '2. 操作逻辑与手机端 `phone_workspace` 完全一致：\n'
+                                '   - 若 UIA 树中有目标元素编号，直接调 `dsh_workspace(op="cua_desktop", action="tap", element_index=N)`（或 `ref="@eN"`）；\n'
+                                '   - 若自绘界面无节点或需点击画面任意位置，直接对照四周 `0..1000` 标尺调用 `dsh_workspace(op="cua_desktop", action="tap", nx=0..1000, ny=0..1000)`！'
+                            )
+                        except Exception:
+                            res['_multimodal_b64'] = b64_data
+                            res['_multimodal_mime'] = str(first_img.get('mimeType') or 'image/png')
+                            res['_multimodal_caption'] = f'【Windows 电脑真机窗口实时画面 (action={cua_action})】'
             return res
 
         limit = max(1, min(100, int(args.get('limit') or 3)))
@@ -744,7 +825,7 @@ class DesktopControllerMixin:
                     f"{ph_label}最近 {len(ph_dialogs)} 条对话 (limit={limit}):",
                 ]
                 for idx, d in enumerate(ph_dialogs, 1):
-                    lines.append(f"{idx}. [{d.get('time', '')}] ({d.get('bot_name', '白珂')}) 主人: {d.get('user', '')} -> AI: {d.get('assistant', '')}")
+                    lines.append(f"{idx}. [{d.get('time', '')}] ({d.get('bot_name', '主助理')}) 主人: {d.get('user', '')} -> AI: {d.get('assistant', '')}")
                 return {
                     'ok': True,
                     'source': norm_ph,
@@ -776,7 +857,7 @@ class DesktopControllerMixin:
             ]
             if phone_dialogs:
                 for idx, d in enumerate(phone_dialogs, 1):
-                    lines.append(f"  {idx}. [{d.get('time', '')}] ({d.get('bot_name', '白珂')}) 主人: {str(d.get('user', ''))[:120]} -> AI: {str(d.get('assistant', ''))[:160]}")
+                    lines.append(f"  {idx}. [{d.get('time', '')}] ({d.get('bot_name', '主助理')}) 主人: {str(d.get('user', ''))[:120]} -> AI: {str(d.get('assistant', ''))[:160]}")
             else:
                 lines.append("  (暂无最近对话)")
             lines.append(f"电脑端最近 {len(combined_dialogs)} 条对话:")
@@ -785,7 +866,7 @@ class DesktopControllerMixin:
                     lines.append(f"  {idx}. [{d.get('time', '')}] ({d.get('session_title') or d.get('bot_name') or 'PC'}) 用户: {str(d.get('user', ''))[:120]} -> AI: {str(d.get('assistant', ''))[:160]}")
             else:
                 lines.append("  (暂无最近对话)")
-            lines.append("提示: 如需给任意端 Bot 发消息，直接调用 send_message(to_bot_id='安卓一:白珂' | 'Windows一:研究助手' | '会话:<工作区会话名>', text='...')。")
+            lines.append("提示: 如需给任意端 Bot 发消息，直接调用 send_message(to_bot_id='安卓一:companion' | 'Windows一:研究助手' | '会话:<工作区会话名>', text='...')。")
             compact_sessions = [
                 {'title': s.get('title'), 'short_id': s.get('short_id'), 'status': s.get('status', 'idle')}
                 for s in sessions[:10]

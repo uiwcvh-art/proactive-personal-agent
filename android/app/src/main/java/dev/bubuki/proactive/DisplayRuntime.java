@@ -17,18 +17,7 @@ import java.io.*;
 import java.lang.reflect.*;
 import java.util.concurrent.*;
 
-/**
- * [Module] DisplayRuntime
- * [Responsibility] VirtualDisplay lifecycle management, ImageReader frame pipeline & lazy JPEG
- *                  preview encoding, JSON RPC command dispatcher, and background escape containment.
- *                  Delegates low-level InputEvent reflection, ATM task queries, and ShellContext
- *                  bootstrap to DisplayInputHelper.
- * [Public API]
- *   - DisplayRuntime(Context base)
- *   - String execute(String command)
- *   - void close()
- *   - static Context systemContext()
- */
+/** VirtualDisplay lifecycle, ImageReader frame pipeline, JSON RPC dispatcher & containment. */
 @android.annotation.SuppressLint({"PrivateApi", "DiscouragedPrivateApi", "BlockedPrivateApi", "SoonBlockedPrivateApi", "WrongConstant"})
 final class DisplayRuntime {
     private static final String SHELL_PACKAGE = DisplayInputHelper.SHELL_PACKAGE;
@@ -84,7 +73,7 @@ final class DisplayRuntime {
     private volatile boolean trustedDisplay = true;
     private volatile boolean releasedToBackground = false;
     private RootClipboard clipboard;
-    private volatile int width = 720, height = 1600, densityDpi = 320;
+    private volatile int width = 1472, height = 3232, densityDpi = 480;
     private volatile String activeTier = "compact";
 
     // Sandbox task containment & main-display anti-jump state
@@ -93,6 +82,8 @@ final class DisplayRuntime {
     private volatile String baselineMainPkg = "";
     private volatile boolean baselineMainIsHome = true;
     private volatile long lastVirtualActionUptime = 0L;
+    private volatile int lastPromotedTaskId = -1;
+    private volatile String lastPromotedPkg = "";
 
     private final Runnable processFrameRunnable = new Runnable() {
         @Override
@@ -177,6 +168,7 @@ final class DisplayRuntime {
         if (vd == null || vd.getDisplay() == null || vd.getDisplay().getDisplayId() <= 0) {
             return state().put("hasFrame", false);
         }
+        if (cmd.optBoolean("fresh", false)) processLatestFrame();
         long since = cmd.optLong("since", -1);
         long curSeq = this.frameSequence;
         PreviewSnapshot snap = this.latestPreview;
@@ -265,6 +257,7 @@ final class DisplayRuntime {
         if (vd == null || vd.getDisplay() == null || vd.getDisplay().getDisplayId() <= 0) {
             return state().put("ok", false);
         }
+        releasedToBackground = false;
         final int displayId = vd.getDisplay().getDisplayId();
         final int rot = vd.getDisplay().getRotation();
         final int lw = (rot % 2 == 0) ? width : height;
@@ -380,42 +373,26 @@ final class DisplayRuntime {
                 previewShortSide = cmd.optInt("preview_short_side", spec[3]);
                 int existingId = display.getDisplay().getDisplayId();
                 if (wantW != width || wantH != height || wantDpi != densityDpi) {
-                    synchronized (frameLock) {
-                        if (wantW != width || wantH != height) {
-                            width = wantW;
-                            height = wantH;
-                            ImageReader oldReader = this.reader;
-                            this.reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2);
-                            this.reader.setOnImageAvailableListener(this::onFrameAvailable, frameHandler);
-                            display.setSurface(this.reader.getSurface());
-                            if (oldReader != null) {
-                                try { oldReader.setOnImageAvailableListener(null, null); oldReader.close(); } catch (Throwable ignored) {}
-                            }
-                            if (latestFrame != null) {
-                                latestFrame.recycle();
-                                latestFrame = null;
-                            }
+                    // Never resize an existing VirtualDisplay in-place when dimensions or DPI change:
+                    // running activities keep stale WindowMetrics/BufferQueue sizes. Release & recreate cleanly.
+                    release(true);
+                } else {
+                    DisplayInputHelper.ensureAwakeAndUnlocked(existingId);
+                    startKeepAwake(existingId);
+                    if (!cmd.optBoolean("skip_home", false)) {
+                        String curTop = DisplayInputHelper.topPackageOnDisplay(existingId);
+                        if (curTop == null || curTop.isEmpty() || "com.android.launcher".equals(curTop)) {
+                            try {
+                                DisplayInputHelper.launchOnDisplay(existingId, "dev.bubuki.proactive/.DisplayTestActivity", 0);
+                            } catch (Throwable ignored) {}
                         }
-                        densityDpi = wantDpi;
-                        display.resize(width, height, densityDpi);
                     }
-                    DisplayInputHelper.setFullscreenWindowingMode(existingId, width, height, densityDpi);
-                }
-                DisplayInputHelper.ensureAwakeAndUnlocked(existingId);
-                startKeepAwake(existingId);
-                if (!cmd.optBoolean("skip_home", false)) {
-                    String curTop = DisplayInputHelper.topPackageOnDisplay(existingId);
-                    if (curTop == null || curTop.isEmpty() || "com.android.launcher".equals(curTop)) {
-                        try {
-                            DisplayInputHelper.launchOnDisplay(existingId, "dev.bubuki.proactive/.DisplayTestActivity", 0);
-                        } catch (Throwable ignored) {}
+                    if (reader != null) {
+                        reader.setOnImageAvailableListener(this::onFrameAvailable, frameHandler);
+                        frameHandler.post(this::scheduleFrameProcess);
                     }
+                    return state().put("newly_created", false).put("reused_display", true);
                 }
-                if (reader != null) {
-                    reader.setOnImageAvailableListener(this::onFrameAvailable, frameHandler);
-                    frameHandler.post(this::scheduleFrameProcess);
-                }
-                return state().put("newly_created", false).put("reused_display", true);
             }
             release(true);
             releasedToBackground = false;
@@ -439,10 +416,15 @@ final class DisplayRuntime {
                 } catch (Throwable secondErr) {
                     try {
                         trustedDisplay = false;
-                        display = dm.createVirtualDisplay("Pulse-Agent", width, height, densityDpi, surface, DisplayInputHelper.displayFlags(Build.VERSION.SDK_INT, false, false));
-                    } catch (Exception thirdErr) {
-                        release();
-                        throw thirdErr;
+                        display = dm.createVirtualDisplay("Pulse-Agent", width, height, densityDpi, surface, DisplayInputHelper.displayFlags(Build.VERSION.SDK_INT, false, false, true));
+                    } catch (Throwable thirdErr) {
+                        try {
+                            trustedDisplay = false;
+                            display = dm.createVirtualDisplay("Pulse-Agent", width, height, densityDpi, surface, DisplayInputHelper.displayFlags(Build.VERSION.SDK_INT, false, false, false));
+                        } catch (Exception fourthErr) {
+                            release();
+                            throw fourthErr;
+                        }
                     }
                 }
             }
@@ -451,6 +433,7 @@ final class DisplayRuntime {
                 throw new Exception("系统没有返回独立虚拟屏");
             }
             int displayId = display.getDisplay().getDisplayId();
+            DisplayInputHelper.setDisplayRemoveModeDestroy(displayId);
             DisplayInputHelper.setFullscreenWindowingMode(displayId, width, height, densityDpi);
             DisplayInputHelper.setImePolicy(displayId);
             DisplayInputHelper.ensureAwakeAndUnlocked(displayId);
@@ -502,19 +485,75 @@ final class DisplayRuntime {
             }
             scheduleFrameProcess();
             return state().put("resized", true).put("tier", activeTier);
-        } else if (op.equals("release") || op.equals("promote") || op.equals("expand_to_foreground")) {
-            if (display == null) {
-                return state().put("ok", true).put("noop", true).put("released_to_background", true);
+        } else if (op.equals("promote") || op.equals("expand_to_foreground") || op.equals("to_foreground") || op.equals("fullscreen")) {
+            if (display == null || display.getDisplay() == null || display.getDisplay().getDisplayId() <= 0) {
+                return state().put("ok", false).put("error", "虚拟屏未启动");
             }
-            boolean destroy = cmd.optBoolean("destroy", false);
-            release(destroy);
-            return state().put("ok", true).put("released_to_background", true).put("destroyed", destroy);
+            int id = display.getDisplay().getDisplayId();
+            String topPkg = DisplayInputHelper.topPackageOnDisplay(id);
+            if (topPkg != null && !topPkg.isEmpty()) {
+                managedVirtualPackages.remove(topPkg);
+            }
+            lastVirtualActionUptime = 0L;
+            int[] res = DisplayInputHelper.promoteTopTaskToMainDisplay(id);
+            if (res[1] == 1) {
+                lastPromotedTaskId = res[0];
+                lastPromotedPkg = topPkg != null ? topPkg : "";
+            }
+            releasedToBackground = false;
+            return state()
+                .put("ok", res[1] == 1)
+                .put("promoted", res[1] == 1)
+                .put("promoted_task_id", res[0])
+                .put("promoted_package", lastPromotedPkg)
+                .put("kept_alive", true);
+        } else if (op.equals("pull_back") || op.equals("to_virtual")) {
+            if (display == null || display.getDisplay() == null || display.getDisplay().getDisplayId() <= 0) {
+                return state().put("ok", false).put("error", "虚拟屏未启动");
+            }
+            int id = display.getDisplay().getDisplayId();
+            String wantPkg = cmd.optString("package", cmd.optString("pkg", lastPromotedPkg)).trim();
+            int wantTid = cmd.optInt("task_id", lastPromotedTaskId);
+            int pulledTid = DisplayInputHelper.pullTaskFromMainToVirtualDisplay(id, wantTid, wantPkg);
+            if (pulledTid > 0) {
+                String nowTop = DisplayInputHelper.topPackageOnDisplay(id);
+                if (nowTop != null && !nowTop.isEmpty() && !"dev.bubuki.proactive".equals(nowTop)) {
+                    managedVirtualPackages.add(nowTop);
+                }
+                lastPromotedTaskId = -1;
+                lastPromotedPkg = "";
+            }
+            scheduleFrameProcess();
+            return state()
+                .put("ok", pulledTid > 0)
+                .put("pulled_back", pulledTid > 0)
+                .put("pulled_task_id", pulledTid);
+        } else if (op.equals("release")) {
+            if (display == null) {
+                return state().put("ok", true).put("noop", true).put("released", true).put("destroyed", true).put("released_to_background", true);
+            }
+            boolean keepAlive = cmd.optBoolean("keep_alive", false);
+            boolean destroy = !keepAlive || cmd.optBoolean("destroy", false) || cmd.optBoolean("user_close", false);
+            if (!destroy) {
+                releasedToBackground = false;
+                return state().put("ok", true).put("released_to_background", false).put("kept_alive", true);
+            }
+            release(true);
+            return state().put("ok", true).put("released", true).put("released_to_background", true).put("destroyed", true);
         } else if (op.equals("preview")) {
             return fastPreview(cmd);
         } else if (op.equals("shell")) {
             String rawCmd = cmd.optString("command", cmd.optString("cmd", "")).trim();
             if (rawCmd.isEmpty()) throw new Exception("shell 操作需要提供 command");
-            return RootCommands.runShell(rawCmd, cmd.optInt("timeout_sec", 18));
+            int activeVdId = (display != null && display.getDisplay() != null) ? display.getDisplay().getDisplayId() : -1;
+            boolean touchesUi = activeVdId > 0 && (rawCmd.contains("am ") || rawCmd.contains("input") || rawCmd.contains("cmd activity") || rawCmd.contains("monkey"));
+            if (touchesUi) onBeforeVirtualInteraction(activeVdId);
+            JSONObject shRes = RootCommands.runShell(rawCmd, cmd.optInt("timeout_sec", 18));
+            if (touchesUi) {
+                scheduleEscapeContainment(activeVdId);
+                scheduleFrameProcess();
+            }
+            return shRes;
         } else if (op.equals("clipboard") || op.equals("clipboard_get") || op.equals("clipboard_set")) {
             boolean isSet = op.equals("clipboard_set")
                 || "set".equalsIgnoreCase(cmd.optString("action", ""))
@@ -660,14 +699,14 @@ final class DisplayRuntime {
             checkTarget(cmd, id);
             String component = cmd.getString("component");
             if (!component.matches("[A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+")) throw new Exception("填写 package/.Activity 形式的组件名");
-            if (component.endsWith(".MainActivity") || component.endsWith(".NativePulseActivity") || component.endsWith(".LauncherActivity")) {
-                throw new Exception("禁止将前台主应用移入虚拟屏");
+            if (component.startsWith("dev.bubuki.proactive/") && !component.endsWith(".DisplayTestActivity")) {
+                throw new Exception("禁止将本客户端主界面移入虚拟屏");
             }
             String pkg = component.split("/")[0];
+            onBeforeVirtualInteraction(id);
             if (!"dev.bubuki.proactive".equals(pkg)) {
                 managedVirtualPackages.add(pkg);
             }
-            onBeforeVirtualInteraction(id);
             int userId = cmd.optInt("user_id", 0);
             String output = DisplayInputHelper.launchOnDisplay(id, component, userId);
             scheduleEscapeContainment(id);
@@ -710,7 +749,7 @@ final class DisplayRuntime {
         if (displayId <= 0) return;
         final long triggerUptime = SystemClock.uptimeMillis();
         lastVirtualActionUptime = triggerUptime;
-        int[] delaysMs = new int[]{90, 260, 580, 1050};
+        int[] delaysMs = new int[]{70, 200, 450};
         for (int d : delaysMs) {
             awakeTimer.schedule(() -> {
                 try {
@@ -723,7 +762,7 @@ final class DisplayRuntime {
     private void containEscapedTasks(int displayId, long triggerUptime) {
         VirtualDisplay vd = this.display;
         if (vd == null || vd.getDisplay() == null || vd.getDisplay().getDisplayId() != displayId) return;
-        if (SystemClock.uptimeMillis() - triggerUptime > 2200L) return;
+        if (SystemClock.uptimeMillis() - triggerUptime > 850L) return;
         try {
             Object atm = Class.forName("android.app.ActivityTaskManager").getMethod("getService").invoke(null);
             Class<?> taskInfoCls = Class.forName("android.app.TaskInfo");
@@ -740,20 +779,27 @@ final class DisplayRuntime {
                 ComponentName base = (ComponentName) baseField.get(t);
                 String topPkg = top != null ? top.getPackageName() : "";
                 String basePkg = base != null ? base.getPackageName() : "";
-                String topCls = top != null ? top.getClassName() : "";
-                if (tid == baselineMainTaskId) break;
-                boolean isManagedEscape = managedVirtualPackages.contains(topPkg)
-                    || managedVirtualPackages.contains(basePkg)
-                    || topCls.contains("AppBrandUI")
-                    || topCls.contains("WebViewUI");
-                if (isManagedEscape && !topPkg.equals(baselineMainPkg)) {
-                    DisplayInputHelper.invokeMoveRootTaskToDisplay(atm, tid, displayId, true);
-                    movedAny = true;
+                if (tid == baselineMainTaskId || tid == lastPromotedTaskId) break;
+                if ("dev.bubuki.proactive".equals(topPkg) || topPkg.contains("launcher") || topPkg.contains("home") || "com.android.systemui".equals(topPkg)) {
+                    break;
+                }
+                // Strictly contain ONLY packages managed inside VirtualDisplay so user app switches on Display 0 are NEVER hijacked!
+                boolean isManagedEscape = !topPkg.isEmpty() && !topPkg.equals(baselineMainPkg)
+                    && (managedVirtualPackages.contains(topPkg) || managedVirtualPackages.contains(basePkg));
+                if (isManagedEscape) {
+                    int rootTid = DisplayInputHelper.extractRootTaskId(t, taskIdField);
+                    if (DisplayInputHelper.invokeMoveRootTaskToDisplay(atm, rootTid, displayId, true)) {
+                        managedVirtualPackages.add(topPkg);
+                        movedAny = true;
+                    }
                 }
                 break;
             }
-            if (movedAny && baselineMainTaskId > 0) {
-                DisplayInputHelper.invokeMoveTaskToFront(atm, baselineMainTaskId);
+            if (movedAny && baselineMainTaskId > 0 && !DisplayInputHelper.isHomeOrLauncherPackage(baselineMainPkg)) {
+                String nowTop = DisplayInputHelper.topPackageOnDisplay(Display.DEFAULT_DISPLAY);
+                if (DisplayInputHelper.isHomeOrLauncherPackage(nowTop)) {
+                    DisplayInputHelper.invokeMoveTaskToFront(atm, baselineMainTaskId, Display.DEFAULT_DISPLAY);
+                }
             }
         } catch (Throwable ignored) {}
     }
@@ -850,6 +896,7 @@ final class DisplayRuntime {
             java.util.Set<String> vdPackages = new java.util.HashSet<>();
 
             if (dispId > 0) {
+                DisplayInputHelper.setDisplayRemoveModeDestroy(dispId);
                 try {
                     atm = Class.forName("android.app.ActivityTaskManager").getMethod("getService").invoke(null);
                     Class<?> taskInfoCls = Class.forName("android.app.TaskInfo");
@@ -865,6 +912,7 @@ final class DisplayRuntime {
                         break;
                     }
 
+                    java.util.List<Integer> vdRootTasks = new java.util.ArrayList<>();
                     for (Object t : DisplayInputHelper.queryTasksOnDisplay(atm, dispId)) {
                         if (t == null) continue;
                         if (displayField.getInt(t) != dispId) continue;
@@ -872,6 +920,15 @@ final class DisplayRuntime {
                         if (top != null && top.getPackageName() != null) {
                             vdPackages.add(top.getPackageName());
                         }
+                        int rtid = DisplayInputHelper.extractRootTaskId(t, taskIdField);
+                        if (rtid > 0 && !vdRootTasks.contains(rtid)) {
+                            vdRootTasks.add(rtid);
+                        }
+                    }
+                    // Remove all tasks inside VirtualDisplay BEFORE releasing it so OEM WindowManager
+                    // NEVER reparents WeChat/Alipay/DisplayTestActivity onto physical Display 0!
+                    for (int rtid : vdRootTasks) {
+                        DisplayInputHelper.invokeRemoveTask(atm, rtid);
                     }
                 } catch (Throwable ignored) {}
             }
@@ -880,16 +937,21 @@ final class DisplayRuntime {
             display = null;
 
             if (dispId > 0 && atm != null) {
-                try {
-                    Thread.sleep(40L);
-                    String afterTop = DisplayInputHelper.topPackageOnDisplay(Display.DEFAULT_DISPLAY);
-                    String mainTopPkg = mainTopComp != null ? mainTopComp.getPackageName() : "";
-                    if (!afterTop.isEmpty() && vdPackages.contains(afterTop) && !afterTop.equals(mainTopPkg)) {
-                        if (mainTopTaskId > 0) {
-                            DisplayInputHelper.invokeMoveTaskToFront(atm, mainTopTaskId);
+                int[] checkWaits = new int[]{40, 90, 140};
+                String mainTopPkg = mainTopComp != null ? mainTopComp.getPackageName() : "";
+                for (int w : checkWaits) {
+                    try {
+                        Thread.sleep(w);
+                        String afterTop = DisplayInputHelper.topPackageOnDisplay(Display.DEFAULT_DISPLAY);
+                        if (!afterTop.isEmpty() && vdPackages.contains(afterTop) && !afterTop.equals(mainTopPkg)) {
+                            if (mainTopTaskId > 0 && !DisplayInputHelper.isHomeOrLauncherPackage(mainTopPkg)) {
+                                DisplayInputHelper.invokeMoveTaskToFront(atm, mainTopTaskId, Display.DEFAULT_DISPLAY);
+                            }
+                        } else {
+                            break;
                         }
-                    }
-                } catch (Throwable ignored) {}
+                    } catch (Throwable ignored) {}
+                }
             }
             managedVirtualPackages.clear();
         }

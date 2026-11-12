@@ -18,8 +18,8 @@ from vault_manager import now_iso
 
 
 class MemoryEngine:
-    AUTO_COMPACT_TOKENS = 200_000
-    KEEP_RECENT_TOKENS = 64_000
+    AUTO_COMPACT_TOKENS = 100_000
+    KEEP_RECENT_TOKENS = 35_000
     SLEEP_CONSOLIDATE_IDLE_SECONDS = 180
     PINNED_FILE = 'profile/pinned_memories.md'
 
@@ -310,12 +310,25 @@ class MemoryEngine:
     @staticmethod
     def prune_tool_loop_messages(messages: list[dict]):
         """
-        IMMUTABLE PREFIX CACHING RULE:
-        Never mutate already-sent tool outputs or image blocks in `messages`!
-        Mutating earlier messages invalidates the upstream LLM Prefix Cache across tool steps.
-        Oversized tool outputs (>12K chars) are offloaded to SQLite FTS5 (`ctx_search`) BEFORE appending.
+        Prunes transient multimodal `image_url` blocks from earlier tool-loop steps (`messages[:-1]`),
+        retaining only the newest step's visual screenshot while keeping text prefix 100% intact
+        and replacing message dicts immutably without mutating stored references in-place.
         """
-        return
+        if not isinstance(messages, list) or len(messages) <= 2:
+            return
+        for idx in range(len(messages) - 1):
+            msg = messages[idx]
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get('content')
+            if isinstance(content, list) and any(isinstance(p, dict) and p.get('type') == 'image_url' for p in content):
+                cleaned_parts = []
+                for p in content:
+                    if isinstance(p, dict) and p.get('type') == 'image_url':
+                        cleaned_parts.append({'type': 'text', 'text': '[历史步骤截图已省略]'})
+                    else:
+                        cleaned_parts.append(p)
+                messages[idx] = {**msg, 'content': cleaned_parts}
 
     # --- Visual Memory Pinning (📌) ---
     @staticmethod
@@ -395,7 +408,7 @@ class MemoryEngine:
         removed_count = len(pins) - len(kept)
         if removed_count > 0:
             self._save_pins(kept)
-        return {'ok': True, 'removed': removed_count > 0, 'removed_count': removed_count, 'pins': kept}
+        return {'ok': removed_count > 0, 'removed': removed_count > 0, 'removed_count': removed_count, 'pins': kept, **({'error': f'未找到匹配的置顶记忆: {q}'} if removed_count == 0 else {})}
 
     def build_static_pinned_block(self) -> str:
         """Static block safe to include inside `messages[0]` system prompt without breaking Prefix Cache."""
@@ -432,11 +445,18 @@ class MemoryEngine:
         return raw_imp, missing
 
     def build_prompt_context(self) -> str:
-        """Dynamic vault index + user traits + structured personal impression digest (budgeted to fit cleanly in 3.6K chars without duplicating pinned_block)."""
+        """Dynamic vault index + user traits + structured personal impression digest (budgeted to fit cleanly in ~3.8K chars without truncating disk files)."""
         raw_idx = self.vault.read('INDEX.md')
         idx = raw_idx[:1200] if len(raw_idx) <= 1200 else (raw_idx[:750] + '\n...\n' + raw_idx[-400:])
         raw_traits = self.vault.read('profile/user_traits.md')
-        traits = raw_traits[-1000:] if len(raw_traits) > 1000 else raw_traits
+        if len(raw_traits) <= 2800:
+            traits = raw_traits
+        else:
+            traits = (
+                raw_traits[:1400]
+                + '\n...(中间历史画像条目保存在磁盘 memory_vault/profile/user_traits.md 中未删减，可随时 read_file 查阅)...\n'
+                + raw_traits[-1400:]
+            )
         raw_imp, missing_imp = self.get_personal_impression()
         parts = [
             f'【记忆库目录 INDEX.md（可用 read_file("memory_vault/...")、memory_search 或 conversation_search 翻阅详情；按需技能存放在 memory_vault/skills/）】\n{idx}',
@@ -466,13 +486,21 @@ class MemoryEngine:
             and (src is None or normalize_node_source(m.get('source')) == src)
         ]
         msg_tokens = sum(self.estimate_tokens(m.get('llm_text') or m.get('text', '')) + 12 for m in bot_msgs)
-        rep = int(self.last_prompt_tokens.get(bot_id, 0) or 0)
-        current_tokens = rep if (rep > 0 and src is None) else ((sys_tokens + msg_tokens) if bot_msgs else sys_tokens)
-        cached_tokens = int(self.last_cached_tokens.get(bot_id, 0) or 0)
+        if src == 'pc':
+            nb_key = f'pc:{bot_id}'
+            rep = int(self.last_prompt_tokens.get(nb_key, 0) or 0)
+            cached_tokens = int(self.last_cached_tokens.get(nb_key, 0) or 0)
+            last_m = (self.store.state.get('last_metrics') or {}).get(nb_key) or {}
+        else:
+            nb_key = f'phone:{bot_id}'
+            rep = int(self.last_prompt_tokens.get(nb_key, self.last_prompt_tokens.get(bot_id, 0)) or 0)
+            cached_tokens = int(self.last_cached_tokens.get(nb_key, self.last_cached_tokens.get(bot_id, 0)) or 0)
+            st_metrics = self.store.state.get('last_metrics') or {}
+            last_m = st_metrics.get(nb_key) or st_metrics.get(bot_id) or {}
+        current_tokens = rep if rep > 0 else ((sys_tokens + msg_tokens) if bot_msgs else sys_tokens)
         if cached_tokens > current_tokens:
             cached_tokens = current_tokens
         compacted_blocks = sum(1 for m in bot_msgs if m.get('kind') == 'compact_summary')
-        last_m = (self.store.state.get('last_metrics') or {}).get(bot_id) or {}
         if not last_m:
             # Fallback to the newest assistant message with metrics for this bot
             for m in reversed(bot_msgs):
@@ -506,158 +534,26 @@ class MemoryEngine:
     async def auto_compact_if_needed(
         self,
         bot_id: str,
-        sys_tokens: int,
-        silent_complete_fn,
+        sys_tokens: int = 14800,
+        silent_complete_fn=None,
         reported_tokens: int | None = None,
         force: bool = False,
         source: str | None = None,
+        llm_stream_fn=None,
+        on_stream=None,
     ) -> dict | None:
-        src = normalize_node_source(source)
-        threshold = self.get_threshold_tokens()
-        keep_recent = max(3_000, min(self.KEEP_RECENT_TOKENS, int(threshold * 0.30)))
-        rep = reported_tokens if reported_tokens is not None else int(self.last_prompt_tokens.get(bot_id, 0))
-        bot_msgs = [
-            m for m in self.store.state['messages']
-            if m.get('bot_id', 'companion') == bot_id and normalize_node_source(m.get('source')) == src
-        ]
-        if not force and len(bot_msgs) <= 6:
-            return None
-        msg_tokens = sum(self.estimate_tokens(m.get('llm_text') or m.get('text', '')) + 12 for m in bot_msgs)
-        est_base_tokens = sys_tokens + msg_tokens
-        # Cap `rep` against `est_base_tokens * 1.35` so transient in-turn tool loop outputs from a previous multi-step
-        # tool turn never trick `auto_compact_if_needed` into prematurely compacting the conversation history!
-        capped_rep = min(rep, int(est_base_tokens * 1.35)) if rep > 0 else 0
-        total_tokens = max(est_base_tokens, capped_rep) if bot_msgs else sys_tokens
-        if not force and total_tokens < threshold:
-            return None
-
-        kept_tokens = 0
-        if not force:
-            split_idx = max(1, len(bot_msgs) - 2)
-            for i in range(len(bot_msgs) - 1, 0, -1):
-                kept_tokens += self.estimate_tokens(bot_msgs[i].get('llm_text') or bot_msgs[i].get('text', '')) + 12
-                if kept_tokens >= keep_recent:
-                    split_idx = i
-                    break
-            older = bot_msgs[:max(1, split_idx)]
-            if len(older) <= 1 and older[0].get('kind') == 'compact_summary':
-                return None
-        else:
-            # Manual compaction: compact all current messages in the room so the new compaction entry appears right at the bottom of the chat!
-            older = bot_msgs
-            kept_tokens = 0
-
-        summary_lines = [f"- [{m.get('from_bot_name') or m['role']}]: {m.get('text', '')[:600]}" for m in older]
-        raw_transcript = '\n'.join(f"[{m.get('from_bot_name') or m['role']}]: {m.get('text', '')[:1800]}" for m in older)
-
-        # Index full compacted transcript into SQLite FTS5 so ctx_search & conversation_search never lose a single line!
-        ctx_id = ''
-        if self.context_search is not None and raw_transcript.strip():
-            try:
-                ctx_id = self.context_search.store_tool_context(
-                    'compaction_archive',
-                    {'bot_id': bot_id, 'messages_count': len(older), 'threshold': threshold},
-                    raw_transcript,
-                    bot_id=bot_id,
-                )
-            except Exception:
-                ctx_id = ''
-
-        llm_summary = ''
-        if raw_transcript.strip():
-            try:
-                sum_msg = await silent_complete_fn([
-                    {
-                        'role': 'system',
-                        'content': '你是上下文静默压缩引擎。请将以下对话历史浓缩为高信息密度的结构化摘要，完整保留所有关键事实、用户偏好、个人印象（出生/身份/家庭/喜好）、时间节点、文件路径、代码/命令结论以及未决事项。'
-                    },
-                    {'role': 'user', 'content': raw_transcript[:150000]}
-                ])
-                llm_summary = (sum_msg.get('content') or '').strip()
-            except Exception:
-                llm_summary = ''
-        final_summary = llm_summary or ('\n'.join(summary_lines[-40:]) if summary_lines else '（当前会话暂无历史对话，基础系统设定与记忆库索引已就绪。）')
-        stamp_slug = time.strftime('%Y%m%d_%H%M%S', time.localtime())
-        vault_note_path = f'notes/compact_{stamp_slug}.md'
-        thresh_k = f'{threshold // 1000}K' if threshold >= 1000 else str(threshold)
-        mode_label = '手动压缩上下文' if force else f'满 {thresh_k} 自动压缩上下文'
-        ctx_hint = f'SQLite FTS5 索引库 (ctx_id="{ctx_id}")' if ctx_id else 'SQLite FTS5 索引库'
-        archive_md = (
-            f"# 📦 {mode_label}归档 ({now_iso()})\n\n"
-            f"- **所属助手**：`{bot_id}`\n"
-            f"- **压缩变化**：`{total_tokens}` Tokens → `{sys_tokens + kept_tokens + self.estimate_tokens(final_summary)}` Tokens（共浓缩 {len(older)} 条对话）\n"
-            f"- **记忆存储位置**：`memory_vault/{vault_note_path}`、`memory_vault/timeline`、{ctx_hint}\n\n"
-            f"## 浓缩核心摘要\n\n{final_summary}\n"
+        from core.compaction_service import execute_streaming_compaction
+        return await execute_streaming_compaction(
+            memory_engine=self,
+            bot_id=bot_id,
+            source=normalize_node_source(source),
+            force=force,
+            sys_tokens=sys_tokens,
+            reported_tokens=reported_tokens,
+            llm_stream_fn=llm_stream_fn,
+            silent_complete_fn=silent_complete_fn,
+            on_stream=on_stream,
         )
-        prev_suppress = self._suppress_vault_listener
-        self._suppress_vault_listener = True
-        try:
-            self.vault.write(vault_note_path, archive_md)
-            self.vault.log(archive_md)
-            self.vault.reindex()
-        except Exception:
-            pass
-        finally:
-            self._suppress_vault_listener = prev_suppress
-
-        older_ids = {m['id'] for m in older}
-        new_est = sys_tokens + kept_tokens + self.estimate_tokens(final_summary)
-        decision_meta = json.dumps({
-            'before_tokens': total_tokens,
-            'after_tokens': new_est,
-            'compacted_messages': len(older),
-            'vault_path': vault_note_path,
-            'ctx_id': ctx_id,
-            'mode': mode_label,
-        }, ensure_ascii=False)
-        compact_marker = {
-            'id': secrets.token_hex(12),
-            'role': 'assistant',
-            'bot_id': bot_id,
-            'source': src,
-            'kind': 'compact_summary',
-            'decision': decision_meta,
-            'text': (
-                f"📦 **{mode_label}完成**：`{total_tokens}` → `{new_est}` Tokens（共浓缩 {len(older)} 条对话）\n"
-                f"📍 **记忆归档去向**：\n"
-                f"1. 透明记忆库笔记：`memory_vault/{vault_note_path}` 与 `memory_vault/timeline`\n"
-                f"2. 全文检索索引：{ctx_hint}（Bot 可随时用 `conversation_search` / `ctx_search` 检索逐字原话）\n\n"
-                f"{final_summary}"
-            ),
-            'created_at': time.time() if force else older[-1].get('created_at', time.time()),
-            'notify': False,
-        }
-        new_all = []
-        inserted = False
-        for m in self.store.state['messages']:
-            if m['id'] in older_ids:
-                if not force and not inserted:
-                    new_all.append(compact_marker)
-                    inserted = True
-                continue
-            new_all.append(m)
-        if force or not inserted:
-            new_all.append(compact_marker)
-        self.store.state['messages'] = new_all
-        self.last_prompt_tokens[bot_id] = new_est
-        self.last_cached_tokens[bot_id] = 0
-        try:
-            self.store.state.setdefault('last_prompt_tokens', {})[bot_id] = new_est
-            self.store.state.setdefault('last_cached_tokens', {})[bot_id] = 0
-        except Exception:
-            pass
-        self.clear_memory_deltas(bot_id=bot_id, source=src)
-        self.store.save()
-        return {
-            'compacted_messages': len(older),
-            'before_tokens': total_tokens,
-            'after_tokens': new_est,
-            'threshold_tokens': threshold,
-            'vault_path': vault_note_path,
-            'ctx_id': ctx_id,
-            'summary': final_summary,
-            'marker': compact_marker,
-        }
 
     async def sleep_time_consolidate(self, silent_complete_fn):
         """Silently consolidate recent conversation facts into Zettelkasten atomic notes without touching any UI stream."""
@@ -672,7 +568,8 @@ class MemoryEngine:
             m for m in s.get('messages', [])
             if float(m.get('created_at', 0)) > last_consolidated
             and m.get('role') in ('user', 'assistant')
-            and m.get('kind') not in ('curiosity', 'error', 'compact_summary', 'notification')
+            and m.get('kind') not in ('curiosity', 'error', 'compact_summary', 'notification', 'bot_message', 'bot_reply')
+            and not m.get('is_sub_turn')
         ]
         if len(new_msgs) < 2:
             return
@@ -684,10 +581,11 @@ class MemoryEngine:
             raw_pins = self.vault.read(self.PINNED_FILE)
             prompt = (
                 '你是后台静默记忆整理器（Zettelkasten 原子记忆引擎 & 主人个人印象与状态同步器）。\n'
-                '请检查以下最近对话是否有值得长期记住的：\n'
+                '请检查以下最近对话是否有值得长期记住的客观事实：\n'
                 '1. 【已完成事项与关键状态变更】（例如“腾讯视频自动续订已解除”、“某待办已办结”、“某订阅已退订”等，必须及时修正旧的待办或挂念状态！）；\n'
                 '2. 【主人个人背景与偏好】（出生地/家乡/成长、身份/专业/目标、家庭/家人/宠物/关系、生活方式/作息/饮食/精神喜好、性格/价值观/雷区、项目/课程进展）。\n'
-                '如果没有任何新的长期价值信息或状态变更，严格只输出 `NONE`。\n'
+                '⚠️ 严禁把日常打情骂俏、亲密互动、角色扮演、荤话玩笑或AI的回复态度记录为“边界/底线/拒绝”规则！若对话仅包含亲密调情、日常催促或无新客观事实的闲聊，严格只输出 `NONE`。\n'
+                '如果没有任何新的长期价值客观事实或状态变更，严格只输出 `NONE`。\n'
                 '如果有，请严格输出 JSON 对象：{"new_traits": ["一句话新画像事实或已完成状态定论（若无则空数组）"], "completed_or_updated_pins": [{"match": "旧待办或旧状态关键词（如 腾讯视频自动续订）", "replacement": "更新后的状态定论（如 腾讯视频自动续订已解除，无需再提醒退订）"}], "updated_impression_markdown": "如果对话中包含主人个人背景/家庭/出生/身份/偏好或状态变更的新事实，请基于下方【当前个人印象档案】把对应条目更新并输出完整的 Markdown；若无个人印象更新则留空字符串", "note_slug": "英文短文件名如 project-update", "note_title": "卡片标题", "note_markdown": "包含 # 标题、关键事实列表与 [[关联双链]] 的精简原子卡片正文（不超过300字）"}\n\n'
                 f'【当前置顶记忆 (profile/pinned_memories.md)】\n{raw_pins[:1600]}\n\n'
                 f'【当前个人印象档案 (profile/personal_impression.md)】\n{raw_imp[:2200]}\n\n'
@@ -771,7 +669,8 @@ class MemoryEngine:
                     self.record_memory_delta(' ； '.join(delta_parts[:4]), path='memory_vault/profile/user_traits.md', source='sleep_consolidate')
             s['last_sleep_consolidate'] = time.time()
             self.store.save()
-        except Exception:
-            pass
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("sleep_time_consolidate error: %s", e)
         finally:
             self._consolidating = False

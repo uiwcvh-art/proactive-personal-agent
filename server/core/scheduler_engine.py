@@ -101,16 +101,22 @@ class SchedulerEngine:
             })
         r_view = []
         changed = False
+        now_t = time.time()
         for r in routines:
-            if not r.get('next_run') or (r.get('daily_time') and r.get('next_run', 0) < time.time() - 86400):
-                r['next_run'] = self.compute_next_routine_run(r)
+            if not r.get('next_run') or (r.get('daily_time') and float(r.get('next_run', 0)) < now_t - 14400):
+                r['next_run'] = self.compute_next_routine_run(r, now_t)
+                r['next_run_bj'] = self.fmt_bj(r['next_run'])
                 changed = True
             mode_desc = f"每天 {r['daily_time']} (北京时间)" if r.get('daily_time') else f"每 {r.get('interval_hours', 24)} 小时"
             if r.get('weekdays') and str(r.get('weekdays')) not in ('', 'all', '*'):
                 mode_desc += f" [星期 {r['weekdays']}]"
+            overdue_s = max(0, round(now_t - float(r.get('next_run') or now_t)))
+            sched_state = 'disabled' if not r.get('enabled', True) else ('queued_catchup' if overdue_s > 0 else 'scheduled')
             r_view.append({
                 **r,
                 'schedule_mode': mode_desc,
+                'schedule_state': sched_state,
+                'overdue_seconds': overdue_s,
                 'next_run_bj': self.fmt_bj(r.get('next_run')),
                 'last_run_bj': self.fmt_bj(r.get('last_run')),
             })

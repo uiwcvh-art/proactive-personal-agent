@@ -20,8 +20,8 @@ def env(tmp_path, monkeypatch):
 
 def test_whalechan_default_persona_and_baike_preservation(env):
     app, c = env
-    # 1. Default install includes 白珂 (companion) and authentic community Whale-chan (鲸鱼娘)
-    assert DEFAULT_ASSISTANTS[0]["name"] == "白珂"
+    # 1. Default install includes 主助理 (companion) and authentic community Whale-chan (鲸鱼娘)
+    assert DEFAULT_ASSISTANTS[0]["name"] == "主助理"
     whale_bot = next((b for b in DEFAULT_ASSISTANTS if b["name"] == "鲸鱼娘"), None)
     assert whale_bot is not None
     assert "白米饭" in whale_bot["instructions"]
@@ -355,59 +355,228 @@ def test_cross_node_same_bot_send_message_and_clean_thought(env):
     call_step = {"n": 0}
 
     async def fake_complete(messages, tools=None, big=False, **kw):
+        cur_src = brain.source_context.get()
+        cur_bot = brain.bot_context.get()
+        if cur_src == "phone" and cur_bot == "companion":
+            captured_target_msgs.extend(messages)
+            return {
+                "role": "assistant",
+                "content": "下午好喵！手机端这边一切正常，余在这边守着通知栏喵～",
+                "reasoning_content": "收到电脑端司工的黑板打招呼，简短回复喵。",
+            }
         call_step["n"] += 1
         if call_step["n"] == 1:
             await brain._set_stream(
                 text="",
-                thought="正在生成 send_message · 安卓一:白珂 (42 字符)\n下午好喵，单纯打个招呼",
-                tool="send_message",
+                thought="准备在黑板 @companion 打个招呼",
+                tool="blackboard",
             )
             return {
                 "role": "assistant",
                 "content": "",
-                "reasoning_content": "正在生成 send_message · 安卓一:白珂 (42 字符)\n下午好喵，单纯打个招呼",
+                "reasoning_content": "准备在黑板 @companion 打个招呼",
                 "tool_calls": [
                     {
                         "id": "call_1",
                         "type": "function",
                         "function": {
-                            "name": "send_message",
+                            "name": "blackboard",
                             "arguments": json.dumps(
-                                {"to_bot_id": "安卓一:白珂", "text": "下午好喵，单纯打个招呼，没事随便聊一句也行喵。"},
+                                {"action": "post", "mentions": ["@companion"], "title": "下午好喵，单纯打个招呼", "text": "下午好喵，单纯打个招呼，没事随便聊一句也行喵。"},
                                 ensure_ascii=False,
                             ),
                         },
                     }
                 ],
             }
-        if call_step["n"] == 2:
-            captured_target_msgs.extend(messages)
-            return {
-                "role": "assistant",
-                "content": "下午好喵！手机端这边一切正常，余在这边守着通知栏喵～",
-                "reasoning_content": "收到电脑端白珂的打招呼，简短回复她喵。",
-            }
         return {
             "role": "assistant",
-            "content": "已经跟手机端的白珂打过招呼啦喵！",
+            "content": "已经在黑板跟手机端主助理打过招呼啦！",
             "reasoning_content": "",
         }
 
     brain.complete = fake_complete
     r = c.post(
         "/api/chat",
-        json={"text": "给安卓一的白珂发条新消息打个招呼", "bot_id": "companion", "mode": "chat", "source": "pc"},
+        json={"text": "给安卓一的白珂发条新消息打个招呼", "bot_id": "pc_engineer", "mode": "auto", "source": "pc"},
     )
     assert r.status_code == 200
+    for _ in range(30):
+        if captured_target_msgs:
+            break
+        import time as _t
+        _t.sleep(0.02)
     assert captured_target_msgs, "Target bot on phone was not invoked"
-    # The incoming cross-node message from pc:companion to phone:companion MUST be role=='user', NOT 'assistant'!
     user_msgs_in_target = [m for m in captured_target_msgs if m.get("role") == "user"]
-    assert any("跨端/同事 Bot 协作来信" in str(m.get("content", "")) and "下午好喵，单纯打个招呼" in str(m.get("content", "")) for m in user_msgs_in_target)
+    assert any("黑板提醒" in str(m.get("content", "")) and "下午好喵，单纯打个招呼" in str(m.get("content", "")) for m in user_msgs_in_target)
 
-    # Verify the outbound bot_message in PC chat has NO '正在生成 send_message' leaked in `thought`
     pc_msgs = [m for m in app.state.store.state["messages"] if m.get("source") == "pc"]
-    outbound_bm = [m for m in pc_msgs if m.get("kind") == "bot_message"]
-    assert outbound_bm
-    assert not str(outbound_bm[-1].get("thought") or "").startswith("正在生成 ")
+    assert not any(m.get("kind") in ("bot_message", "bot_reply") for m in pc_msgs)
+    pc_reply = [m for m in pc_msgs if m.get("role") == "assistant"][-1]
+    assert "打过招呼啦" in pc_reply.get("text", "")
+    assert "收到电脑端司工的黑板打招呼" not in str(pc_reply.get("thought") or "")
+    phone_msgs = [m for m in app.state.store.state["messages"] if m.get("source") == "phone"]
+    for _ in range(20):
+        phone_msgs = [m for m in app.state.store.state["messages"] if m.get("source") == "phone"]
+        if any(m.get("role") == "assistant" for m in phone_msgs):
+            break
+        import time as _t
+        _t.sleep(0.02)
+    inbound_phone = [m for m in phone_msgs if m.get("kind") == "bot_message"]
+    assert inbound_phone and not inbound_phone[-1].get("trace") and not inbound_phone[-1].get("thought")
+    reply_phone = [m for m in phone_msgs if m.get("role") == "assistant"]
+    assert reply_phone and "收到电脑端司工的黑板打招呼" in str(reply_phone[-1].get("thought") or "")
+
+
+def test_slash_commands_and_undo_redo_and_pin(env):
+    app, c = env
+    # 1. /help, /mcp, /status, /doctor
+    for cmd, expected in [
+        ("/help", "/compact"),
+        ("/mcp", "MCP / 插件工具与技能矩阵"),
+        ("/status", "Harness 运行状态"),
+        ("/doctor", "Harness 通道自检报告"),
+    ]:
+        r = c.post("/api/chat", json={"text": cmd, "bot_id": "companion", "source": "phone"})
+        assert r.status_code == 200
+        assert expected in r.json().get("text", "")
+
+    # 2. /pin, /pins, /unpin
+    r_pin = c.post("/api/chat", json={"text": "/pin 记住测试锚点Alpha", "bot_id": "companion", "source": "phone"})
+    assert r_pin.status_code == 200
+    assert "记住测试锚点Alpha" in r_pin.json().get("text", "")
+
+    r_pins = c.post("/api/chat", json={"text": "/pins", "bot_id": "companion", "source": "phone"})
+    assert "记住测试锚点Alpha" in r_pins.json().get("text", "")
+
+    r_unpin = c.post("/api/chat", json={"text": "/unpin 记住测试锚点Alpha", "bot_id": "companion", "source": "phone"})
+    assert "已移除置顶记忆" in r_unpin.json().get("text", "")
+
+    # 3. /undo and /redo
+    r_undo = c.post("/api/chat", json={"text": "/undo", "bot_id": "companion", "source": "phone"})
+    assert r_undo.status_code == 200
+    assert "已撤销上一轮对话" in r_undo.json().get("text", "")
+
+    r_redo = c.post("/api/chat", json={"text": "/redo", "bot_id": "companion", "source": "phone"})
+    assert r_redo.status_code == 200
+    assert "已恢复撤销的对话" in r_redo.json().get("text", "")
+
+
+def test_vault_index_false_isolation(env):
+    app, c = env
+    vault = app.state.vault
+    deltas_triggered = []
+    vault.mutation_listeners.append(lambda p, act: deltas_triggered.append((p, act)))
+
+    vault.write(
+        "notes/asmr-style-worldbook.md",
+        "---\ntitle: ASMR世界书\nindex: false\n---\n# 专属哄睡词库\n包含普通搜索关键词测试词条XYZ",
+    )
+    # 1. Writing index:false note should NOT trigger mutation_listeners (no memory_delta injection)
+    assert not any("asmr-style-worldbook.md" in p for p, _ in deltas_triggered)
+
+    # 2. Ordinary search should skip index:false note
+    res_general = vault.search("测试词条XYZ")
+    assert all(not r["path"].endswith("notes/asmr-style-worldbook.md") for r in res_general)
+
+    # 3. Explicit worldbook/asmr search MUST find it
+    res_explicit = vault.search("ASMR世界书 测试词条XYZ")
+    assert any(r["path"].endswith("notes/asmr-style-worldbook.md") for r in res_explicit)
+
+
+def test_resource_domain_concurrency_and_inline_xml_healing(env):
+    app, c = env
+    brain = app.state.brain
+
+    # 1. Inline XML hallucination self-healing
+    raw_text = '我先帮你看下喵\n<run_bash>{"command": "uptime"}</run_bash>\n<phone_workspace op="device_info" />'
+    calls, cleaned = brain._extract_inline_xml_tool_calls(raw_text, {"run_bash", "phone_workspace"})
+    assert len(calls) == 2
+    assert calls[0]["function"]["name"] == "run_bash"
+    assert calls[1]["function"]["name"] == "phone_workspace"
+    assert "<run_bash>" not in cleaned
+
+    # 2. Universal Resource-Domain Concurrency Scheduler
+    d_read1 = brain._resolve_tool_concurrency_domain("read_file", {"path": "a.md"}, "phone", False)
+    d_read2 = brain._resolve_tool_concurrency_domain("read_file", {"path": "b.md"}, "phone", False)
+    assert d_read1 is None and d_read2 is None
+
+    # Different files write in parallel; same file writes sequentially in same domain
+    d_w1 = brain._resolve_tool_concurrency_domain("edit_file", {"path": "notes/a.md"}, "phone", False)
+    d_w2 = brain._resolve_tool_concurrency_domain("edit_file", {"path": "notes/b.md"}, "phone", False)
+    d_w1_again = brain._resolve_tool_concurrency_domain("write_file", {"path": "./notes/a.md"}, "phone", False)
+    assert d_w1 != d_w2
+    assert d_w1 == d_w1_again
+
+    # Phone GUI vs Phone Shell vs Phone Read-Only Status
+    d_pgui = brain._resolve_tool_concurrency_domain("phone_workspace", {"op": "tap", "nx": 500, "ny": 500}, "phone", False)
+    d_pshell = brain._resolve_tool_concurrency_domain("phone_workspace", {"op": "shell", "command": "id"}, "phone", False)
+    d_pinfo = brain._resolve_tool_concurrency_domain("phone_workspace", {"op": "device_info"}, "phone", False)
+    assert d_pgui == "domain:phone_gui"
+    assert d_pshell == "domain:phone_shell"
+    assert d_pinfo is None
+
+
+def test_xml_tool_parser_and_silent_proactive_filter():
+    import json
+    from core.xml_tool_parser import (
+        extract_inline_tool_calls,
+        is_silent_proactive_output,
+        strip_inline_tool_markup,
+    )
+
+    assert is_silent_proactive_output("（静默，主人在忙，不打扰喵～）") is True
+    assert is_silent_proactive_output("[SILENT: nothing new]") is True
+    assert is_silent_proactive_output("SILENT_OK") is True
+    assert is_silent_proactive_output("主人，余帮你查好啦喵～") is False
+
+    sample = (
+        "余先看下手机界面喵～\n"
+        "<function=phone_workspace><parameter=op>wait</parameter><parameter=duration_ms>1500</parameter></function>\n"
+        "<functions_tool_call>{\"name\": \"web_search\", \"arguments\": {\"query\": \"DeepSeek\"}}</functions_tool_call>\n"
+        "<tool_call>run_bash(command=\"echo ok\", timeout=5)</tool_call>"
+    )
+    calls = extract_inline_tool_calls(sample)
+    assert len(calls) == 3
+    assert calls[0]["function"]["name"] == "phone_workspace"
+    assert json.loads(calls[0]["function"]["arguments"])["duration_ms"] == 1500
+    assert calls[1]["function"]["name"] == "web_search"
+    assert calls[2]["function"]["name"] == "run_bash"
+
+    stripped = strip_inline_tool_markup(sample)
+    assert stripped == "余先看下手机界面喵～"
+
+
+def test_compaction_idempotency_and_anti_drift(env):
+    from core.compaction_service import (
+        build_compaction_messages,
+        check_already_compacted,
+        is_valid_compaction_summary,
+    )
+
+    msgs = build_compaction_messages("[user]: 帮我看看为什么压缩了两次？")
+    assert "<transcript_to_summarize>" in msgs[1]["content"]
+    assert "绝对禁止回答" in msgs[0]["content"]
+
+    # Conversational reply must be rejected by anti-drift validator
+    bad_reply = "主人喵～那是因为之前没有加锁，余马上帮你修好喵！"
+    assert not bool(is_valid_compaction_summary(bad_reply))
+
+    good_summary = "### 📋 核心进展与上下文摘要\n- 已完成上下文流式压缩改造\n- 解决了重复压缩与回答跑偏问题"
+    valid_res = is_valid_compaction_summary(good_summary)
+    assert bool(valid_res) is True
+    assert valid_res[1].startswith("### 📋")
+
+    # Idempotency guard when last message is already compact_summary
+    room_msgs = [
+        {"id": "m1", "role": "assistant", "kind": "compact_summary", "bot_id": "companion", "source": "phone", "text": good_summary}
+    ]
+    already = check_already_compacted(room_msgs, force=True)
+    assert already is not None
+    assert already["already_compacted"] is True
+    assert already["compacted"] is False
+
+
+
 
 

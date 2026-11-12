@@ -29,6 +29,7 @@ import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.core.graphics.PathParser
@@ -103,15 +104,8 @@ internal fun PulseIcon(name: String, color: Color, modifier: Modifier = Modifier
     }
 }
 
-private val shapePaths = mapOf(
-    "flower" to "M50 4 C61 4 64 17 73 20 C82 23 93 16 97 25 C101 35 89 43 89 52 C89 61 100 68 95 78 C90 87 78 81 70 86 C62 91 61 98 50 98 C39 98 38 91 30 86 C22 81 10 87 5 78 C0 68 11 61 11 52 C11 43 -1 35 3 25 C7 16 18 23 27 20 C36 17 39 4 50 4 Z",
-    "circle" to "M50 5 A45 45 0 1 0 50 95 A45 45 0 1 0 50 5 Z",
-    "star" to "M50 4 C54 33 67 46 96 50 C67 54 54 67 50 96 C46 67 33 54 4 50 C33 46 46 33 50 4 Z",
-    "drop" to "M50 5 C71 29 88 47 88 67 A38 38 0 1 1 12 67 C12 47 29 29 50 5 Z",
-    "diamond" to "M50 5 L95 50 L50 95 L5 50 Z",
-    "square" to "M22 8 H78 A14 14 0 0 1 92 22 V78 A14 14 0 0 1 78 92 H22 A14 14 0 0 1 8 78 V22 A14 14 0 0 1 22 8 Z",
-    "pill" to "M34 6 H66 A28 28 0 0 1 94 34 V66 A28 28 0 0 1 66 94 H34 A28 28 0 0 1 6 66 V34 A28 28 0 0 1 34 6 Z"
-)
+private val shapePaths: Map<String, String>
+    get() = BotAvatarView.shapePaths
 
 @Composable
 internal fun PulseAvatar(
@@ -125,73 +119,48 @@ internal fun PulseAvatar(
     val image = state.avatars[bot.id]
     val isBusy = state.streamBotId == bot.id || state.workingBot == bot.id || state.busyBot == bot.id
     val dotSize = (diameter * 0.26f).coerceIn(10.dp, 15.dp)
+    val baseColor = remember(bot.color) {
+        BotAvatarView.parseColorSafe(bot.color, Color(0xFFB568F7))
+    }
+    val useWhalechanStamp = remember(bot.id, bot.shape) {
+        BotAvatarView.isWhalechanStamp(bot.id, bot.shape)
+    }
 
     Box(Modifier.size(diameter)) {
         if (image != null && bot.avatarVersion.isNotBlank()) {
-            Image(image, null, Modifier.size(diameter).clip(RoundedCornerShape(radius)), contentScale = ContentScale.Crop)
+            Image(
+                image,
+                null,
+                Modifier
+                    .size(diameter)
+                    .clip(RoundedCornerShape(radius))
+                    .border(1.5.dp, baseColor.copy(alpha = 0.85f), RoundedCornerShape(radius)),
+                contentScale = ContentScale.Crop
+            )
+        } else if (useWhalechanStamp) {
+            Image(
+                painter = painterResource(id = R.drawable.whalechan_avatar),
+                contentDescription = bot.name,
+                modifier = Modifier
+                    .size(diameter)
+                    .clip(CircleShape)
+                    .background(baseColor.copy(alpha = 0.18f), CircleShape)
+                    .border(2.dp, baseColor, CircleShape),
+                contentScale = ContentScale.Crop
+            )
         } else {
-            val isPrimaryCompanion = bot.id == "companion" || bot.shape == "flower"
             val shapeKey = remember(bot.shape, bot.id) {
-                when {
-                    bot.id == "companion" -> "flower"
-                    bot.shape in shapePaths -> bot.shape
-                    bot.id == "research" -> "circle"
-                    else -> "flower"
-                }
-            }
-            val fill = remember(shapeKey) { PathParser.createPathFromPathData(shapePaths[shapeKey] ?: shapePaths.getValue("flower")) }
-            val fillPaint = remember { Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL } }
-            val baseColor = remember(bot.color, bot.id, isPrimaryCompanion) {
-                if (bot.id == "companion" && (bot.color.isBlank() || bot.color.equals("#4D6BFE", ignoreCase = true) || bot.color.equals("#2B6EF6", ignoreCase = true) || bot.color.equals("#7C5CFF", ignoreCase = true))) {
-                    Color(0xFFB568F7)
-                } else if (isPrimaryCompanion && bot.color.isBlank()) {
-                    Color(0xFFB568F7)
+                if (bot.shape.isNotBlank() && bot.shape in BotAvatarView.shapePaths) {
+                    bot.shape
                 } else {
-                    runCatching { Color(android.graphics.Color.parseColor(bot.color)) }.getOrDefault(Color(0xFFB568F7))
+                    BotAvatarView.resolveShapeKey(bot.id, bot.shape)
                 }
             }
-            val isSpeaking = state.streamSpeakerId == bot.id || isBusy
-            val animateEyes = state.motion && isSpeaking
-            val eyeScaleY: Float
-            val eyeShiftX: Float
-            if (animateEyes) {
-                val infinite = rememberInfiniteTransition(label = "avatar_${bot.id}")
-                val blinkVal by infinite.animateFloat(
-                    initialValue = 1f,
-                    targetValue = 1f,
-                    animationSpec = infiniteRepeatable(
-                        animation = keyframes {
-                            durationMillis = 4200
-                            1f at 0
-                            1f at 3750
-                            0.15f at 3880 using FastOutSlowInEasing
-                            1f at 4020 using FastOutSlowInEasing
-                            1f at 4200
-                        },
-                        repeatMode = RepeatMode.Restart
-                    ),
-                    label = "blink"
-                )
-                val shiftVal by infinite.animateFloat(
-                    initialValue = 0f,
-                    targetValue = 3.5f,
-                    animationSpec = infiniteRepeatable(
-                        animation = keyframes {
-                            durationMillis = 1200
-                            0f at 0
-                            3.5f at 600 using FastOutSlowInEasing
-                            0f at 1200
-                        },
-                        repeatMode = RepeatMode.Restart
-                    ),
-                    label = "glance"
-                )
-                eyeScaleY = blinkVal
-                eyeShiftX = shiftVal
-            } else {
-                eyeScaleY = 1f
-                eyeShiftX = 0f
-            }
+            val fill = remember(shapeKey) { BotAvatarView.createPath(shapeKey) }
+            val fillPaint = remember { Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL } }
+            // Static eye geometry to eliminate 90Hz infinite Canvas invalidations & BLASTBufferQueue out-of-order buffers.
+            val eyeScaleY = 1f
+            val eyeShiftX = 0f
             Canvas(Modifier.size(diameter)) {
                 val s = size.minDimension / 100f
                 fillPaint.color = android.graphics.Color.argb(

@@ -387,7 +387,8 @@ class TestNotificationAndScreenshot(unittest.TestCase):
             # and the corresponding prefix of Turn 2 Step 1 (`captured_payloads[3]`)!
             turn1_msgs = captured_payloads[0]
             turn2_msgs = captured_payloads[3]
-            self.assertEqual(len(turn2_msgs), len(turn1_msgs) + 2)
+            self.assertEqual(len(turn2_msgs), len(turn1_msgs) + 4)
+            self.assertEqual(turn2_msgs[-3]['role'], 'tool')
             for idx, m1 in enumerate(turn1_msgs):
                 self.assertEqual(
                     m1,

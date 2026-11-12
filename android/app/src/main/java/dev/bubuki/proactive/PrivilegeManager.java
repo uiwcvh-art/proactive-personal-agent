@@ -24,6 +24,10 @@ final class PrivilegeManager {
     private BufferedReader rootIn;
     private BufferedWriter rootOut;
     private java.lang.Process rootProcess;
+    private final Object pipeLock = new Object();
+    private final java.util.concurrent.atomic.AtomicLong reqSeq = new java.util.concurrent.atomic.AtomicLong(1L);
+    private final ConcurrentHashMap<String, CompletableFuture<String>> pendingRpcs = new ConcurrentHashMap<>();
+    private volatile CompletableFuture<String> handshakeFuture;
     private final ExecutorService ioPool = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "pulse-root-io");
         t.setDaemon(true);
@@ -177,42 +181,67 @@ final class PrivilegeManager {
         return proc;
     }
 
-    synchronized JSONObject execute(JSONObject command) throws Exception {
+    JSONObject execute(JSONObject command) throws Exception {
         if (!rootGranted) {
             probe();
             if (!rootGranted) throw new Exception("先在此手机页面连接并授权 Root；请在 Magisk / KernelSU / APatch 中允许此应用");
         }
+        String op = command.optString("op", "");
+        long timeoutMs = "shell".equals(op) ? 30000L : 20000L;
         Exception lastErr = null;
         for (int attempt = 0; attempt < 2; attempt++) {
+            String reqId = "r" + reqSeq.getAndIncrement();
+            CompletableFuture<String> future = new CompletableFuture<>();
+            pendingRpcs.put(reqId, future);
             try {
-                ensureRoot();
-                rootOut.write(command.toString());
-                rootOut.newLine();
-                rootOut.flush();
-                String line = readRpcLine(20000);
+                JSONObject wireCmd = new JSONObject(command.toString());
+                wireCmd.put("_req_id", reqId);
+                synchronized (pipeLock) {
+                    ensureRootLocked();
+                    rootOut.write(wireCmd.toString());
+                    rootOut.newLine();
+                    rootOut.flush();
+                }
+                String line = future.get(timeoutMs, TimeUnit.MILLISECONDS);
                 if (line == null) throw new IOException("Root 工具会话已断开" + (lastDiag.isEmpty() ? "" : " (" + lastDiag + ")"));
                 JSONObject result = new JSONObject(line);
+                result.remove("_req_id");
                 if (result.has("error")) throw new Exception(result.getString("error"));
                 return result;
+            } catch (TimeoutException te) {
+                // Single request timeout: do NOT close the shared pipe or interrupt other active requests!
+                throw new Exception("等待 Root 工具响应超时 (" + op + ")");
             } catch (InterruptedException e) {
-                closeRoot();
                 Thread.currentThread().interrupt();
                 throw e;
+            } catch (ExecutionException ee) {
+                Throwable cause = ee.getCause();
+                if (cause instanceof IOException) {
+                    synchronized (pipeLock) { closeRootLocked(); }
+                    lastErr = (IOException) cause;
+                } else {
+                    throw (cause instanceof Exception) ? (Exception) cause : new Exception(cause);
+                }
             } catch (IOException e) {
-                closeRoot();
+                synchronized (pipeLock) { closeRootLocked(); }
                 lastErr = e;
+            } finally {
+                pendingRpcs.remove(reqId);
             }
         }
-        if (rootProcess == null) {
-            rootGranted = false;
-            persistHint(false, suMode);
+        synchronized (pipeLock) {
+            if (rootProcess == null) {
+                rootGranted = false;
+                persistHint(false, suMode);
+            }
         }
         throw lastErr != null ? lastErr : new Exception("Root 工具调用失败");
     }
 
-    private void ensureRoot() throws Exception {
+    private void ensureRootLocked() throws Exception {
         if (rootProcess != null && rootProcess.isAlive() && rootIn != null && rootOut != null) return;
-        closeRoot();
+        closeRootLocked();
+        lastDiag = "";
         String token = UUID.randomUUID().toString();
         String apk = context.getApplicationInfo().sourceDir;
         String escapedApk = apk.replace("'", "'\\''");
@@ -224,8 +253,9 @@ final class PrivilegeManager {
             + "settings put secure accessibility_enabled 1 >/dev/null 2>&1; ";
         String cmd = preGrant + "export CLASSPATH='" + escapedApk + "'; exec /system/bin/app_process /system/bin --nice-name="
             + pkg + ":root dev.bubuki.proactive.RootDisplayServer " + token + " " + android.os.Process.myUid();
-        rootProcess = startSu(cmd, suMode);
-        final InputStream errStream = rootProcess.getErrorStream();
+        final java.lang.Process proc = startSu(cmd, suMode);
+        rootProcess = proc;
+        final InputStream errStream = proc.getErrorStream();
         ioPool.submit(() -> {
             try (BufferedReader errReader = new BufferedReader(new InputStreamReader(errStream, StandardCharsets.UTF_8))) {
                 String errLine;
@@ -238,46 +268,74 @@ final class PrivilegeManager {
                 }
             } catch (Throwable ignored) {}
         });
-        rootIn = new BufferedReader(new InputStreamReader(rootProcess.getInputStream(), StandardCharsets.UTF_8));
-        rootOut = new BufferedWriter(new OutputStreamWriter(rootProcess.getOutputStream(), StandardCharsets.UTF_8));
-        String handshake = readRpcLine(12000);
-        if (!("READY:" + token).equals(handshake)) {
-            String diag = lastDiag;
-            closeRoot();
-            throw new IOException("Root 工具进程握手未完成" + (diag.isEmpty() ? "" : ": " + diag));
-        }
-    }
-
-    private String readRpcLine(long timeoutMs) throws Exception {
-        final BufferedReader reader = rootIn;
-        if (reader == null) return null;
-        Future<String> future = ioPool.submit(() -> {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                int idx = line.indexOf(RPC_PREFIX);
-                if (idx >= 0) {
-                    return line.substring(idx + RPC_PREFIX.length()).trim();
+        final BufferedReader reader = new BufferedReader(new InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8));
+        rootIn = reader;
+        rootOut = new BufferedWriter(new OutputStreamWriter(proc.getOutputStream(), StandardCharsets.UTF_8));
+        final CompletableFuture<String> hs = new CompletableFuture<>();
+        handshakeFuture = hs;
+        ioPool.submit(() -> {
+            try {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    int idx = line.indexOf(RPC_PREFIX);
+                    if (idx < 0) continue;
+                    String payload = line.substring(idx + RPC_PREFIX.length()).trim();
+                    if (payload.startsWith("READY:")) {
+                        CompletableFuture<String> h = handshakeFuture;
+                        if (h != null && !h.isDone()) h.complete(payload);
+                        continue;
+                    }
+                    String targetReqId = "";
+                    try {
+                        JSONObject obj = new JSONObject(payload);
+                        targetReqId = obj.optString("_req_id", "");
+                    } catch (Throwable ignored) {}
+                    if (!targetReqId.isEmpty()) {
+                        CompletableFuture<String> f = pendingRpcs.remove(targetReqId);
+                        if (f != null) f.complete(payload);
+                    } else {
+                        for (java.util.Map.Entry<String, CompletableFuture<String>> entry : pendingRpcs.entrySet()) {
+                            if (pendingRpcs.remove(entry.getKey(), entry.getValue())) {
+                                entry.getValue().complete(payload);
+                                break;
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                CompletableFuture<String> h = handshakeFuture;
+                if (h != null && !h.isDone()) h.completeExceptionally(new IOException("Root 管道已关闭"));
+                for (java.util.Map.Entry<String, CompletableFuture<String>> entry : pendingRpcs.entrySet()) {
+                    if (pendingRpcs.remove(entry.getKey(), entry.getValue())) {
+                        entry.getValue().completeExceptionally(new IOException("Root 管道已断开"));
+                    }
                 }
             }
-            return null;
         });
+        String handshake;
         try {
-            return future.get(timeoutMs, TimeUnit.MILLISECONDS);
-        } catch (InterruptedException e) {
-            future.cancel(true);
-            closeRoot();
-            throw e;
-        } catch (TimeoutException e) {
-            future.cancel(true);
-            throw new IOException("等待 Root 工具响应超时");
-        } catch (ExecutionException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof IOException) throw (IOException) cause;
-            throw new IOException(cause != null ? cause.getMessage() : "读取 Root 响应失败");
+            handshake = hs.get(12000, TimeUnit.MILLISECONDS);
+        } catch (Exception e) {
+            String diag = lastDiag;
+            if ("ok".equalsIgnoreCase(diag)) diag = "";
+            String exitInfo = "";
+            try {
+                if (!proc.isAlive()) exitInfo = "exit=" + proc.exitValue();
+            } catch (Throwable ignored) {}
+            closeRootLocked();
+            String detail = !diag.isEmpty() ? diag : (!exitInfo.isEmpty() ? exitInfo : "daemon_handshake_timeout");
+            throw new IOException("Root 工具进程握手未完成 (" + detail + ")");
+        }
+        if (!("READY:" + token).equals(handshake)) {
+            String diag = lastDiag;
+            if ("ok".equalsIgnoreCase(diag)) diag = "";
+            closeRootLocked();
+            throw new IOException("Root 工具进程握手未完成" + (diag.isEmpty() ? " (invalid_token)" : " (" + diag + ")"));
         }
     }
 
-    private void closeRoot() {
+    private void closeRootLocked() {
         try { if (rootIn != null) rootIn.close(); } catch (Exception ignored) {}
         try { if (rootOut != null) rootOut.close(); } catch (Exception ignored) {}
         rootIn = null;
@@ -288,13 +346,15 @@ final class PrivilegeManager {
         }
     }
 
-    synchronized void close() {
-        try {
-            if (rootOut != null) {
-                rootOut.write("{\"op\":\"exit\"}\n");
-                rootOut.flush();
-            }
-        } catch (IOException ignored) {}
-        closeRoot();
+    void close() {
+        synchronized (pipeLock) {
+            try {
+                if (rootOut != null) {
+                    rootOut.write("{\"op\":\"exit\"}\n");
+                    rootOut.flush();
+                }
+            } catch (IOException ignored) {}
+            closeRootLocked();
+        }
     }
 }

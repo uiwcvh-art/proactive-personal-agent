@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import Any
 
 from assistants import get_assistant
-from vault_manager import TZ
+from storage import normalize_node_source
+from vault_manager import TZ, now_iso
 
 
 class ToolHandlersMixin:
@@ -45,6 +46,10 @@ class ToolHandlersMixin:
         m_hm = re.fullmatch(r'(\d{1,2}):(\d{2})(?::(\d{2}))?', s)
         if m_hm:
             hh, mm, ss = int(m_hm.group(1)), int(m_hm.group(2)), int(m_hm.group(3) or 0)
+            if hh == 24 and mm == 0 and ss == 0:
+                hh = 0
+            if not (0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59):
+                raise ValueError(f'时间格式非法: {raw}（小时须为 00-23，分钟/秒须为 00-59）')
             target = now_dt.replace(hour=hh, minute=mm, second=ss, microsecond=0)
             if target.timestamp() <= base_ts:
                 target += timedelta(days=1)
@@ -54,6 +59,29 @@ class ToolHandlersMixin:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=TZ)
         return dt.timestamp()
+
+    @staticmethod
+    def _validate_daily_time_slots(daily_raw: str) -> list[tuple[int, int, int]]:
+        s = (daily_raw or '').strip()
+        if not s:
+            return []
+        slots: list[tuple[int, int, int]] = []
+        for part in s.split(','):
+            p = part.strip()
+            if not p:
+                continue
+            m = re.fullmatch(r'(\d{1,2}):(\d{2})(?::(\d{2}))?', p)
+            if not m:
+                raise ValueError(f'daily_time 格式非法: {p}（请使用 HH:MM，如 08:30 或 08:30,21:00）')
+            hh, mm, ss = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
+            if hh == 24 and mm == 0 and ss == 0:
+                hh = 0
+            if not (0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59):
+                raise ValueError(f'daily_time 时间超出有效范围: {p}（小时须为 00-23，分钟/秒须为 00-59）')
+            slots.append((hh, mm, ss))
+        if not slots:
+            raise ValueError(f'daily_time 格式非法: {daily_raw}')
+        return slots
 
     @classmethod
     def _extract_clock_from_goal(cls, goal: str) -> str:
@@ -69,12 +97,10 @@ class ToolHandlersMixin:
                 daily_raw = inferred
                 r['daily_time'] = inferred
         if daily_raw:
-            slots = []
-            for part in daily_raw.split(','):
-                part = part.strip()
-                m = re.fullmatch(r'(\d{1,2}):(\d{2})(?::(\d{2}))?', part)
-                if m:
-                    slots.append((int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)))
+            try:
+                slots = cls._validate_daily_time_slots(daily_raw)
+            except ValueError:
+                slots = []
             if slots:
                 wk_raw = str(r.get('weekdays') or '').strip().lower()
                 allowed_days = set(range(1, 8))
@@ -99,36 +125,7 @@ class ToolHandlersMixin:
         return last_run + hours * 3600
 
     def _decorate_schedule_view(self) -> dict:
-        timers = self.store.state.setdefault('timers', [])
-        routines = self.store.state.setdefault('routines', [])
-        t_view = []
-        for t in timers:
-            t_view.append({
-                **t,
-                'due_at_bj': self._fmt_bj(t.get('due_at')),
-                'remaining_seconds': max(0, round(float(t.get('due_at', 0)) - time.time())) if not t.get('done') else 0,
-            })
-        r_view = []
-        changed = False
-        for r in routines:
-            if not r.get('next_run') or (r.get('daily_time') and r.get('next_run', 0) < time.time() - 86400):
-                r['next_run'] = self._compute_next_routine_run(r)
-                changed = True
-            elif not r.get('daily_time') and self._extract_clock_from_goal(str(r.get('goal') or '')):
-                r['next_run'] = self._compute_next_routine_run(r)
-                changed = True
-            mode_desc = f"每天 {r['daily_time']} (北京时间)" if r.get('daily_time') else f"每 {r.get('interval_hours', 24)} 小时"
-            if r.get('weekdays') and str(r.get('weekdays')) not in ('', 'all', '*'):
-                mode_desc += f" [星期 {r['weekdays']}]"
-            r_view.append({
-                **r,
-                'schedule_mode': mode_desc,
-                'next_run_bj': self._fmt_bj(r.get('next_run')),
-                'last_run_bj': self._fmt_bj(r.get('last_run')),
-            })
-        if changed:
-            self.store.save()
-        return {'now_bj': self._fmt_bj(time.time()), 'timers': t_view, 'routines': r_view}
+        return self.scheduler_engine.decorate_schedule_view()
 
     async def _tool_schedule_task(self, args: dict):
         action = str(args.get('action') or 'list').strip().lower()
@@ -173,12 +170,17 @@ class ToolHandlersMixin:
         if action == 'add_routine':
             goal = str(args.get('goal') or '').strip()
             if not goal:
-                return {'error': 'goal 不能为空'}
+                return {'ok': False, 'error': 'goal 不能为空'}
             hours = max(1, min(720, int(args.get('interval_hours') or 24)))
             bot_id = str(args.get('bot_id') or self.bot_context.get()).strip()
             daily_time = str(args.get('daily_time') or args.get('at_time') or '').strip()
             if not daily_time:
                 daily_time = self._extract_clock_from_goal(goal)
+            if daily_time:
+                try:
+                    self._validate_daily_time_slots(daily_time)
+                except ValueError as e:
+                    return {'ok': False, 'error': str(e)}
             weekdays = str(args.get('weekdays') or '').strip()
             item = {
                 'id': secrets.token_hex(8),
@@ -196,7 +198,7 @@ class ToolHandlersMixin:
             routines.append(item)
             self.store.save()
             self.wake.set()
-            return {'scheduled': True, 'routine': item}
+            return {'ok': True, 'scheduled': True, 'routine': item}
         if action == 'update':
             tid = str(args.get('task_id') or '').strip()
             for r in routines:
@@ -206,7 +208,13 @@ class ToolHandlersMixin:
                     if 'bot_id' in args and str(args['bot_id']).strip():
                         r['bot_id'] = str(args['bot_id']).strip()
                     if 'daily_time' in args or 'at_time' in args:
-                        r['daily_time'] = str(args.get('daily_time') or args.get('at_time') or '').strip()
+                        new_dt = str(args.get('daily_time') or args.get('at_time') or '').strip()
+                        if new_dt:
+                            try:
+                                self._validate_daily_time_slots(new_dt)
+                            except ValueError as e:
+                                return {'ok': False, 'error': str(e)}
+                        r['daily_time'] = new_dt
                     if 'weekdays' in args:
                         r['weekdays'] = str(args['weekdays'] or '').strip()
                     if 'interval_hours' in args and args['interval_hours'] is not None:
@@ -217,15 +225,19 @@ class ToolHandlersMixin:
                     r['next_run_bj'] = self._fmt_bj(r['next_run'])
                     self.store.save()
                     self.wake.set()
-                    return {'updated': True, 'routine': r}
+                    return {'ok': True, 'updated': True, 'routine': r}
             for t in timers:
                 if t['id'] == tid:
                     if 'goal' in args and str(args['goal']).strip():
                         t['goal'] = str(args['goal']).strip()[:2000]
                     if 'at_time' in args or 'daily_time' in args:
                         raw_at = str(args.get('at_time') or args.get('daily_time') or '').strip()
+                        try:
+                            due_val = self._parse_wall_time(raw_at)
+                        except ValueError as e:
+                            return {'ok': False, 'error': str(e)}
                         t['at_time'] = raw_at
-                        t['due_at'] = self._parse_wall_time(raw_at)
+                        t['due_at'] = due_val
                         t['due_at_bj'] = self._fmt_bj(t['due_at'])
                     elif 'delay_minutes' in args and args['delay_minutes'] is not None:
                         t['due_at'] = time.time() + max(1, int(args['delay_minutes'])) * 60
@@ -237,10 +249,12 @@ class ToolHandlersMixin:
             return {'error': f'未找到定时任务 "{tid}"'}
         if action == 'remove':
             tid = str(args.get('task_id') or '').strip()
+            before_n = len(timers) + len(routines)
             self.store.state['timers'] = [t for t in timers if t['id'] != tid]
             self.store.state['routines'] = [r for r in routines if r['id'] != tid]
-            self.store.save()
-            return {'removed': True, 'task_id': tid}
+            existed = (len(self.store.state['timers']) + len(self.store.state['routines'])) < before_n
+            if existed: self.store.save()
+            return {'ok': existed, 'removed': existed, 'existed': existed, 'task_id': tid, **({'error': f'未找到定时任务 "{tid}"'} if not existed else {})}
         return {'error': f'未知 schedule_task action: {action}'}
 
     async def _tool_bg_task(self, args: dict):
@@ -304,6 +318,11 @@ class ToolHandlersMixin:
             cmd = str(args.get('command') or '').strip()
             if not cmd:
                 return {'error': 'command 不能为空'}
+            if normalize_node_source(self.source_context.get()) in ('pc', 'pc2') and self.is_dsh_online():
+                pc_bg = await self._raw_dsh_rpc('pc_shell', {'command': cmd, 'background': True, 'cwd': args.get('cwd')}, timeout=15.0)
+                if isinstance(pc_bg, dict) and pc_bg.get('ok'):
+                    return {'started': True, 'node': 'pc', **pc_bg}
+                return {'error': str((pc_bg or {}).get('error') or 'Windows 后台任务启动失败')}
             tid = 'bg-' + secrets.token_hex(4)
             log_dir = self.harness.root / '.bg_logs'
             log_dir.mkdir(parents=True, exist_ok=True)
@@ -487,9 +506,10 @@ class ToolHandlersMixin:
 
     async def _tool_conversation_search(self, args: dict):
         query = str(args.get('query') or '').strip()
-        bot_id = str(args.get('bot_id') or 'all').strip()
-        limit = int(args.get('limit') or 10)
         cur_bot = self.room_context.get() or self.bot_context.get()
+        raw_bot_arg = str(args.get('bot_id') or '').strip()
+        bot_id = raw_bot_arg if raw_bot_arg else cur_bot
+        limit = int(args.get('limit') or 10)
         try:
             self.context_search.sync_store_messages(self.store.state.get('messages', []))
         except Exception:
@@ -511,47 +531,82 @@ class ToolHandlersMixin:
         query = str(args.get('query') or '').strip()
         ctx_id = str(args.get('ctx_id') or '').strip()
         limit = int(args.get('limit') or 8)
-        return self.context_search.ctx_search(query=query, ctx_id=ctx_id, limit=limit)
+        cur_bot = self.room_context.get() or self.bot_context.get()
+        bot_filter = str(args.get('bot_id') or cur_bot or '').strip()
+        return self.context_search.ctx_search(query=query, ctx_id=ctx_id, limit=limit, bot_id=bot_filter)
 
-    def _search_vault_files(self, query: str, limit: int = 8) -> list[dict]:
-        if not query or self.vault is None:
+    def _search_vault_files(self, query: str, limit: int = 8, bot_id: str = '') -> list[dict]:
+        if not query or self.vault is None or limit <= 0:
             return []
         tokens = [t for t in re.split(r'\s+', query.strip()) if t]
         rx_full = re.compile(re.escape(query), re.IGNORECASE)
         hits = []
+        eff_bot = str(bot_id or '').strip()
         for f in self.vault.files():
-            content = self.vault.read(f['path'])
             path_str = f['path']
+            if eff_bot and eff_bot != 'all':
+                if path_str.startswith('timeline/bots/') and not path_str.startswith(f'timeline/bots/{eff_bot}/'):
+                    continue
+                if path_str.startswith('conversations/') and '_' in path_str[14:] and not path_str[14:].startswith(f'{eff_bot}_'):
+                    continue
+            content = self.vault.read(path_str)
             if rx_full.search(content) or rx_full.search(path_str) or (tokens and any(t.lower() in content.lower() or t.lower() in path_str.lower() for t in tokens)):
-                hits.append({'path': 'memory_vault/' + path_str, 'snippet': content[:800]})
+                matched_lines = [ln.strip() for ln in content.splitlines() if any(t.lower() in ln.lower() for t in (tokens or [query]))]
+                snippet = ('\n'.join(matched_lines[:4])[:360] if matched_lines else content[:360])
+                hits.append({'path': 'memory_vault/' + path_str, 'snippet': snippet})
                 if len(hits) >= limit:
                     break
-        return hits
+        return hits[:limit]
 
     async def _tool_memory_search(self, args: dict):
         query = str(args.get('query') or '').strip()
-        bot_id = str(args.get('bot_id') or 'all').strip()
+        cur_bot = self.room_context.get() or self.bot_context.get()
+        bot_id = str(args.get('bot_id') or cur_bot or 'all').strip()
         ctx_id = str(args.get('ctx_id') or '').strip()
-        limit = max(1, min(30, int(args.get('limit') or 8)))
+        raw_lim = args.get('limit')
+        if raw_lim is not None and int(raw_lim) <= 0:
+            return {'ok': False, 'query': query, 'hits': [], 'conversation_hits': [], 'ctx_hits': [], 'error': 'limit 必须大于 0'}
+        if not query and not ctx_id:
+            return {'ok': False, 'query': '', 'hits': [], 'conversation_hits': [], 'ctx_hits': [], 'error': '检索词 query 不能为空'}
+        limit = max(1, min(20, int(raw_lim) if raw_lim is not None else 6))
         if ctx_id:
-            ctx_res = self.context_search.ctx_search(query=query, ctx_id=ctx_id, limit=limit)
-            vault_hits = self._search_vault_files(query, max(3, limit // 2))
+            ctx_res = self.context_search.ctx_search(query=query, ctx_id=ctx_id, limit=limit, bot_id=bot_id)
+            if isinstance(ctx_res, dict) and ctx_res.get('ok') is False:
+                return ctx_res
+            vault_hits = self._search_vault_files(query, min(limit, max(1, limit // 2)), bot_id=bot_id) if query else []
+            raw_ctx_hits = (ctx_res.get('chunks') or ctx_res.get('hits') or [])[:limit] if isinstance(ctx_res, dict) else []
             return {
+                'ok': True,
                 'query': query,
-                'hits': vault_hits,
-                'ctx_hits': (ctx_res.get('chunks') or ctx_res.get('hits') or []) if isinstance(ctx_res, dict) else [],
+                'hits': vault_hits[:limit],
+                'ctx_hits': [
+                    {**c, 'content': str(c.get('content') or '')[:400]} if isinstance(c, dict) else c
+                    for c in raw_ctx_hits
+                ],
                 'ctx_id': ctx_id,
             }
-        vault_hits = self._search_vault_files(query, limit)
+        vault_hits = self._search_vault_files(query, limit, bot_id=bot_id)
         conv_res = await self._tool_conversation_search({'query': query, 'bot_id': bot_id, 'limit': limit})
-        ctx_res = self.context_search.ctx_search(query=query, ctx_id='', limit=max(4, limit // 2))
-        return {
+        ctx_res = self.context_search.ctx_search(query=query, ctx_id='', limit=limit, bot_id=bot_id)
+        raw_conv_hits = (conv_res.get('results') or conv_res.get('hits') or [])[:limit] if isinstance(conv_res, dict) else []
+        raw_ctx_hits = (ctx_res.get('chunks') or ctx_res.get('hits') or [])[:limit] if isinstance(ctx_res, dict) else []
+        total_found = len(vault_hits) + len(raw_conv_hits) + len(raw_ctx_hits)
+        out_ms: dict = {
+            'ok': True,
             'query': query,
-            'hits': vault_hits,
-            'conversation_hits': (conv_res.get('results') or conv_res.get('hits') or []) if isinstance(conv_res, dict) else [],
-            'ctx_hits': (ctx_res.get('chunks') or ctx_res.get('hits') or []) if isinstance(ctx_res, dict) else [],
-            'note': '已一次性检索长期记忆库 (memory_vault)、历史对话归档与工具大输出缓存，无需再重复调用其他搜索工具。',
+            'hits': vault_hits[:limit],
+            'conversation_hits': [
+                {**c, 'text': str(c.get('text') or '')[:400]} if isinstance(c, dict) else c
+                for c in raw_conv_hits
+            ],
+            'ctx_hits': [
+                {**c, 'content': str(c.get('content') or '')[:400]} if isinstance(c, dict) else c
+                for c in raw_ctx_hits
+            ],
         }
+        if total_found > 0:
+            out_ms['note'] = '已一次性检索长期记忆库 (memory_vault)、历史对话归档与工具大输出缓存，无需再重复调用其他搜索工具。'
+        return out_ms
 
     async def _tool_present_choices(self, args: dict):
         raw_choices = args.get('choices') or args.get('options') or args.get('items')
@@ -597,37 +652,10 @@ class ToolHandlersMixin:
         return {'error': f'未知 memory_pin action: {action}'}
 
     async def _tool_blackboard(self, args: dict):
-        action = str(args.get('action') or 'list').strip().lower()
-        bot_id = self.bot_context.get()
-        room_id = self.room_context.get() or bot_id
-        if action == 'write':
-            return self.context_search.blackboard_write(
-                key=str(args.get('key') or ''),
-                value=str(args.get('value') or ''),
-                author_bot=bot_id,
-                summary=str(args.get('summary') or ''),
-            )
-        if action == 'read':
-            return self.context_search.blackboard_read(str(args.get('key') or ''))
-        if action == 'delete':
-            return self.context_search.blackboard_delete(str(args.get('key') or ''))
-        if action == 'set_todos':
-            raw_steps = args.get('steps') if isinstance(args.get('steps'), list) else []
-            todos = []
-            for idx, st in enumerate(raw_steps[:12], 1):
-                if isinstance(st, dict):
-                    todos.append({
-                        'title': str(st.get('title') or st.get('text') or f'步骤 {idx}')[:120],
-                        'status': str(st.get('status') or ('done' if st.get('done') else 'pending')),
-                    })
-                elif isinstance(st, str):
-                    todos.append({'title': st[:120], 'status': 'pending'})
-            cur_exec = self.executions_by_bot.get(room_id) or self.execution
-            if isinstance(cur_exec, dict):
-                cur_exec['todos'] = todos
-                await self.publish({'type': 'execution', 'execution': cur_exec})
-            return {'ok': True, 'todos': todos}
-        return self.context_search.blackboard_list()
+        return await self.blackboard_engine.execute(args)
+
+    async def _tool_peek_bots(self, args: dict):
+        return self.blackboard_engine.peek_bots(args)
 
     async def _tool_custom_tool(self, args: dict):
         action = str(args.get('action') or 'list').strip().lower()
@@ -674,54 +702,140 @@ class ToolHandlersMixin:
             skills_list = [sf.stem for sf in sorted(skills_dir.glob('*.md'))]
             return {**summary, 'available_skills': skills_list}
         if action == 'delete':
-            t_name = re.sub(r'[^a-zA-Z0-9_]', '', str(args.get('name') or '')).strip()
+            raw_name = str(args.get('name') or '').strip()
+            t_name = re.sub(r'[^a-zA-Z0-9_\u4e00-\u9fa5]', '_', raw_name).strip('_').lower()
+            if not t_name:
+                return {'ok': False, 'deleted': False, 'existed': False, 'error': '请提供要删除的自定义工具名称 name'}
+            safe_t_name = self.harness.extension_registry._safe_openai_tool_name(t_name)
             p_file = plugins_dir / f'{t_name}.py'
+            existed = p_file.exists() or (t_name in self.harness.extension_registry.tool_plugins) or (safe_t_name in self.harness.extension_registry.tool_plugins)
             if p_file.exists():
                 p_file.unlink()
             self.harness.extension_registry.tool_plugins.pop(t_name, None)
-            return {'deleted': True, 'name': t_name}
+            self.harness.extension_registry.tool_plugins.pop(safe_t_name, None)
+            return {'ok': existed, 'deleted': existed, 'existed': existed, 'name': t_name, **({'error': f'未找到自定义工具 "{raw_name}"'} if not existed else {})}
         if action == 'create':
-            t_name = re.sub(r'[^a-zA-Z0-9_]', '', str(args.get('name') or '')).strip().lower()
-            desc = str(args.get('description') or f'Custom tool {t_name}').strip()
+            raw_name = str(args.get('name') or '').strip()
+            t_name = re.sub(r'[^a-zA-Z0-9_\u4e00-\u9fa5]', '_', raw_name).strip('_').lower()
             code = str(args.get('code') or '').strip()
             if not t_name or not code:
-                return {'error': 'create 需要提供 name 和 code (包含 async def run(args, context) -> dict)'}
+                return {
+                    'ok': False,
+                    'error': 'create 需要提供合法的 name（支持中英文、数字与下划线）和 code (支持 def run(args, context) / def run(args) / def run(param_name) / async def run(...))',
+                }
+            code_lines = code.splitlines()
+            try:
+                ast.parse(code)
+            except SyntaxError as se:
+                return {
+                    'ok': False,
+                    'total_lines': len(code_lines),
+                    'error': f'Python 语法校验未通过 (line {se.lineno} / 共 {len(code_lines)} 行): {se.msg}',
+                }
+            desc = str(args.get('description') or f'Custom tool {t_name}').strip()
+            cls_id = re.sub(r'[^a-zA-Z0-9_]', '_', t_name).strip('_')
+            if not cls_id or not cls_id.isidentifier():
+                import hashlib as _hl
+                cls_id = 'u_' + _hl.md5(t_name.encode('utf-8')).hexdigest()[:10]
             try:
                 params_schema = json.loads(str(args.get('parameters_json') or '{"type":"object","properties":{}}'))
             except Exception:
                 params_schema = {'type': 'object', 'properties': {}}
-            indented_code = '\n'.join('        ' + ln for ln in code.splitlines())
+            indented_code = '\n'.join('        ' + ln for ln in code_lines)
             plugin_src = (
                 f'"""Dynamic Custom Tool: {t_name}"""\n'
-                f'import asyncio, json, os, re, time, httpx\n'
+                f'import asyncio, inspect, json, os, re, time, httpx\n'
                 f'from pathlib import Path\n\n'
-                f'class DynamicPlugin_{t_name}:\n'
-                f'    name = {json.dumps(t_name)}\n'
+                f'class DynamicPlugin_{cls_id}:\n'
+                f'    name = {json.dumps(t_name, ensure_ascii=False)}\n'
                 f'    description = {json.dumps(desc, ensure_ascii=False)}\n'
                 f'    parameters = {repr(params_schema)}\n\n'
                 f'    async def execute(self, args: dict, context: dict) -> dict:\n'
                 f'{indented_code}\n'
                 f'        if "run" in locals() and callable(locals()["run"]):\n'
-                f'            res = locals()["run"](args, context)\n'
-                f'            return (await res) if asyncio.iscoroutine(res) else res\n'
+                f'            _fn = locals()["run"]\n'
+                f'            _sig = inspect.signature(_fn)\n'
+                f'            _params = list(_sig.parameters.values())\n'
+                f'            _dict_arg_names = ("args", "params", "payload", "data", "input", "req", "request")\n'
+                f'            _ctx_arg_names = ("context", "ctx", "env")\n'
+                f'            if len(_params) == 0:\n'
+                f'                res = _fn()\n'
+                f'            elif any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in _params):\n'
+                f'                res = _fn(args, context)\n'
+                f'            elif len(_params) == 1 and _params[0].kind != inspect.Parameter.VAR_KEYWORD:\n'
+                f'                _p0 = _params[0].name\n'
+                f'                if _p0 in _dict_arg_names or not isinstance(args, dict):\n'
+                f'                    res = _fn(args)\n'
+                f'                elif _p0 in _ctx_arg_names:\n'
+                f'                    res = _fn(context)\n'
+                f'                elif _p0 in args:\n'
+                f'                    res = _fn(args[_p0])\n'
+                f'                elif len(args) == 1 and _params[0].default is inspect.Parameter.empty:\n'
+                f'                    res = _fn(next(iter(args.values())))\n'
+                f'                else:\n'
+                f'                    res = _fn(args)\n'
+                f'            elif len(_params) == 2 and _params[0].name in _dict_arg_names and _params[1].name in _ctx_arg_names:\n'
+                f'                res = _fn(args, context)\n'
+                f'            elif isinstance(args, dict):\n'
+                f'                if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in _params):\n'
+                f'                    _kw = dict(args)\n'
+                f'                    for _cn in _ctx_arg_names:\n'
+                f'                        if _cn in _sig.parameters and _cn not in _kw:\n'
+                f'                            _kw[_cn] = context\n'
+                f'                    res = _fn(**_kw)\n'
+                f'                else:\n'
+                f'                    _kw = {{k: v for k, v in args.items() if k in _sig.parameters}}\n'
+                f'                    for _cn in _ctx_arg_names:\n'
+                f'                        if _cn in _sig.parameters and _cn not in _kw:\n'
+                f'                            _kw[_cn] = context\n'
+                f'                    for _an in _dict_arg_names:\n'
+                f'                        if _an in _sig.parameters and _an not in _kw:\n'
+                f'                            _kw[_an] = args\n'
+                f'                    _missing = [p.name for p in _params if p.default is inspect.Parameter.empty and p.name not in _kw]\n'
+                f'                    if not _missing:\n'
+                f'                        res = _fn(**_kw)\n'
+                f'                    else:\n'
+                f'                        res = _fn(args, context)\n'
+                f'            else:\n'
+                f'                res = _fn(args, context)\n'
+                f'            out = (await res) if asyncio.iscoroutine(res) else res\n'
+                f'            if isinstance(out, dict):\n'
+                f'                if "ok" not in out and "error" not in out:\n'
+                f'                    out["ok"] = True\n'
+                f'                return out\n'
+                f'            return {{"ok": True, "result": out}}\n'
                 f'        return {{"ok": True}}\n\n'
                 f'def register(registry):\n'
-                f'    registry.register_tool(DynamicPlugin_{t_name}())\n'
+                f'    registry.register_tool(DynamicPlugin_{cls_id}())\n'
             )
             try:
                 ast.parse(plugin_src)
             except SyntaxError as se:
-                return {'error': f'Python 语法校验未通过 (line {se.lineno}): {se.msg}'}
+                adj_line = max(1, (se.lineno or 10) - 9)
+                return {'ok': False, 'total_lines': len(code_lines), 'error': f'Python 语法校验未通过 (line {adj_line} / 共 {len(code_lines)} 行): {se.msg}'}
             p_file = plugins_dir / f'{t_name}.py'
             p_file.write_text(plugin_src, encoding='utf-8')
             loaded = self.harness.extension_registry.discover_plugins_dir(plugins_dir)
-            return {'created': True, 'name': t_name, 'loaded_plugins': loaded}
+            return {
+                'ok': True,
+                'created': True,
+                'name': t_name,
+                'total_lines': len(code_lines),
+                'loaded_plugins': loaded,
+                'supported_signatures': [
+                    'def run(args, context):',
+                    'def run(args):',
+                    'def run(named_param, ...):',
+                    'def run(*args, **kwargs):',
+                ],
+            }
         return {'error': f'未知 custom_tool action: {action}'}
 
     async def _tool_notify_user(self, args: dict):
         title = str(args.get('title') or '助理提醒').strip()[:120]
         body = str(args.get('body') or '').strip()[:2000]
         urgent = bool(args.get('urgent', False))
+        overlay = bool(args.get('overlay', False))
         if not body:
             return {'error': '通知内容不能为空'}
         bot_id = self.room_context.get() or self.bot_context.get()
@@ -736,17 +850,66 @@ class ToolHandlersMixin:
             'body': body,
             'urgent': urgent,
         })
+        if overlay:
+            overlay_text = f'【{title}】\n{body}' if title and title not in body else body
+            with self.store.lock:
+                self.store.state.setdefault('pending', {})[nid] = {
+                    'id': nid,
+                    'text': overlay_text[:3000],
+                    'created_at': time.time(),
+                    'stage': 3,
+                    'last_email': 0,
+                    'emails': 0,
+                    'demo': False,
+                    'email_status': 'overlay_tool',
+                }
+                self.store.save()
+            await self.publish({
+                'type': 'escalation',
+                'stage': 3,
+                'id': nid,
+                'title': title,
+                'text': overlay_text[:3000],
+                'demo': False,
+            })
         return {
             'notified': True,
+            'overlay_popped': overlay,
             'id': nid,
             'title': title,
             'urgent': urgent,
-            'note': '手机系统通知栏推送已发出；请直接将提醒正文作为本轮最终回复输出即可，禁止再额外说“推送已经发了”。',
+            'note': '手机系统通知栏推送' + ('与可滚动确认悬浮窗' if overlay else '') + '已发出；请直接将提醒正文作为本轮最终回复输出即可，禁止再额外说“推送已经发了”。',
         }
 
+    async def _tool_complete_goal(self, args: dict):
+        summary = str(args.get('summary') or args.get('result') or args.get('text') or '').strip()
+        verified_evidence = str(args.get('verified_evidence') or args.get('evidence') or '').strip()
+        if not summary:
+            return {'ok': False, 'error': '调用 complete_goal 必须提供具体的完成总结 summary'}
+        norm_src = normalize_node_source(self.source_context.get())
+        room_bot_id = self.room_context.get() or self.bot_context.get()
+        nb_key = f'{norm_src}:{room_bot_id}'
+        with self.store.lock:
+            active_goals = self.store.state.setdefault('active_goals', {})
+            cur_goal = active_goals.pop(nb_key, None) or {}
+            cur_exec = self.executions_by_node_bot.get(nb_key) or self.execution or {}
+            cur_trace_steps = len(cur_exec.get('trace') or [])
+            goal_title = str(cur_goal.get('goal') or summary)[:200]
+            self.store.state['last_goal_run'] = {
+                'goal': goal_title,
+                'status': 'completed',
+                'summary': summary[:600],
+                'verified_evidence': verified_evidence[:400],
+                'wakeups': int(cur_goal.get('wakeups') or 0),
+                'steps': int(cur_goal.get('total_steps') or 0) + max(1, cur_trace_steps),
+                'updated_at': now_iso(),
+            }
+            self.store.save()
+        await self.publish({'type': 'goal_status', 'source': norm_src, 'bot_id': room_bot_id, 'active': False, 'status': 'completed', 'goal': goal_title, 'summary': summary[:500]})
+        return {'ok': True, 'goal_completed': True, 'goal': goal_title, 'summary': summary, 'verified_evidence': verified_evidence, 'note': '🎯 目标已完成状态已由引擎正式登记，自动拉起循环已解除。现在请向主人输出清晰、完整的最终交付总结！'}
+
     async def _tool_emergency_alarm(self, args: dict):
-        title = str(args.get('title') or '紧急呼叫').strip()[:120]
-        reason = str(args.get('reason') or '').strip()[:1000]
+        title, reason = str(args.get('title') or '紧急呼叫').strip()[:120], str(args.get('reason') or '').strip()[:1000]
         duration_sec = max(5, min(45, int(args.get('duration_sec') or 18)))
         if not reason:
             return {'error': '必须提供触发紧急响铃的具体原因 reason'}
@@ -759,14 +922,5 @@ class ToolHandlersMixin:
         bot_id = self.room_context.get() or self.bot_context.get()
         bot = get_assistant(self.store, self.bot_context.get())
         aid = 'alarm-' + secrets.token_hex(6)
-        await self.publish({
-            'type': 'emergency_alarm',
-            'id': aid,
-            'bot_id': bot_id,
-            'bot_name': bot['name'],
-            'title': f'🚨 {title}',
-            'body': reason,
-            'duration_sec': duration_sec,
-            'urgent': True,
-        })
+        await self.publish({'type': 'emergency_alarm', 'id': aid, 'bot_id': bot_id, 'bot_name': bot['name'], 'title': f'🚨 {title}', 'body': reason, 'duration_sec': duration_sec, 'urgent': True})
         return {'alarm_triggered': True, 'id': aid, 'duration_sec': duration_sec, 'title': title}

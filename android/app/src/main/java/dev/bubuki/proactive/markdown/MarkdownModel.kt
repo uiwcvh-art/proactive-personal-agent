@@ -1,6 +1,7 @@
 // Adapted from wangzan101/Mika, e9daf53 (Apache-2.0). See assets/mika-LICENSE.txt.
 package dev.bubuki.proactive.markdown
 
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
@@ -172,11 +173,71 @@ object MarkdownModel {
         return MdBlock.Table(pad(header), rows.map(::pad))
     }
 
+    private val highlightSpanStyle = SpanStyle(
+        background = Color(0x38F59E0B),
+        fontWeight = FontWeight.Medium
+    )
+    private val eqHighlightRegex = Regex("""==([^\n=]{1,200}?)=""")
+    private val htmlColorAttrRegex = Regex("""(?i)(?:style\s*=\s*["'][^"']*color\s*:\s*([#a-zA-Z0-9]+)|color\s*=\s*["']([#a-zA-Z0-9]+)["'])""")
+
+    private fun parseNamedOrHexColor(raw: String): Color? {
+        val c = raw.trim().lowercase()
+        return when (c) {
+            "red", "crimson", "danger" -> Color(0xFFE11D48)
+            "green", "emerald", "success" -> Color(0xFF10B981)
+            "blue", "royalblue", "info" -> Color(0xFF3B82F6)
+            "orange", "amber", "warning" -> Color(0xFFD97706)
+            "purple", "violet" -> Color(0xFF8B5CF6)
+            "pink", "rose" -> Color(0xFFEC4899)
+            "cyan", "teal" -> Color(0xFF06B6D4)
+            "gray", "grey", "muted" -> Color(0xFF6B7280)
+            else -> {
+                if (c.startsWith("#")) {
+                    val hex = c.removePrefix("#")
+                    try {
+                        when (hex.length) {
+                            3 -> {
+                                val r = hex[0].toString().repeat(2).toInt(16)
+                                val g = hex[1].toString().repeat(2).toInt(16)
+                                val b = hex[2].toString().repeat(2).toInt(16)
+                                Color(r, g, b)
+                            }
+                            6 -> Color(0xFF000000 or hex.toLong(16))
+                            8 -> Color(hex.toLong(16))
+                            else -> null
+                        }
+                    } catch (_: Exception) { null }
+                } else null
+            }
+        }
+    }
+
+    private fun AnnotatedString.Builder.appendTextWithHighlights(literal: String) {
+        if (!literal.contains("==")) {
+            append(literal)
+            return
+        }
+        var lastIdx = 0
+        for (m in eqHighlightRegex.findAll(literal)) {
+            if (m.range.first > lastIdx) {
+                append(literal.substring(lastIdx, m.range.first))
+            }
+            withStyle(highlightSpanStyle) {
+                append(m.groupValues[1])
+            }
+            lastIdx = m.range.last + 1
+        }
+        if (lastIdx < literal.length) {
+            append(literal.substring(lastIdx))
+        }
+    }
+
     private fun inlines(parent: Node, s: Styles): AnnotatedString = buildAnnotatedString { appendInlines(parent, s) }
 
     private fun AnnotatedString.Builder.appendInlines(parent: Node, s: Styles) {
+        val openHtmlStyles = ArrayDeque<Int>()
         for (n in children(parent)) when (n) {
-            is Text -> append(n.literal)
+            is Text -> appendTextWithHighlights(n.literal)
             is SoftLineBreak, is HardLineBreak -> append('\n')
             is Code -> withStyle(s.code) { append(n.literal) }
             is Emphasis -> withStyle(SpanStyle(fontStyle = FontStyle.Italic)) { appendInlines(n, s) }
@@ -185,8 +246,39 @@ object MarkdownModel {
             is Link -> link(n.destination, s) { appendInlines(n, s) }
             // 聊天里不显示图片,只留替代文字(有可打开的地址就做成链接)
             is Image -> link(n.destination, s) { if (n.firstChild != null) appendInlines(n, s) else append(n.destination.orEmpty()) }
-            is HtmlInline -> append(n.literal)
+            is HtmlInline -> {
+                val tag = n.literal.trim()
+                val lower = tag.lowercase()
+                when {
+                    lower == "<mark>" || lower.startsWith("<mark ") -> {
+                        pushStyle(highlightSpanStyle)
+                        openHtmlStyles.addLast(1)
+                    }
+                    lower == "</mark>" || lower == "</span>" || lower == "</font>" -> {
+                        if (openHtmlStyles.isNotEmpty()) {
+                            openHtmlStyles.removeLast()
+                            try { pop() } catch (_: Exception) {}
+                        }
+                    }
+                    lower.startsWith("<span") || lower.startsWith("<font") -> {
+                        val match = htmlColorAttrRegex.find(tag)
+                        val colorStr = match?.groupValues?.getOrNull(1)?.takeIf { it.isNotBlank() }
+                            ?: match?.groupValues?.getOrNull(2)?.takeIf { it.isNotBlank() }
+                        val parsedColor = colorStr?.let { parseNamedOrHexColor(it) }
+                        if (parsedColor != null) {
+                            pushStyle(SpanStyle(color = parsedColor))
+                            openHtmlStyles.addLast(1)
+                        }
+                    }
+                    lower == "<br>" || lower == "<br/>" || lower == "<br />" -> append('\n')
+                    else -> {}
+                }
+            }
             else -> appendInlines(n, s)
+        }
+        while (openHtmlStyles.isNotEmpty()) {
+            openHtmlStyles.removeLast()
+            try { pop() } catch (_: Exception) {}
         }
     }
 

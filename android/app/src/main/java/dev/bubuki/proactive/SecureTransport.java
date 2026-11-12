@@ -40,7 +40,7 @@ final class SecureTransport {
 
     static String getNodeSource(Context context){
         try{
-            JSONObject settings=SecurePrefs.read(context);
+            JSONObject settings=SecurePrefs.readFast(context);
             String saved=settings.optString("nodeSource","").trim().toLowerCase();
             if(!saved.isEmpty())return saved;
         }catch(Exception ignored){}
@@ -66,7 +66,7 @@ final class SecureTransport {
         String token=cachedToken;
         String publicKey=cachedPubKeyB64;
         if(forceNewKey || base==null || token==null || publicKey==null || (now - cachedAtMs) > 15_000L){
-            JSONObject settings=SecurePrefs.read(context);
+            JSONObject settings=SecurePrefs.readFast(context);
             base=settings.optString("serverUrl",DEFAULT_SERVER).replaceAll("/+$","");
             HttpUrl url=HttpUrl.parse(base);
             if(url==null||(!url.scheme().equals("http")&&!url.scheme().equals("https"))||!url.username().isEmpty()||!url.password().isEmpty())throw new Exception("Server URL 无效");
@@ -125,6 +125,10 @@ final class SecureTransport {
 
     JSONObject request(String method,String path,JSONObject body,JSONObject query) throws Exception {
         if(!path.startsWith("/api/")||path.equals("/api/secure"))throw new Exception("不支持的 API 路径");
+        if("/api/message".equals(path)){
+            AgentForegroundService.phoneAbortUntilMs=0L;
+            FloatingVirtualDisplay.resetUserDismissed();
+        }
         String nodeSource=getNodeSource(context);
         if(query==null)query=new JSONObject();
         if(!query.has("source"))query.put("source",nodeSource);

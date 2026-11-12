@@ -70,9 +70,8 @@ internal class RootPhoneAgent {
                     if (error is kotlinx.coroutines.CancellationException) throw error
                     JSONObject().put("error", MainActivity.safeError(error))
                 }
-                val clean = JSONObject(result.toString())
-                val image = clean.optString("image")
-                clean.remove("image")
+                val image = result.optString("image").ifBlank { result.optString("_image_b64") }
+                val clean = RootPhoneHarness.shallowCopyWithoutImage(result)
                 // Keep tool response compact: if `ui_tree` has `summary`, omit verbose `nodes` array in LLM tool message
                 if (name == "phone_ui_tree" && clean.has("summary")) {
                     clean.remove("nodes")

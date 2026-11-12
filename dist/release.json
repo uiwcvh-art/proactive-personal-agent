@@ -1,15 +1,15 @@
 {
-  "version": "3.5.7",
-  "version_name": "3.5.7",
-  "versionName": "3.5.7",
-  "tag_name": "v3.5.7",
-  "version_code": 76,
-  "versionCode": 76,
-  "build": 76,
-  "published_at": "2026-11-11T02:46:39.729732+08:00",
-  "apk_sha256": "95a22efa7e69cbb0b964a17835bf73a218f2a495cb1ebde95caea3a75b4c8490",
-  "apk_size": 21105384,
+  "version": "3.6.3",
+  "version_name": "3.6.3",
+  "versionName": "3.6.3",
+  "tag_name": "v3.6.3",
+  "version_code": 82,
+  "versionCode": 82,
+  "build": 82,
+  "published_at": "2026-11-12T01:22:13.264100+08:00",
+  "apk_sha256": "224276c1acfb3b0bd6d8cdbccdc0baaf795d3272bd31db3789ebde3e623e9043",
+  "apk_size": 21156132,
   "download_url": "/proactive-agent/download/proactive-agent.apk",
-  "notes": "v3.5.7 (Build 76): 虚拟屏专属独立屏桌面（DisplayTestActivity 4列日常优先应用网格+不误触实时过滤搜索栏，彻底禁用 AOSP SecondaryDisplayLauncher）；修正 FLAG_OWN_DISPLAY_GROUP (1<<11) 与 720x1584@320dpi (360dp) 几何规格及 wm size/density reset；消除 treeHash/tree_hash 与 change_summary/ui_tree 状态冲突；type/submit 多步执行透明回执（steps_executed + submit_triggered_navigation）",
-  "body": "v3.5.7 (Build 76): 虚拟屏专属独立屏桌面（DisplayTestActivity 4列日常优先应用网格+不误触实时过滤搜索栏，彻底禁用 AOSP SecondaryDisplayLauncher）；修正 FLAG_OWN_DISPLAY_GROUP (1<<11) 与 720x1584@320dpi (360dp) 几何规格及 wm size/density reset；消除 treeHash/tree_hash 与 change_summary/ui_tree 状态冲突；type/submit 多步执行透明回执（steps_executed + submit_triggered_navigation）"
+  "notes": "v3.6.3 (Build 82): 1) 虚拟屏底层彻底重构：根治微信/支付宝抢占主屏前台与主屏莫名退回桌面 Bug，固定独立屏桌面根任务防止返回串栈，修复返回键连发 4 次问题；2) 主页横幅、对话顶栏与工具菜单全面新增一键「销毁虚拟屏」，AI 侧 close/release 真正彻底销毁虚拟屏且零残留；3) Agent Loop 与流式状态机大改：移除 DSH/Codex 后置总结抹除与重跑 Bug，修复未调工具提前停机；4) 引擎级持久目标模式 (/goal)：自动持续拉起 AI 直至显式调用 complete_goal 宣布目标完成；5) 升级虚拟屏 1080P 高清视觉截图并硬拦截修改系统深浅色/主屏设置",
+  "body": "v3.6.3 (Build 82): 1) 虚拟屏底层彻底重构：根治微信/支付宝抢占主屏前台与主屏莫名退回桌面 Bug，固定独立屏桌面根任务防止返回串栈，修复返回键连发 4 次问题；2) 主页横幅、对话顶栏与工具菜单全面新增一键「销毁虚拟屏」，AI 侧 close/release 真正彻底销毁虚拟屏且零残留；3) Agent Loop 与流式状态机大改：移除 DSH/Codex 后置总结抹除与重跑 Bug，修复未调工具提前停机；4) 引擎级持久目标模式 (/goal)：自动持续拉起 AI 直至显式调用 complete_goal 宣布目标完成；5) 升级虚拟屏 1080P 高清视觉截图并硬拦截修改系统深浅色/主屏设置"
 }

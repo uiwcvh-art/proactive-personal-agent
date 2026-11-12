@@ -36,16 +36,37 @@ public final class RootClipboardBroker {
         try { previous=read(getter,service); } catch (Throwable ignored) {}
         String label="pulse-input-"+UUID.randomUUID();boolean changed=false;
         try {
-            String request=in.readLine();if(request==null)return;String text=new JSONObject(request).getString("text");
+            String request=in.readLine();if(request==null)return;
+            JSONObject reqObj=new JSONObject(request);
+            String op=reqObj.optString("op","paste");
+            if("get".equals(op)){
+                ClipData cur=read(getter,service);
+                String clipTxt="";
+                if(cur!=null&&cur.getItemCount()>0&&cur.getItemAt(0).getText()!=null){
+                    clipTxt=cur.getItemAt(0).getText().toString();
+                }
+                out.println(new JSONObject().put("ok",true).put("text",clipTxt).toString());
+                return;
+            }
+            if("set".equals(op)){
+                String text=reqObj.optString("text","");
+                ClipData clip=ClipData.newPlainText("pulse-clip",text);
+                manager.setPrimaryClip(clip);
+                out.println(new JSONObject().put("ok",true).put("text",text).toString());
+                return;
+            }
+            String text=reqObj.getString("text");
             ClipData pending=ClipData.newPlainText(label,text);PersistableBundle extras=new PersistableBundle();extras.putBoolean("android.content.extra.IS_SENSITIVE",true);pending.getDescription().setExtras(extras);
             manager.setPrimaryClip(pending);changed=true;out.println("{\"ready\":true}");
             in.readLine();
         }catch(Exception error){out.println(new JSONObject().put("error",error.getClass().getSimpleName()+": "+error.getMessage()));}
         finally{
-            try {
-                if(changed){ClipData current=read(getter,service);if(current==null||label.contentEquals(current.getDescription().getLabel())){if(previous==null)manager.clearPrimaryClip();else manager.setPrimaryClip(previous);}}
-            } catch (Throwable ignored) {}
-            out.println("{\"restored\":true}");
+            if(changed){
+                try {
+                    ClipData current=read(getter,service);if(current==null||label.contentEquals(current.getDescription().getLabel())){if(previous==null)manager.clearPrimaryClip();else manager.setPrimaryClip(previous);}
+                } catch (Throwable ignored) {}
+                out.println("{\"restored\":true}");
+            }
         }
         System.exit(0);
     }

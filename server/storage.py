@@ -46,9 +46,10 @@ class Config(BaseModel):
     api_base_url: str = 'https://api.openai.com/v1'
     api_key: str = Field('', max_length=4096)
     default_model: str = Field('', max_length=200)
-    fallback_base_url: str = Field('http://149.104.25.8:3000/v1', max_length=500)
-    fallback_api_key: str = Field('sk-daye-aggregate-2026', max_length=4096)
-    fallback_model: str = Field('commandcode/deepseek/deepseek-v4.1-flash', max_length=200)
+    fallback_enabled: bool = False
+    fallback_base_url: str = Field('', max_length=500)
+    fallback_api_key: str = Field('', max_length=4096)
+    fallback_model: str = Field('', max_length=200)
     small_brain: BrainConfig = Field(default_factory=BrainConfig)
     big_brain: BrainConfig = Field(default_factory=BrainConfig)
     smtp: SMTPConfig = Field(default_factory=SMTPConfig)
@@ -59,7 +60,7 @@ class Config(BaseModel):
     overlay_after_minutes: int = Field(30, ge=2, le=2880)
     quiet_start_hour: int = Field(0, ge=0, le=23)
     quiet_end_hour: int = Field(8, ge=0, le=23)
-    auto_compact_tokens: int = Field(120000, ge=8000, le=1000000)
+    auto_compact_tokens: int = Field(100000, ge=8000, le=1000000)
 
     @field_validator('api_base_url')
     @classmethod
@@ -90,6 +91,8 @@ class Config(BaseModel):
         return primary or self.default_model
 
     def effective_fallback(self, big: bool = False) -> tuple[str, str, str]:
+        if not self.fallback_enabled:
+            return '', '', ''
         fb_url = (self.fallback_base_url or '').strip() or self.effective_base_url()
         fb_key = (self.fallback_api_key or '').strip() or self.effective_api_key(big=big)
         fb_model = (self.fallback_model or '').strip()
@@ -101,6 +104,7 @@ class Config(BaseModel):
         data['has_fallback_api_key'] = bool(data.pop('fallback_api_key', ''))
         data['api_base_url'] = self.effective_base_url()
         data['default_model'] = self.default_model or self.big_brain.model or self.small_brain.model
+        data['fallback_enabled'] = bool(self.fallback_enabled)
         data['fallback_base_url'] = (self.fallback_base_url or '').strip()
         data['fallback_model'] = (self.fallback_model or '').strip()
         for key in ('small_brain','big_brain'):
@@ -134,12 +138,13 @@ def node_display_name(raw: str | None) -> str:
     return str(raw or '安卓一').strip()
 
 
-def compact_trace_list(trace: list | None) -> list[dict]:
+def compact_trace_list(trace: list | None, finalize: bool = False) -> list[dict]:
     """
     Strip heavy tool outputs (read_file content, run_bash stdout, web_fetch HTML, Base64 screenshots)
     and large write_file/edit_file argument blobs from persisted/broadcast UI trace arrays.
     The client UI only ever displays tool name, short arguments (path/command/query/op), duration_ms,
     status, and whether result has an 'error' key.
+    When `finalize=True` (for committed messages in state.json), any leftover 'running' status is normalized to 'done'.
     """
     if not isinstance(trace, list):
         return []
@@ -161,17 +166,31 @@ def compact_trace_list(trace: list | None) -> list[dict]:
                     slim_args[k] = v[:4]
         raw_res = step.get('result')
         slim_res: dict = {}
-        if isinstance(raw_res, dict) and raw_res.get('error'):
-            slim_res['error'] = str(raw_res['error'])[:200]
+        if isinstance(raw_res, dict):
+            if raw_res.get('error'):
+                slim_res['error'] = str(raw_res['error'])[:200]
+            if str(step.get('tool') or '') in ('send_message', 'send_message_callback'):
+                for k in ('ok', 'status', 'from_bot_id', 'from_bot_name', 'to_bot_id', 'to_bot_name'):
+                    if k in raw_res:
+                        slim_res[k] = raw_res[k]
+                if raw_res.get('reply'):
+                    slim_res['reply'] = str(raw_res['reply'])[:300]
         entry: dict = {
             'tool': str(step.get('tool') or ''),
             'arguments': slim_args,
             'duration_ms': int(step.get('duration_ms') or 0),
         }
-        if step.get('status'):
-            entry['status'] = str(step['status'])
+        st_val = str(step.get('status') or '')
+        if finalize and st_val == 'running':
+            st_val = 'done'
+        if st_val:
+            entry['status'] = st_val
         if slim_res:
             entry['result'] = slim_res
+        if step.get('step_note'):
+            entry['step_note'] = str(step['step_note'])[:280]
+        if step.get('step_thought'):
+            entry['step_thought'] = str(step['step_thought'])[:280]
         compacted.append(entry)
     return compacted
 
@@ -205,7 +224,7 @@ class Store:
                     if isinstance(m, dict):
                         if m.get('trace'):
                             old_tr = m['trace']
-                            new_tr = compact_trace_list(old_tr)
+                            new_tr = compact_trace_list(old_tr, finalize=True)
                             if old_tr != new_tr:
                                 m['trace'] = new_tr
                                 changed = True
@@ -320,6 +339,7 @@ class Store:
                     'model': self.config.big_brain.model,
                     'has_api_key': bool(self.config.big_brain.api_key or self.config.api_key),
                 },
+                'fallback_enabled': bool(self.config.fallback_enabled),
                 'fallback_base_url': self.config.fallback_base_url,
                 'fallback_api_key': self.config.fallback_api_key,
                 'fallback_model': self.config.fallback_model,
@@ -435,7 +455,7 @@ class Store:
                             update = {}
                             cur_dump = self.config.model_dump()
                             for k in ('api_base_url', 'api_key', 'default_model',
-                                      'fallback_base_url', 'fallback_api_key', 'fallback_model',
+                                      'fallback_enabled', 'fallback_base_url', 'fallback_api_key', 'fallback_model',
                                       'enabled', 'curiosity_interval_minutes', 'idle_research_minutes',
                                       'quiet_start_hour', 'quiet_end_hour', 'auto_compact_tokens'):
                                 if k in raw:
@@ -469,7 +489,10 @@ class Store:
 
     def save(self):
         with self.lock:
-            atomic_write(self.state_path, json.dumps(self.state, ensure_ascii=False, indent=2))
+            serialized = json.dumps(self.state, ensure_ascii=False, indent=2)
+            if serialized != getattr(self, '_last_saved_state_json', None) or not self.state_path.exists():
+                atomic_write(self.state_path, serialized)
+                self._last_saved_state_json = serialized
             self._sync_to_workspace()
 
     def update_config(self, update: dict):
@@ -512,7 +535,7 @@ class Store:
             config = Config.model_validate(data)
             atomic_write(self.config_path, config.model_dump_json(indent=2))
             self.config = config
-            self._sync_to_workspace()
+            self._sync_to_workspace(_from_sync=True)
             return config.public()
 
     def message(self, role, text, kind='chat', **extra):
@@ -522,7 +545,7 @@ class Store:
         target_src = normalize_node_source(extra.get('source'))
         extra['source'] = target_src
         if 'trace' in extra:
-            extra['trace'] = compact_trace_list(extra['trace'])
+            extra['trace'] = compact_trace_list(extra['trace'], finalize=True)
         with self.lock:
             if role == 'assistant' and clean_txt and self.state['messages']:
                 for prev in reversed(self.state['messages'][-6:]):

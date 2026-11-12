@@ -1,20 +1,10 @@
 """Android Virtual Display Workspace Controller (`phone_workspace` & `phone_macro`).
-Implements the agreed Vision + Accessibility Dual Passthrough architecture:
-1. Every visual action on the Android Virtual Display returns BOTH:
-   - The native Accessibility UI tree (`@e1..@eN` with normalized 0..1000 coordinates)
-   - The real-time screenshot annotated with a `0..1000` ruler border, `@eN` purple badges, and tap crosshair
-2. Passed directly to the active multimodal model via standard `image_url` blocks (never forwarded to a secondary OCR LLM).
-3. Zero mechanical same-coordinate tap blockers (`repeated_same_spot` removed).
+Vision + Accessibility dual passthrough (`@e1..@eN` + 0..1000 annotated screenshot via `image_url`).
 """
 from __future__ import annotations
-import asyncio
-import base64
-import json
-import re
-import secrets
-import time
+import asyncio, base64, json, re, secrets, time
 from storage import normalize_node_source
-from core.vfs_router import apply_authoritative_tree, normalize_single_tree_frame
+from core.vfs_router import apply_authoritative_tree, enrich_phone_frame_contract, normalize_single_tree_frame, reconcile_device_root_status
 from core.vision_engine import annotate_tap_crosshair, draw_vision_ruler_overlay
 
 class PhoneControllerMixin:
@@ -26,16 +16,11 @@ class PhoneControllerMixin:
 
     async def _raw_phone_rpc(self, op: str, args: dict, timeout: float = 32.0) -> dict:
         bot_id = self.bot_context.get()
-        cur_src = normalize_node_source(
-            args.get('source')
-            if args.get('source') in ('phone', 'phone2', '安卓一', '安卓二')
-            else (self.source_context.get() or 'phone')
-        )
+        cur_src = normalize_node_source(args.get('source') if args.get('source') in ('phone', 'phone2', '安卓一', '安卓二') else (self.source_context.get() or 'phone'))
         if cur_src not in ('phone', 'phone2'):
             cur_src = 'phone'
         req_id = 'ph-' + secrets.token_hex(6)
-        loop = asyncio.get_running_loop()
-        fut = loop.create_future()
+        fut = asyncio.get_running_loop().create_future()
         self.phone_pending[req_id] = fut
         await self.publish({ 'type': 'phone_workspace_command', 'request_id': req_id, 'bot_id': bot_id, 'source': cur_src, 'op': op, 'args': args, 'timestamp': time.time(), })
         try:
@@ -54,49 +39,24 @@ class PhoneControllerMixin:
         return draw_vision_ruler_overlay(img_bytes, a11y_summary=a11y_summary, screen_w=screen_w, screen_h=screen_h)
 
     async def _auto_release_phone_if_used(self):
-        if not self._vdisplay_currently_open and not self._used_phone_in_turn:
-            self._phone_to_foreground_in_turn = False
-            return
-        was_vdisplay_open = self._vdisplay_currently_open
         self._used_phone_in_turn = False
         self._vdisplay_currently_open = False
         self._phone_to_foreground_in_turn = False
-        if not was_vdisplay_open:
-            return
-        try:
-            bot_id = self.bot_context.get()
-            cur_src = normalize_node_source(self.source_context.get() or 'phone')
-            if cur_src not in ('phone', 'phone2'):
-                cur_src = 'phone'
-            await self.publish({ 'type': 'phone_workspace_command', 'request_id': 'ph-auto-' + secrets.token_hex(4), 'bot_id': bot_id, 'source': cur_src, 'op': 'auto_release', 'args': {'op': 'auto_release', 'delay_ms': 1800, 'to_foreground': False, 'source': cur_src}, 'timestamp': time.time(), })
-        except Exception:
-            pass
 
     @staticmethod
     def _resolve_phone_grid_or_norm(args: dict, width: int, height: int) -> tuple[int, int] | None:
         """Convert grid (`A1..F10`) or normalized 0..1000 (`nx`, `ny`) into pixel coordinates `(px, py)`."""
         grid_raw = str(args.get('grid') or '').strip().upper()
         if grid_raw and len(grid_raw) >= 2 and grid_raw[0].isalpha() and grid_raw[1:].replace('.', '', 1).isdigit():
-            col_idx = max(0, min(5, ord(grid_raw[0]) - ord('A')))
-            row_val = max(0.0, min(9.9, float(grid_raw[1:]) - 1.0))
-            px = int(((col_idx + 0.5) / 6.0) * width)
-            py = int(((row_val + 0.5) / 10.0) * height)
-            return max(0, min(width - 1, px)), max(0, min(height - 1, py))
-        nx = args.get('nx')
-        ny = args.get('ny')
+            col_idx, row_val = max(0, min(5, ord(grid_raw[0]) - ord('A'))), max(0.0, min(9.9, float(grid_raw[1:]) - 1.0))
+            return max(0, min(width - 1, int(((col_idx + 0.5) / 6.0) * width))), max(0, min(height - 1, int(((row_val + 0.5) / 10.0) * height)))
+        nx, ny = args.get('nx'), args.get('ny')
         if nx is not None and ny is not None:
             try:
                 nx_f, ny_f = float(nx), float(ny)
                 if nx_f < 0 or nx_f > 1000 or ny_f < 0 or ny_f > 1000:
-                    args['_coord_clamped'] = True
-                    args['_raw_nx'] = nx
-                    args['_raw_ny'] = ny
-                nx_c = max(0.0, min(1000.0, nx_f))
-                ny_c = max(0.0, min(1000.0, ny_f))
-                return (
-                    max(0, min(width - 1, int(round(nx_c * width / 1000.0)))),
-                    max(0, min(height - 1, int(round(ny_c * height / 1000.0)))),
-                )
+                    args['_coord_clamped'], args['_raw_nx'], args['_raw_ny'] = True, nx, ny
+                return max(0, min(width - 1, int(round(max(0.0, min(1000.0, nx_f)) * width / 1000.0)))), max(0, min(height - 1, int(round(max(0.0, min(1000.0, ny_f)) * height / 1000.0))))
             except (ValueError, TypeError):
                 pass
         return None
@@ -333,20 +293,29 @@ class PhoneControllerMixin:
         cur_turn = self.turn_id_var.get()
         if cur_turn and cur_turn in self._stopped_turn_ids:
             raise asyncio.CancelledError()
-        if (self.source_context.get() or 'phone') == 'pc':
-            return { 'ok': False, 'error': '你当前位于「Windows一」，不能直接调用安卓端的 phone_workspace 工具！请调用 send_message(to_bot_id="安卓一", text="...") 直接发消息让「安卓一」自己执行并回复你。', }
+        if (self.source_context.get() or 'phone') in ('pc', 'pc2'):
+            return { 'ok': False, 'error': '你当前位于电脑端，不能直接调用安卓端的 phone_workspace 工具！请调用 blackboard(action="post", mentions=["@companion"], text="...") 在黑板异步唤醒手机端助理代为执行。', }
         op = str(args.get('op') or 'status').strip().lower()
         orig_requested_op = op
         scroll_dir = ''
-        if op in ('promote', 'expand_to_foreground', 'to_foreground', 'fullscreen', 'release', 'close', 'destroy', 'stop_display'):
-            destroy_flag = bool(args.get('destroy', op in ('destroy', 'stop_display')))
-            op = 'release'
-            args = {**args, 'op': 'release', 'destroy': destroy_flag, 'to_foreground': False}
+        if op in ('promote', 'expand_to_foreground', 'to_foreground', 'fullscreen'):
             self._used_phone_in_turn = False
-            self._vdisplay_currently_open = False
-            self._phone_to_foreground_in_turn = False
+            self._phone_to_foreground_in_turn = True
+            res = await self._raw_phone_rpc('promote', {'op': 'promote'})
+            return {**(res if isinstance(res, dict) else {}), 'ok': bool(isinstance(res, dict) and res.get('ok', True)), 'op': 'promote', 'note': '已将虚拟屏当前页面无损切至主屏前台（零重启），请告知主人完成支付/验证'}
+        if op in ('pull_back', 'to_virtual', 'pull_to_virtual'):
+            await self._raw_phone_rpc('pull_back', {'op': 'pull_back', 'package': str(args.get('package') or args.get('target') or '').strip()})
+            await asyncio.sleep(0.35)
+            return await self._tool_phone_workspace({'op': 'ui_tree', 'refresh': True})
+        if op in ('release', 'close', 'destroy', 'stop_display'):
+            keep_alive = bool(args.get('keep_alive', False))
+            destroy_flag = (not keep_alive) if 'destroy' not in args else bool(args.get('destroy'))
+            self._used_phone_in_turn = self._phone_to_foreground_in_turn = False
+            self._vdisplay_currently_open = not destroy_flag
+            rel_res = await self._raw_phone_rpc('release', {'op': 'release', 'destroy': destroy_flag, 'user_close': destroy_flag, 'keep_alive': keep_alive, 'to_foreground': False})
+            return {**(rel_res if isinstance(rel_res, dict) else {}), 'ok': True, 'op': orig_requested_op, 'released': destroy_flag, 'destroyed': destroy_flag, 'display_active': not destroy_flag, 'created': not destroy_flag, 'note': '已彻底销毁并关闭手机独立虚拟屏与桌面悬浮小窗（主屏应用不受任何影响）。' if destroy_flag else '虚拟屏已保留在后台驻留。'}
         notif_ops = ( 'notifications', 'get_notifications', 'recent_notifications', 'notifs', 'notification', 'add_filter', 'remove_filter', 'list_filters', 'clear_inbox', )
-        non_gui_ops = ( 'status', 'device_info', 'phone_info', 'battery', 'shell', 'bash', 'cmd', 'exec', 'pull_file', 'push_file', 'list_files', 'files', 'apps', 'connect', 'delay', 'wait', 'sleep', 'release', 'auto_release', *notif_ops, )
+        non_gui_ops = ( 'status', 'device_info', 'phone_info', 'battery', 'shell', 'bash', 'cmd', 'exec', 'pull_file', 'push_file', 'list_files', 'files', 'apps', 'connect', 'delay', 'wait', 'sleep', 'release', 'auto_release', 'promote', 'pull_back', *notif_ops, )
         if self.activity == 'curiosity' and op not in notif_ops:
             return {'error': '后台主动关心期间仅允许操作通知栏摘要与过滤 (op=notifications)，禁止操控虚拟屏应用界面，以免与主人的前台操作冲突'}
         if op not in non_gui_ops:
@@ -357,21 +326,40 @@ class PhoneControllerMixin:
                 return {'ok': False, 'error': 'phone_workspace(op="shell") 需要提供 command 参数'}
             if re.search(r'\b(reboot|poweroff|shutdown|rm\s+-rf\s+/data|mkfs|dd\s+if=)\b', cmd_str, flags=re.IGNORECASE):
                 return {'ok': False, 'error': '安全保护已拦截高危系统关机/格式化指令'}
+            if re.search(r'\bcmd\s+uimode\b|\bservice\s+call\s+uimode\b|\bsettings\s+put\s+(?:system|secure|global)\s+(?:ui_night_mode|screen_brightness|screen_off_timeout|font_scale|user_rotation|accelerometer_rotation|default_input_method|enabled_input_methods)\b', cmd_str, flags=re.IGNORECASE):
+                return {'ok': False, 'error': '安全沙箱已拦截系统全局设置修改指令（严禁通过 shell 修改主人手机的深浅色 Night mode、亮度、字体缩放或输入法等系统设置）'}
+            if re.search(r'\bmonkey\b|(?:--display|-d)\s+0\b', cmd_str, flags=re.IGNORECASE):
+                return {'ok': False, 'error': '安全沙箱已拦截指向主屏幕 (Display 0) 或 monkey 的指令，严禁触碰主人主屏幕 Display 0；请使用 phone_workspace(op="open"|"tap") 在独立虚拟屏内操作'}
             cur_disp_env = int(getattr(self, '_last_phone_display_id', 0) or 0)
             rpc_cmd_str = f'export DISPLAY_ID={cur_disp_env}; {cmd_str}' if (cur_disp_env > 0 and 'DISPLAY_ID=' not in cmd_str) else cmd_str
             raw_sh = await self._raw_phone_rpc('shell', {'op': 'shell', 'command': rpc_cmd_str}, timeout=35.0)
             if isinstance(raw_sh, dict):
-                clean_sh: dict = { 'ok': bool(raw_sh.get('ok', 'error' not in raw_sh)), 'op': 'shell', 'output': str(raw_sh.get('output') if 'output' in raw_sh else raw_sh.get('stdout', '')), 'exit_code': int(raw_sh.get('exit_code') if raw_sh.get('exit_code') is not None else (0 if raw_sh.get('ok', True) else 1)), }
+                is_ok = bool(raw_sh.get('ok', 'error' not in raw_sh)) and not bool(raw_sh.get('error'))
+                raw_ec = raw_sh.get('exit_code')
+                eff_ec = -1 if (not is_ok and (raw_ec is None or int(raw_ec) == 0)) else int(raw_ec if raw_ec is not None else (0 if is_ok else -1))
+                out_text = str(raw_sh.get('output') if 'output' in raw_sh else raw_sh.get('stdout', ''))
+                if 'screencap' in cmd_str.lower() and ('status: -2' in out_text.lower() or eff_ec != 0):
+                    out_text = (out_text + '\n[提示：独立虚拟屏启用了 FLAG_SECURE 防泄漏保护，shell screencap 无法直接截取；请改用 phone_workspace(op="inspect") 直接查看高清实时画面，或 phone_workspace(op="send_screenshot") 发送干净截图给主人。]').strip()
+                clean_sh: dict = {'ok': is_ok, 'op': 'shell', 'output': out_text, 'exit_code': eff_ec}
                 if raw_sh.get('cwd'):
                     clean_sh['cwd'] = str(raw_sh['cwd'])
                 if raw_sh.get('error'):
-                    clean_sh['error'] = str(raw_sh['error'])
+                    err_s = re.sub(r'(Root\s*工具进程握手未完成)\s*:\s*ok\b', r'\1', str(raw_sh['error'])).strip()
+                    clean_sh['error'] = err_s
+                    if '握手未完成' in err_s:
+                        clean_sh['root_state'] = 'handshake_failed'
+                        clean_sh['hint'] = 'Root 守护进程握手未完成（常见于热更新 APK 或 su 会话失效）：请强停重启手机端 App 或检查 Magisk/KernelSU 授权与 Zygisk'
                 if raw_sh.get('stderr'):
                     clean_sh['stderr'] = str(raw_sh['stderr'])
                 return clean_sh
             return raw_sh
         if op in ('device_info', 'phone_info', 'battery'):
-            return await self._raw_phone_rpc('device_info', {'op': 'device_info'}, timeout=10.0)
+            from vault_manager import now_iso as _now_iso
+            dev_r, sh_r = await asyncio.gather(
+                self._raw_phone_rpc('device_info', {'op': 'device_info'}, timeout=10.0),
+                self._raw_phone_rpc('shell', {'op': 'shell', 'command': 'id -u'}, timeout=4.5),
+            )
+            return reconcile_device_root_status(dev_r if isinstance(dev_r, dict) else {}, sh_r if isinstance(sh_r, dict) else None, _now_iso())
         if op in ('list_files', 'files'):
             dir_p = str(args.get('path') or args.get('target') or args.get('text') or '/sdcard/Download').strip()
             lim_f = max(1, min(100, int(args.get('limit') or 25)))
@@ -763,8 +751,7 @@ class PhoneControllerMixin:
             reused_existing_app = False
             if op == 'launch' and not str(args.get('component') or '').strip() and not args.get('force'):
                 req_app = str(args.get('app') or args.get('target') or args.get('package') or args.get('text') or '').strip()
-                if req_app and (self._vdisplay_currently_open or self._last_phone_pkg):
-                    await self._raw_phone_rpc('create', {'op': 'create'})
+                if req_app and self._vdisplay_currently_open:
                     probe_tree = await self._raw_phone_rpc('ui_tree', {'op': 'ui_tree', 'refresh': True})
                     if isinstance(probe_tree, dict) and not probe_tree.get('error'):
                         probe_pkg = str(probe_tree.get('package') or '')
@@ -823,20 +810,14 @@ class PhoneControllerMixin:
             return res
 
         pkg, node_count, cur_hash_now = normalize_single_tree_frame(res)
-        # Fix 18-1: Verify key/press actually changed treeHash; auto-retry once if swallowed
+        # Never re-inject key events when treeHash is unchanged (self-drawn apps like WeChat report constant empty treeHash,
+        # so re-firing KEYCODE_BACK caused double/quadruple BACK jumps!). One `press` = strictly ONE key event.
         if op == 'key' and not res.get('error'):
             if not cur_hash_now or (before_tree_hash and cur_hash_now == before_tree_hash):
-                await asyncio.sleep(0.28)
+                await asyncio.sleep(0.24)
                 probe_k = await self._raw_phone_rpc('ui_tree', {'op': 'ui_tree', 'refresh': True})
                 if isinstance(probe_k, dict) and not probe_k.get('error'):
                     apply_authoritative_tree(res, probe_k)
-                    pkg, node_count, cur_hash_now = normalize_single_tree_frame(res)
-            if before_tree_hash and cur_hash_now == before_tree_hash:
-                await self._raw_phone_rpc('key', args)
-                await asyncio.sleep(0.32)
-                probe_k2 = await self._raw_phone_rpc('ui_tree', {'op': 'ui_tree', 'refresh': True})
-                if isinstance(probe_k2, dict) and not probe_k2.get('error'):
-                    apply_authoritative_tree(res, probe_k2)
                     pkg, node_count, cur_hash_now = normalize_single_tree_frame(res)
             res['tree_hash_before'] = before_tree_hash
             res['tree_hash_after'] = cur_hash_now
@@ -860,9 +841,15 @@ class PhoneControllerMixin:
             res['settled'] = False
         else:
             res['settled'] = int(node_count or 0) >= 3
+        if op in ('tap', 'tap_node', 'click_node', 'swipe') and not res.get('error') and before_tree_hash and cur_hash_now and cur_hash_now != before_tree_hash:
+            await asyncio.sleep(0.26)
+            fresh_t = await self._raw_phone_rpc('ui_tree', {'op': 'ui_tree', 'refresh': True})
+            if isinstance(fresh_t, dict) and not fresh_t.get('error'):
+                apply_authoritative_tree(res, fresh_t)
+                pkg, node_count, cur_hash_now = normalize_single_tree_frame(res)
         res['layoutStable'] = bool(res.get('settled', True))
-        res.setdefault('densityDpi', int(res.get('dpi') or 320))
-        res.setdefault('screenWidthDp', int(res.get('swDp') or 360))
+        res['densityDpi'] = int(res.get('dpi') or res.get('densityDpi') or 320)
+        res['screenWidthDp'] = int(res.get('swDp') or res.get('screenWidthDp') or 360)
         res.setdefault('fontScale', 1.0)
         res.setdefault('settle_ms', 0)
         if 'change_summary' in res or op in ('launch', 'open_uri', 'tap', 'tap_node', 'click_node', 'tap_and_type', 'swipe', 'text', 'type_node', 'key', 'long_press'):
@@ -904,12 +891,10 @@ class PhoneControllerMixin:
             res['node_count'] = int(node_count)
         if hasattr(self, 'phone_state_registry'):
             node_st = self.phone_state_registry.get(args.get('source') or self.source_context.get() or 'phone')
-            node_st.last_size = self._last_phone_size
-            node_st.last_pkg = self._last_phone_pkg
-            node_st.last_node_count = self._last_phone_node_count
-            node_st.last_tree_hash = cur_hash_now or node_st.last_tree_hash
-            node_st.last_nodes = cached_nodes
-        if eff_disp_id > 0 and 'display_id' not in res:
+            node_st.last_size, node_st.last_pkg, node_st.last_node_count = self._last_phone_size, self._last_phone_pkg, self._last_phone_node_count
+            node_st.last_tree_hash, node_st.last_nodes = cur_hash_now or node_st.last_tree_hash, cached_nodes
+            enrich_phone_frame_contract(res, node_st, eff_disp_id, node_count)
+        elif eff_disp_id > 0 and 'display_id' not in res:
             res['display_id'] = eff_disp_id
         tapped_xy: tuple[int, int] | None = None
         if op in ('tap', 'tap_node', 'click_node', 'tap_and_type', 'type_node', 'input_node', 'long_press'):
@@ -970,11 +955,11 @@ class PhoneControllerMixin:
                     from PIL import Image as _Image
                     im = _Image.open(_io.BytesIO(annotated_jpg)).convert('RGB')
                     iw, ih = im.size
-                    if max(iw, ih) > 480:
-                        scale = 480.0 / float(max(iw, ih))
+                    if max(iw, ih) > 1080:
+                        scale = 1080.0 / float(max(iw, ih))
                         im = im.resize((max(1, int(round(iw * scale))), max(1, int(round(ih * scale)))), _Image.Resampling.LANCZOS)
                     buf = _io.BytesIO()
-                    im.save(buf, format='JPEG', quality=55)
+                    im.save(buf, format='JPEG', quality=78)
                     annotated_jpg = buf.getvalue()
                 except Exception:
                     pass
@@ -983,7 +968,13 @@ class PhoneControllerMixin:
             change_line = f"{res.get('change_summary')}\n" if res.get('change_summary') else ''
             res['_multimodal_b64'] = b64_img
             res['_multimodal_mime'] = 'image/jpeg'
-            res['_multimodal_caption'] = ( f'已同时返回手机虚拟屏实时无障碍节点树 (`ui_tree`) 与画面截图 (op={orig_requested_op}, 包名={pkg or "unknown"}, 节点数={int(node_count or 0)}, 分辨率={w}x{h})：\n' f'{change_line}' '1. 画面四周带有 `0..1000` 归一化标尺与 `@eN` 紫色锚点，对应 `norm=(nx,ny)` 0..1000 坐标；\n' '2. 若目标有 `@eN` 节点请优先调用 `phone_workspace(op="tap", target="@eN")`；若自绘界面或目标未出现在节点树中，可直接看着画面用 `nx, ny` 点击。' )
+            res['_multimodal_caption'] = (
+                f'已同时返回手机虚拟屏实时无障碍节点树 (`ui_tree`) 与画面截图 (op={orig_requested_op}, 包名={pkg or "unknown"}, 节点数={int(node_count or 0)}, 分辨率={w}x{h})：\n'
+                f'{change_line}'
+                '1. 画面四周带有 `0..1000` 归一化标尺与 `@eN` 紫色锚点，对应 `norm=(nx,ny)` 0..1000 坐标；\n'
+                '2. 若目标有 `@eN` 节点请优先调用 `phone_workspace(op="tap", target="@eN")`；若自绘界面或目标未出现在节点树中，可直接看着画面用 `nx, ny` 点击；\n'
+                '3. 【Agent Loop 续行指令】：若主人的任务尚未徹底完成（例如刚打开/查看页面，或上一步 `⚠️ 界面未变` 点击偏了），请立即在当前步骤继续发起下一步 `phone_workspace` 工具调用，严禁只输出空内容/句号 `.` 或停下来写“下一步计划”！'
+            )
             res['vision_direct'] = True
             res['image_mode'] = img_mode or 'thumb'
         if tapped_xy is not None:

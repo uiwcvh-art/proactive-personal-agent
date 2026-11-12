@@ -91,15 +91,43 @@ public class DisplayTestActivity extends Activity {
     private TextView emptyFilterText;
     private TextView countBadgeText;
     private EditText searchInput;
+    private float uiScale = 2.5f;
+
+    private void initUiScale() {
+        try {
+            android.graphics.Point pt = new android.graphics.Point();
+            if (getDisplay() != null) {
+                getDisplay().getRealSize(pt);
+            } else {
+                getWindowManager().getDefaultDisplay().getRealSize(pt);
+            }
+            int shortSide = Math.min(pt.x, pt.y);
+            if (shortSide >= 320) {
+                // Anchor virtual home layout to 420dp logical width regardless of system/process densityDpi or fontScale
+                uiScale = shortSide / 420f;
+                return;
+            }
+        } catch (Throwable ignored) {}
+        float density = getResources().getDisplayMetrics().density;
+        uiScale = density > 0f ? density : 2.5f;
+    }
 
     private int dp(float v) {
-        float density = getResources().getDisplayMetrics().density;
-        return Math.round(v * (density > 0f ? density : 2f));
+        return Math.max(1, Math.round(v * uiScale));
+    }
+
+    private void setPxTextSize(TextView tv, float spEquivalent) {
+        tv.setTextSize(android.util.TypedValue.COMPLEX_UNIT_PX, Math.max(10f, spEquivalent * uiScale));
     }
 
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        if (getDisplay() != null && getDisplay().getDisplayId() == android.view.Display.DEFAULT_DISPLAY) {
+            finishAndRemoveTask();
+            return;
+        }
+        initUiScale();
         setTitle("独立屏桌面");
 
         LinearLayout root = new LinearLayout(this);
@@ -121,21 +149,21 @@ public class DisplayTestActivity extends Activity {
         String timeStr = new SimpleDateFormat("HH:mm", Locale.getDefault()).format(new Date());
         titleView.setText("脉冲独立屏 · " + timeStr);
         titleView.setTextColor(0xFFF5F7FA);
-        titleView.setTextSize(18f);
+        setPxTextSize(titleView, 17f);
         titleView.setTypeface(Typeface.DEFAULT_BOLD);
         titleCol.addView(titleView);
 
         TextView subView = new TextView(this);
         subView.setText("点按图标在虚拟屏内打开应用，搜索框回车仅过滤不直接启动");
         subView.setTextColor(0xFF8F9BB3);
-        subView.setTextSize(11f);
+        setPxTextSize(subView, 10.5f);
         titleCol.addView(subView);
 
         header.addView(titleCol, new LinearLayout.LayoutParams(0, -2, 1f));
 
         countBadgeText = new TextView(this);
         countBadgeText.setTextColor(0xFF94A3B8);
-        countBadgeText.setTextSize(11f);
+        setPxTextSize(countBadgeText, 10.5f);
         countBadgeText.setPadding(dp(10), dp(4), dp(10), dp(4));
         GradientDrawable badgeBg = new GradientDrawable();
         badgeBg.setColor(0xFF1A2234);
@@ -159,7 +187,7 @@ public class DisplayTestActivity extends Activity {
         TextView searchIcon = new TextView(this);
         searchIcon.setText("⌕");
         searchIcon.setTextColor(0xFF8F9BB3);
-        searchIcon.setTextSize(15f);
+        setPxTextSize(searchIcon, 14f);
         searchIcon.setPadding(0, 0, dp(8), 0);
         searchBox.addView(searchIcon, new LinearLayout.LayoutParams(-2, -2));
 
@@ -169,7 +197,7 @@ public class DisplayTestActivity extends Activity {
         searchInput.setSingleLine(true);
         searchInput.setTextColor(Color.WHITE);
         searchInput.setHintTextColor(0xFF7B879E);
-        searchInput.setTextSize(13.5f);
+        setPxTextSize(searchInput, 13f);
         searchInput.setHint("搜索应用（输入名称或包名过滤）");
         searchInput.setContentDescription("搜索应用");
         searchInput.setImeOptions(EditorInfo.IME_ACTION_SEARCH | EditorInfo.IME_FLAG_NO_EXTRACT_UI);
@@ -177,7 +205,7 @@ public class DisplayTestActivity extends Activity {
         final TextView clearBtn = new TextView(this);
         clearBtn.setText("清空");
         clearBtn.setTextColor(0xFF94A3B8);
-        clearBtn.setTextSize(11.5f);
+        setPxTextSize(clearBtn, 11f);
         clearBtn.setPadding(dp(8), dp(4), dp(8), dp(4));
         clearBtn.setVisibility(View.GONE);
         clearBtn.setClickable(true);
@@ -228,7 +256,7 @@ public class DisplayTestActivity extends Activity {
         emptyFilterText = new TextView(this);
         emptyFilterText.setText("未找到匹配的应用");
         emptyFilterText.setTextColor(0xFF7B879E);
-        emptyFilterText.setTextSize(13f);
+        setPxTextSize(emptyFilterText, 12.5f);
         emptyFilterText.setGravity(Gravity.CENTER);
         emptyFilterText.setPadding(dp(16), dp(48), dp(16), dp(48));
         emptyFilterText.setVisibility(View.GONE);
@@ -246,6 +274,10 @@ public class DisplayTestActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        if (getDisplay() != null && getDisplay().getDisplayId() == android.view.Display.DEFAULT_DISPLAY) {
+            finishAndRemoveTask();
+            return;
+        }
         if (allApps.isEmpty()) {
             loadAppsAndRender();
         }
@@ -409,7 +441,7 @@ public class DisplayTestActivity extends Activity {
             TextView fallback = new TextView(this);
             fallback.setText(app.label.isEmpty() ? "App" : app.label.substring(0, 1));
             fallback.setTextColor(Color.WHITE);
-            fallback.setTextSize(18f);
+            setPxTextSize(fallback, 17f);
             fallback.setTypeface(Typeface.DEFAULT_BOLD);
             fallback.setGravity(Gravity.CENTER);
             iconWrap.addView(fallback, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
@@ -419,7 +451,7 @@ public class DisplayTestActivity extends Activity {
         TextView labelView = new TextView(this);
         labelView.setText(app.label);
         labelView.setTextColor(0xFFE2E8F0);
-        labelView.setTextSize(11.5f);
+        setPxTextSize(labelView, 11f);
         labelView.setSingleLine(true);
         labelView.setEllipsize(TextUtils.TruncateAt.END);
         labelView.setGravity(Gravity.CENTER);
@@ -439,5 +471,15 @@ public class DisplayTestActivity extends Activity {
             }, "pulse-vd-home-launch").start();
         });
         return cell;
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (searchInput != null && searchInput.getText() != null && searchInput.getText().length() > 0) {
+            searchInput.setText("");
+            hideKeyboard(searchInput);
+            return;
+        }
+        // VirtualDisplay Home Launcher anchor: never finish on BACK so the stack bottom stays clean.
     }
 }

@@ -1,4 +1,4 @@
-# Proactive Personal Agent (共生 / 白珂 Baike) — 全局系统架构与操作逻辑权威规范
+# Proactive Personal Agent (DSB) — 全局系统架构与操作逻辑权威规范
 
 > **核心设计哲学：「在看不见的地方做加法，在看得见的地方做减法」**
 > 本规范完整还原并固化项目全部已商定、已验证的架构设计、交互状态机、多端互联协议、虚拟屏视觉+无障碍双通道契约、200K 静态前缀缓存与底部分离式动态记忆（Bottom Memory Deltas）机制，以及 UI 极简美学铁律。任何后续迭代与 Bug 修复严禁违背本规范或将既定特性误判为 Bug 删除。
@@ -17,7 +17,7 @@
      - 采用与原生 `ds-bot`（Grok 风格鲸鱼娘）完全一致的侧边栏分组、顶栏、消息流与输入框样式。
      - 严禁在输入框上方展示冗余胶囊栏；支持拖拽上传、剪贴板粘贴图片与文件，统一走原生附件卡片体验。
 2. **看不见的地方做加法（强大的底层能力按需无缝唤醒）**：
-   - 当主人提出需求时，AI 通过底层的 12 个核心工具（`phone_workspace`, `cloud_desktop`, `dsh_workspace`, `send_message`, `memory_search`, `conversation_search`, `ctx_search`, `memory_pin`, `watchdog`, `bg_task`, `notify`, `alarm`, `choices`, `custom_tool`）静默完成跨端操控、文件流转、自动化检索与记忆沉淀。
+   - 当主人提出需求时，AI 通过底层的核心工具（`phone_workspace`, `cloud_desktop`, `dsh_workspace`, `blackboard`, `peek_bots`, `memory_search`, `conversation_search`, `ctx_search`, `memory_pin`, `notify_user`, `emergency_alarm`, `present_choices`, `custom_tool`）静默完成跨端操控、事件黑板协同、文件流转、自动化检索与记忆沉淀。
    - **平时零打扰、零后台耗电**：不使用虚拟屏时不创建 `VirtualDisplay`、不抓帧、不持锁、不弹窗；不执行重任务时不唤醒后台轮询。
 
 ### 1.2 模型多模态铁律（严禁区分「文本模型 vs 视觉模型」或二次转发 OCR）
@@ -130,33 +130,31 @@
 
 ---
 
-## 第三章：多设备全网互联架构 (`安卓一` / `安卓二` / `Windows一`)
+## 第三章：多设备全网互联与事件黑板架构 (`安卓一` / `安卓二` / `Windows一` / `共享云电脑`)
 
-### 3.1 设备节点标识与独立会话流隔离
-| 节点 `source` ID | 标准显示名称 | 终端类型 | 专属执行工作区工具 |
+### 3.1 设备节点标识、独立花名册 (`home_node`) 与工作区工具
+| 节点 `source` ID | 标准显示名称 | 常驻专属 Bot (`home_node`) | 专属与共享工作区工具 |
 | :--- | :--- | :--- | :--- |
-| `phone` | **安卓一** | 主力安卓手机 | `phone_workspace(device="安卓一")` |
-| `phone2` | **安卓二** | 备用安卓手机 / 平板 | `phone_workspace(device="安卓二")` |
-| `pc` | **Windows一** | Windows 电脑端 (`DeepSeek Harness` + `Sentinel`) | `dsh_workspace` / `cloud_desktop(node="local_pc")` |
-| `cloud` | **云端主机** | 日本节点服务器 (`vps-jp` Xvfb 桌面) | `cloud_desktop(node="cloud")` |
+| `phone` / `phone2` | **安卓一 / 安卓二** | 手机专属助理团（`companion`, `research`, `contrarian`, `whalechan`） | `phone_workspace` + 共享 `cloud_desktop` |
+| `pc` / `pc2` | **Windows一 / Windows二** | 电脑专属助理团（`pc_engineer` 司工, `pc_research` 探微, `pc_reviewer` 审校, `pc_companion` 云汐） | `dsh_workspace` (含 Git Bash `pc_shell` / `cua_desktop` / 秒回 `steer` `dispatch_session`) + **直接操控共享 `cloud_desktop`** |
+| `cloud` | **共享云电脑** | 全端共享 24/7 隔离 Linux 工作站 (`proactive-desktop`) | `cloud_desktop`（手机端与电脑端均可直控） |
 
-1. **会话流严格按 `(source, bot_id)` 隔离**：不同设备上的聊天流各自独立，互不混窜。
-2. **助手花名册：全局身份共享 + 单设备独立开关 (`node_overrides`)**：
-   - 助手的 `id`、`name`、`persona`、`avatar`、`color`、`model` 全网同步。
-   - `curiosity_enabled`（主动搭话/好奇心开关）与 `proactive_interval` 存储在 `node_overrides[source]` 中，支持在手机开启主动搭话、在平板关闭主动搭话。
-3. **跨设备 & 同设备 & DSH 原生会话通信 (`send_message`)**：
-   - 支持同设备 (`target="研究助手"`)、跨设备 (`target="安卓一:白珂"`, `target="Windows一:白珂"`)、以及 DSH 原生会话 (`target="会话:<标题或ID>"`)。
-   - 严格遵循双气泡展示规范（Bubble 1: `bot_message` 发出方气泡；Bubble 2: `bot_reply` 接收方回复气泡），消除多余的第 3 条重复气泡。
-   - 思考与工具调用轨迹统一收纳于单行定高折叠胶囊 (`💭 思考中…` -> `💭 已思考 · N 步工具 ▾`)，默认折叠不跳动，点击展开详情。
+1. **分端不同名 + 快速导入导出 (`.dsb-bot.json`)**：
+   - 手机端与电脑端采用各自独立命名的 Bot 花名册（`home_node: "phone" | "pc"`），全局名字唯一，黑板 `@Bot名` 零歧义；支持一键导出/导入 Bot 完整档案（含设定、外观、聊天记录、置顶记忆与关联笔记）。
+2. **废除点对点 `send_message`，全面采用事件黑板 (`blackboard`) + 只读窥视 (`peek_bots`)**：
+   - **`blackboard`**：`<50ms` 瞬时发帖并异步 `@Bot` / `@self` / `@everyone` 唤醒；支持 `action="claim"` 租约认领、`artifact_path` 产物交接、按需 `review_by` 审校门禁（仅在明确要求时开启）、闹钟/定时自唤醒（`ring_alarm`/`notify_user`/`wake_bot`）及 0-Token `watch` 事件探针。
+   - **`peek_bots`**：只读查看任意端 Bot 最新消息、当前运行步骤与黑板任务进度。
+   - **抢占式插话 (`steer`)**：用户或高优指导第二轮输入直接打断第一轮旧执行，保留已执行工具轨迹并带着新上下文无缝继续。
 
 ---
 
-## 第四章：200K 不可变静态前缀缓存与底部分离式记忆引擎
+## 第四章：原生 Agent 工具历史、98%~99% 静态前缀缓存与满 100K 分段局部压缩
 
-1. **`static_system_instructions()` 完全静态不可变**：
-   - 每个 `(source, bot_id)` 的系统提示词前缀一经生成即锁定缓存，不包含动态时间戳或全量变动笔记，确保 200K 上下文 100% 命中 Prefix Cache。
-2. **底部分离式动态记忆注入 (`inject_memory_deltas`)**：
-   - 记忆库 (`memory_vault`) 的新增/变更笔记通过 `inject_memory_deltas()` 追加在历史消息列表最底部（最新用户输入之前），既实时生效又不破坏前方长前缀缓存。
+1. **原生 `assistant(tool_calls)` + `role: "tool"` 历史回放**：
+   - 严格保持大模型原生 Agent 训练格式回放真实工具调用与返回，跨轮自动剥离旧 `reasoning_content`，杜绝伪造旁白导致的工具调用报错。
+2. **小于 `100K` 免压缩 + 满 `100K`「告一段落」分段局部压缩**：
+   - 上下文 `< 100K` Tokens 时 0 压缩纯追加（Append-Only），配合底部 `inject_memory_deltas()` 保持 98%~99% Prefix Cache 命中率。
+   - 满 `100K` Tokens 时仅压缩前序「已告一段落」的旧对话段并原地替换为结构化摘要，完整保留近期活跃的 30K~40K 原生上下文。
 
 ---
 

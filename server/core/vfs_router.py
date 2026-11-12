@@ -88,6 +88,8 @@ class PhoneNodeSessionState:
     """Per-Android-device (`phone` vs `phone2`) isolated VirtualDisplay & Accessibility state."""
 
     source: str = 'phone'
+    session_id: str = ''
+    display_id: int = -1
     last_tap: tuple[int, int] | None = None
     last_size: tuple[int, int] = (720, 1600)
     last_pkg: str = ''
@@ -97,6 +99,10 @@ class PhoneNodeSessionState:
     vdisplay_open: bool = False
     used_in_turn: bool = False
     to_foreground_in_turn: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.session_id:
+            self.session_id = f'vd-{normalize_node_source(self.source)}'
 
 
 class PerNodePhoneRegistry:
@@ -183,9 +189,53 @@ def apply_authoritative_tree(target_d: dict, auth_d: dict) -> None:
     for k_ov in (
         'package', 'node_count', 'ui_tree', 'tree', 'treeHash', 'tree_hash',
         'layout_signature', 'layoutStable', 'settled', 'likely_blank',
-        'densityDpi', 'screenWidthDp', 'fontScale', 'settle_ms',
+        'densityDpi', 'screenWidthDp', 'dpi', 'swDp', 'fontScale', 'settle_ms',
         'width', 'height', 'displayId', 'display', 'nodes',
+        'image', '_image_b64', 'frameHash',
     ):
         if k_ov in auth_d and auth_d[k_ov] is not None:
+            if k_ov in ('image', '_image_b64') and not str(auth_d[k_ov]).strip():
+                continue
             target_d[k_ov] = auth_d[k_ov]
     normalize_single_tree_frame(target_d)
+
+
+def enrich_phone_frame_contract(
+    res: dict[str, Any],
+    node_st: PhoneNodeSessionState,
+    eff_disp_id: int,
+    node_count: int | None,
+) -> None:
+    """Attach stable `display_session_id` handle (36-1) and explicit `ui_readable` visual fallback metadata (36-0②)."""
+    if eff_disp_id > 0:
+        node_st.display_id = eff_disp_id
+        res.setdefault('display_id', eff_disp_id)
+    elif node_st.display_id > 0:
+        res.setdefault('display_id', node_st.display_id)
+    res['display_session_id'] = node_st.session_id
+    cnt = int(node_count or 0)
+    res['ui_readable'] = cnt > 0
+    if cnt == 0:
+        res['ui_hint'] = '当前画面无无障碍节点结构 (ui_readable=false，常见于自绘/小程序/游戏层)，请直接依据实时截图四周 0..1000 标尺传 nx, ny 视觉坐标点击。'
+
+
+def reconcile_device_root_status(info: dict[str, Any], shell_probe: dict[str, Any] | None, checked_at: str) -> dict[str, Any]:
+    """Unify `device_info` file-level root marker with real `id -u` execution proof (fixes 28-1 / 29-1 / 29-2 / 30-3)."""
+    out = dict(info) if isinstance(info, dict) else {'ok': True}
+    raw_marker = bool(out.get('root', False))
+    uid_str = str((shell_probe or {}).get('output') or '').strip().splitlines()
+    first_uid = uid_str[0].strip() if uid_str else ''
+    exec_ok = bool(isinstance(shell_probe, dict) and shell_probe.get('ok') is not False and not shell_probe.get('error') and first_uid == '0')
+    out['root_present'] = raw_marker
+    out['root_functional'] = exec_ok
+    out['root_uid'] = 0 if exec_ok else None
+    out['root'] = exec_ok
+    out['root_checked_at'] = checked_at
+    if raw_marker != exec_ok or (not exec_ok and isinstance(shell_probe, dict) and shell_probe.get('error')):
+        out['root_degraded'] = True
+        out['root_state'] = 'handshake_or_daemon_down' if raw_marker else 'su_unavailable'
+        out['hint'] = 'Root 执行探针未通过（ADB/共享存储层不受影响）：若 Magisk/KernelSU 已授权但此处为 false，请强停重启手机端 App 重新建立 su 握手，或检查 Zygisk/su 状态。'
+    else:
+        out['root_degraded'] = False
+        out['root_state'] = 'granted' if exec_ok else 'not_rooted'
+    return out

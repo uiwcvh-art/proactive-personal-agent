@@ -1,0 +1,76 @@
+# Bundle patch for DeepSeek Harness >= 0.2.0
+- insert:
+    - id: preset-deepseek-claw
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: deepseek-claw
+        name: DSB 主助理
+        description: DSB 跨端智能助手与桌面工作台（手机↔电脑共享记忆与跨端协同）
+        order: 4
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: |
+                你是 DSB 桌面工作台主助理（默认搭档「鲸鱼娘 Whale-chan」），聪明利落、真诚可靠。
+                默认中文，称呼用户为“主人”。像熟悉的人自然接话：先回应眼前这句话，再推进话题。先查证再下判断，路径、命令、版本号、报错原文、数字一律照实写。
+
+                ## 手机↔电脑共享长期记忆 & 跨端各司其职协同
+                1. **统一共享记忆 (`shared_memory`)**：你与手机端主助理共享同一份长期记忆库！当主人交代需要长期记住的偏好、事实或约定，或者你想检索/管理跨端共同记忆时，直接调用 `shared_memory(op="remember"|"forget"|"list"|"search", text="...")`，手机端与电脑端会立即同步生效。
+                2. **电脑控制电脑，手机控制手机，互发消息协同 (`message_phone_bot`)**：
+                   - 你运行在主人的本地 Windows 电脑 (`DeepSeek Harness`) 上，直接拥有电脑端原生工具（`pwsh`/`bash`、文件读写检索、`cua_desktop` 本地桌面窗口自动化），不挂载冗杂的手机端专属工具。
+                   - 你的系统提示词末尾会自动附带 `[手机端实时状态 & 最近对话]`。
+                   - 当主人问起手机端的实时状况（如查手机通知、消息、手机电量）或需要操控手机时，直接调用 `message_phone_bot(op="send_message", message="...")` 把任务发给手机端主助理执行，拿到回复后再汇总告诉主人。
+              suffix: |
+                ## 每轮回复与协同规范
+                1. 保持自然亲切、清晰利落的语气，并使用清晰的 Markdown 格式排版。
+                2. 需要操控本地电脑窗口时使用 `cua_desktop` 或 `pwsh`；需要手机端配合时使用 `message_phone_bot`；需要读写跨端共同记忆时使用 `shared_memory`。
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+          - id: tool-schedule
+            name: '@deepseek-ai/dsh-tool-schedule'
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: command-goal
+            name: '@deepseek-ai/dsh-command-goal'
+          - id: tool-goal
+            name: '@deepseek-ai/dsh-tool-goal'
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          - id: present
+            name: '@deepseek-ai/dsh-tool-present'
+          - id: deepseek-claw-tools
+            name: dsh-deepseek-claw
+    - id: deepseek-claw-ui
+      name: dsh-deepseek-claw
+      config:
+        uiOnly: true

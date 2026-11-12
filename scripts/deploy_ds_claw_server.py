@@ -30,6 +30,7 @@ def main():
             *(ROOT / "server/transport").rglob("*.py"),
             *(ROOT / "server/plugins").rglob("*.py"),
             *(ROOT / "server/cloud_os").rglob("*.py"),
+            *(ROOT / "server/tests").rglob("*.py"),
             *(ROOT / "server/memory_vault_seed").rglob("*.md"),
             *(ROOT / "desktop").rglob("*.py"),
             ROOT / "ARCHITECTURE_AND_OPERATIONS.md",

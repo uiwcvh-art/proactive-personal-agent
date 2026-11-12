@@ -302,37 +302,14 @@ class InterconnectRouterMixin:
             sess_title_label = str((matched_session or {}).get('title') or sess_query).strip()
             if not sess_id_to_send:
                 return {'error': '请指定要发送的工作区会话标题或 ID，例如 send_message(to_bot_id="会话:1", text="...")'}
-            sender_sess_label = f'{from_bot["name"]} · {cur_node_label}'
-            target_sess_id = f'session:{sess_id_to_send[:8]}'
             target_sess_label = f'工作区会话 · {sess_title_label}'
-            if self.hop_depth.get() == 0:
-                outbound_sess_msg = self.store.message(
-                    'assistant',
-                    text,
-                    kind='bot_message',
-                    bot_id=room_id,
-                    from_bot_id=from_id,
-                    from_bot_name=sender_sess_label,
-                    from_node=cur_src,
-                    to_bot_id=target_sess_id,
-                    to_bot_name=target_sess_label,
-                    to_node='session',
-                    direction='outbound',
-                    thought=caller_thought,
-                    trace=outbound_trace,
-                    notify=False,
-                    source=cur_src,
-                )
-                self.stream_seq += 1
-                outbound_sess_msg['seq'] = self.stream_seq
-                outbound_sess_msg['turn_id'] = parent_turn_id
-                await self.publish({'type': 'message', 'source': cur_src, 'message': outbound_sess_msg, 'seq': self.stream_seq})
-                await self._set_stream(
-                    text=f'正在等待「{target_sess_label}」执行并回复…',
-                    tool=f'dsh_workspace(dispatch_session → {sess_title_label})',
-                    speaker_id=target_sess_id,
-                    speaker_name=target_sess_label,
-                )
+            await self._set_stream(
+                text=f'正在等待「{target_sess_label}」执行并回复…',
+                tool=f'send_message → {sess_title_label}',
+                speaker_id=from_id,
+                speaker_name=from_bot['name'],
+                thought=None,
+            )
             res = await self._raw_dsh_rpc(
                 'dispatch_session',
                 {'session_id': sess_id_to_send, 'message': text, 'wait': True, 'timeout_sec': 90},
@@ -340,36 +317,6 @@ class InterconnectRouterMixin:
             )
             reply_str = str(res.get('assistant_reply') or res.get('message') or res.get('error') or '（工作区会话已接收并执行完毕）').strip()
             final_sess_title = str(res.get('title') or sess_title_label).strip()
-            final_sess_label = f'工作区会话 · {final_sess_title}'
-            sess_reply_msg = None
-            if self.hop_depth.get() == 0 and reply_str:
-                sess_trace = [{
-                    'tool': 'dsh_workspace',
-                    'arguments': {'op': 'dispatch_session', 'session_id': final_sess_title},
-                    'result': {'ok': bool(res.get('ok')), 'session_id': res.get('session_id') or sess_id_to_send},
-                    'duration_ms': 1,
-                    'status': 'done',
-                }]
-                sess_reply_msg = self.store.message(
-                    'assistant',
-                    reply_str,
-                    kind='bot_reply',
-                    bot_id=room_id,
-                    from_bot_id=target_sess_id,
-                    from_bot_name=final_sess_label,
-                    from_node='session',
-                    to_bot_id=from_id,
-                    to_bot_name=sender_sess_label,
-                    to_node=cur_src,
-                    direction='inbound',
-                    trace=sess_trace,
-                    notify=False,
-                    source=cur_src,
-                )
-                self.stream_seq += 1
-                sess_reply_msg['seq'] = self.stream_seq
-                sess_reply_msg['turn_id'] = parent_turn_id
-                await self.publish({'type': 'message', 'source': cur_src, 'message': sess_reply_msg, 'seq': self.stream_seq})
             return {
                 'ok': bool(res.get('ok')),
                 'status': 'session_dispatched' if res.get('ok') else 'error',
@@ -378,8 +325,6 @@ class InterconnectRouterMixin:
                 'sent_text': text,
                 'reply': reply_str,
                 'detail': res,
-                '_already_emitted_turn_bubbles': bool(sess_reply_msg is not None),
-                '_final_emitted_msg': sess_reply_msg,
             }
 
         if target_bot is None:
@@ -388,7 +333,7 @@ class InterconnectRouterMixin:
             return {
                 'error': (
                     f'未找到目标 Bot 或工作区会话 "{raw_target}"。'
-                    f'可用 Bot: {", ".join(available)}（跨端可写 "Windows一:白珂"、"Windows一:研究助手"、"安卓一:白珂" 等）；'
+                    f'可用 Bot: {", ".join(available)}（跨端可写 "Windows一:companion"、"Windows一:研究助手"、"安卓一:companion" 等）；'
                     + (f'可用电脑端工作区会话: {", ".join(sess_hints)}。' if sess_hints else '也可写 "会话:<工作区会话名>" 发给电脑端底部工作区会话。')
                 )
             }
@@ -396,7 +341,7 @@ class InterconnectRouterMixin:
         target_id = target_bot['id']
         target_node_label = node_display_name(target_src)
         if target_src == cur_src and target_id == from_id:
-            return {'error': '不能给自己发送 send_message（如需发给其他端的同名 Bot，请在 to_bot_id 中加上节点前缀，如 "Windows一:白珂" 或 "安卓一:白珂"）'}
+            return {'error': '不能给自己发送 send_message（如需发给其他端的同名 Bot，请在 to_bot_id 中加上节点前缀，如 "Windows一:companion" 或 "安卓一:companion"）'}
 
         cur_sig = f'{cur_src}:{from_id}'
         target_sig = f'{target_src}:{target_id}'
@@ -420,32 +365,9 @@ class InterconnectRouterMixin:
                 'note': f'已通过 send_message 将回复送达「{target_label}」。',
             }
 
-        # 3. Emit Bubble 1 (`发了什么` + Caller's send_message tool trace) in Caller's room when hop_depth == 0
-        if self.hop_depth.get() == 0:
-            outbound_msg = self.store.message(
-                'assistant',
-                text,
-                kind='bot_message',
-                bot_id=room_id,
-                from_bot_id=from_id,
-                from_bot_name=sender_label,
-                from_node=cur_src,
-                to_bot_id=target_id,
-                to_bot_name=target_label,
-                to_node=target_src,
-                direction='outbound',
-                thought=caller_thought,
-                trace=outbound_trace,
-                notify=False,
-                source=cur_src,
-            )
-            self.stream_seq += 1
-            outbound_msg['seq'] = self.stream_seq
-            outbound_msg['turn_id'] = parent_turn_id
-            outbound_msg['is_sub_turn'] = True
-            await self.publish({'type': 'message', 'source': cur_src, 'message': outbound_msg, 'seq': self.stream_seq})
-
-        # 4. Check hop depth and loop guard before waking target_bot
+        # 3. Strict 1-on-1 Room & CoT Isolation:
+        # Never emit `bot_message` or `bot_reply` bubbles into Caller's room (`room_id`),
+        # and never mirror Target Bot's live stream or CoT into Caller's room!
         depth = self.hop_depth.get()
         if depth >= 4:
             return {'error': 'Bot 间连续转发已达单次上限 (4 跳)，请先总结当前进展'}
@@ -454,14 +376,12 @@ class InterconnectRouterMixin:
             return {'error': f'检测到 Bot 循环调用链路 ({" -> ".join(chain + [target_sig])})，已自动拦截以防死锁；请直接汇总当前信息。'}
 
         incoming_prompt = (
-            f'【跨端/同事 Bot 协作来信 · 发件方：「{sender_label}」(to_bot_id="{cur_node_label}:{from_bot["name"]}")】\n'
-            f'⚠️ 协作响应铁律：\n'
-            f'1. 本条消息是由「{sender_label}」通过 `send_message` 发到你专属会话的协作请求。若对方请你查看本机窗口/屏幕、查消息、跑命令或读文件，你**必须在当前回合立即调用你节点上的真实工具**（如电脑端调用 `dsh_workspace(op="cua_desktop" | "pc_shell")`、手机端调用 `phone_workspace`）获取最新实测结果，严禁不调工具就凭旧记录口头回答！\n'
-            f'2. 执行完所需工具（或无需工具的纯讨论）后，请直接面向「{sender_label}」用自然语言正文输出你的完整答复（系统会自动将你的最终正文同步回传给「{sender_label}」，请勿再重复调用 `send_message` 回传），不要把回复写成向主人汇报“我已经回过她了”。\n\n'
-            f'「{sender_label}」对你说：\n{text}'
+            f'【跨端/同事 Bot 协作来信 · 来自「{sender_label}」的同级触发委托】（请站在你自己的专业职责视角独立完成任务并直接输出完整汇报；系统会将你的正文回传给「{sender_label}」，你的思考过程与会话空间严格独立）：\n\n'
+            f'{text}\n\n'
+            f'[协作来信 · 来自「{sender_label}」—— 处理完毕后可直接输出回复正文，或调用 `send_message(to_bot_id="{cur_node_label}:{from_bot["name"]}", text="...")` 回信]'
         )
         deferred_incoming_spec = {
-            'role': 'assistant',
+            'role': 'user',
             'text': text,
             'kind': 'bot_message',
             'bot_id': target_id,
@@ -472,171 +392,332 @@ class InterconnectRouterMixin:
             'to_bot_name': target_label,
             'to_node': target_src,
             'direction': 'inbound',
-            'trace': outbound_trace,
-            'notify': False,
+            'trace': [],
+            'notify': True,
             'source': target_src,
             'llm_text': incoming_prompt,
             'turn_id': parent_turn_id,
             'is_sub_turn': True,
         }
-        if self._get_bot_lock(target_id, target_src).locked():
+        inbound_msg = self.store.message(
+            'user',
+            text,
+            kind='bot_message',
+            bot_id=target_id,
+            from_bot_id=from_id,
+            from_bot_name=sender_label,
+            from_node=cur_src,
+            to_bot_id=target_id,
+            to_bot_name=target_label,
+            to_node=target_src,
+            direction='inbound',
+            trace=[],
+            notify=True,
+            source=target_src,
+            llm_text=incoming_prompt,
+        )
+        self.stream_seq += 1
+        inbound_msg['seq'] = self.stream_seq
+        inbound_msg['turn_id'] = parent_turn_id
+        inbound_msg['is_sub_turn'] = True
+        self.store.save()
+        await self.publish({'type': 'message', 'source': target_src, 'message': inbound_msg, 'seq': self.stream_seq})
+
+        if cur_src != target_src and target_src in ('phone', 'phone2'):
+            with contextlib.suppress(Exception):
+                await self.publish({
+                    'type': 'user_notification',
+                    'id': 'xnode-' + secrets.token_hex(4),
+                    'bot_id': target_id,
+                    'bot_name': sender_label,
+                    'title': f'{sender_label} 发来跨端协作消息',
+                    'body': text[:240],
+                    'urgent': False,
+                })
+
+        caller_user_txt = str(self._current_user_text_by_bot.get(from_id) or '').strip()
+        auto_async_delegate = bool(
+            depth == 0
+            and caller_user_txt
+            and re.search(r'(?:派发?给|交给|丢给|甩给|转给|分给).*(?:跟(?:我|余)|陪(?:我|余)|继续.*聊)', caller_user_txt)
+        )
+        raw_wait = args.get('wait')
+        should_wait = False if (raw_wait is False or str(raw_wait).lower() == 'false' or auto_async_delegate) else True
+
+        if should_wait:
+            wait_hint = (
+                f'⏳ 「{target_label}」正在处理上一条消息，排队等待中…'
+                if self._get_bot_lock(target_id, target_src).locked()
+                else f'正在等待「{target_label}」协作处理…'
+            )
             await self._set_stream(
-                text=f'⏳ 「{target_label}」正在处理上一条消息，排队等待中…',
-                tool='send_message',
+                text=wait_hint,
+                tool=f'send_message → {target_label}',
                 speaker_id=from_id,
                 speaker_name=from_bot['name'],
+                thought=None,
             )
 
         reply_box_list: list[dict] = []
         reply_box_key = f'{cur_sig}:{parent_turn_id}'
         self._reply_box_by_sig[reply_box_key] = reply_box_list
         self._reply_box_by_sig[cur_sig] = reply_box_list
-        parent_room_val = (cur_src, room_id, target_label) if depth == 0 else self.parent_stream_room_var.get()
-        parent_stream_token = self.parent_stream_room_var.set(parent_room_val)
-        depth_token = self.hop_depth.set(depth + 1)
-        chain_token = self.call_chain_var.set(tuple(chain + [target_sig]))
-        bot_token = self.bot_context.set(target_id)
-        room_token = self.room_context.set(target_id)
-        src_token = self.source_context.set(target_src)
-        sub_turn_token = self.turn_id_var.set('turn-' + secrets.token_hex(6))
-        sub_prefix_token = self.stream_prefix_var.set('')
-        cur_sub_task = asyncio.current_task()
-        if cur_sub_task:
-            self.queued_tasks_by_bot.setdefault(target_id, set()).add(cur_sub_task)
-        peer_res = None
-        try:
-            peer_res = await self._chat(
-                incoming_prompt,
-                deferred_incoming_spec=deferred_incoming_spec,
-                source=target_src,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            err_text = f'调用 {target_label} 失败: {exc}'
-            err_msg_in_target = self.store.message(
-                'assistant',
-                err_text,
-                kind='error',
-                bot_id=target_id,
-                from_bot_id=target_id,
-                from_bot_name=target_label,
-                to_bot_id=from_id,
-                to_bot_name=sender_label,
-                notify=False,
-                source=target_src,
-            )
-            self.stream_seq += 1
-            err_msg_in_target['seq'] = self.stream_seq
-            await self.publish({'type': 'message', 'source': target_src, 'message': err_msg_in_target, 'seq': self.stream_seq})
-            peer_res = err_msg_in_target
-        finally:
+
+        async def _run_peer_turn() -> dict:
+            parent_stream_token = self.parent_stream_room_var.set(None)
+            depth_token = self.hop_depth.set(depth + 1)
+            chain_token = self.call_chain_var.set(tuple(chain + [target_sig]))
+            bot_token = self.bot_context.set(target_id)
+            room_token = self.room_context.set(target_id)
+            src_token = self.source_context.set(target_src)
+            sub_turn_token = self.turn_id_var.set('turn-' + secrets.token_hex(6))
+            sub_prefix_token = self.stream_prefix_var.set('')
+            sub_thought_token = self.thought_prefix_var.set('') if hasattr(self, 'thought_prefix_var') else None
+            sub_choices_token = self.choices_var.set(None)
+            sub_cp_token = self.choices_prompt_var.set('')
+            sub_stk_token = self.pending_sticker_var.set('')
+            sub_stks_token = self.pending_stickers_var.set(())
+            cur_sub_task = asyncio.current_task()
             if cur_sub_task:
-                self.queued_tasks_by_bot.get(target_id, set()).discard(cur_sub_task)
-            self.stream_prefix_var.reset(sub_prefix_token)
-            self.turn_id_var.reset(sub_turn_token)
-            self.source_context.reset(src_token)
-            self.room_context.reset(room_token)
-            self.bot_context.reset(bot_token)
-            self.call_chain_var.reset(chain_token)
-            self.hop_depth.reset(depth_token)
-            self.parent_stream_room_var.reset(parent_stream_token)
-            self._reply_box_by_sig.pop(reply_box_key, None)
-            if self._reply_box_by_sig.get(cur_sig) is reply_box_list:
-                self._reply_box_by_sig.pop(cur_sig, None)
-            replies = list(reply_box_list)
-
-        trace_items = list((peer_res or {}).get('trace') or [])
-        peer_thought = str((peer_res or {}).get('thought') or '').strip()
-        peer_direct_text = str((peer_res or {}).get('text') or '').strip()
-        if not replies and peer_direct_text:
-            replies = [{
-                'from_bot_id': target_id,
-                'from_bot_name': target_label,
-                'text': peer_direct_text,
-            }]
-        with contextlib.suppress(Exception):
-            ts_str = time.strftime('%Y-%m-%d %H:%M:%S')
-            tools_str = ', '.join(str(t.get('tool') or '') for t in trace_items if isinstance(t, dict)) if trace_items else '直接处理'
-            reply_summary = (' / '.join(r['text'] for r in replies) if replies else '（未回发消息，已在自身会话内处理）')[:200]
-            digest_line = (
-                f"- **{ts_str}** [{cur_node_label}·{from_bot['name']} -> {target_node_label}·{target_bot['name']}] "
-                f"指令: `{text[:120]}` | 工具: `{tools_str}` | 回发: {reply_summary}"
-            )
-            self.vault.append_work_log(digest_line)
-
-        if replies:
-            combined_reply = '\n\n'.join(str(r.get('text') or '') for r in replies if r.get('text')).strip()
-            peer_is_error = str((peer_res or {}).get('kind') or '') == 'error'
-            reply_msg_in_caller = None
-            if depth == 0 and combined_reply:
-                reply_msg_in_caller = self.store.message(
+                self.queued_tasks_by_bot.setdefault(target_id, set()).add(cur_sub_task)
+            peer_res = None
+            try:
+                peer_res = await self._chat(
+                    incoming_prompt,
+                    pre_recorded_user_msg=inbound_msg,
+                    deferred_incoming_spec=deferred_incoming_spec,
+                    source=target_src,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                err_text = f'调用 {target_label} 失败: {exc}'
+                err_msg_in_target = self.store.message(
                     'assistant',
-                    combined_reply,
-                    kind='error' if peer_is_error else 'bot_reply',
-                    bot_id=room_id,
+                    err_text,
+                    kind='error',
+                    bot_id=target_id,
                     from_bot_id=target_id,
                     from_bot_name=target_label,
-                    from_node=target_src,
                     to_bot_id=from_id,
                     to_bot_name=sender_label,
-                    to_node=cur_src,
-                    direction='inbound',
-                    thought=peer_thought,
-                    trace=trace_items,
                     notify=False,
-                    source=cur_src,
+                    source=target_src,
                 )
                 self.stream_seq += 1
-                reply_msg_in_caller['seq'] = self.stream_seq
-                reply_msg_in_caller['turn_id'] = parent_turn_id
-                self._clear_bot_stream(room_id, source=cur_src)
-                self.last_completed_stream = {
-                    'seq': self.stream_seq,
-                    'turn_id': parent_turn_id or reply_msg_in_caller.get('id', ''),
-                    'bot_id': room_id,
-                    'source': cur_src,
-                    'speaker_id': target_id,
-                    'speaker_name': target_label,
-                    'text': combined_reply,
-                    'final_message_id': reply_msg_in_caller.get('id', ''),
-                    'done': True,
-                    'completed_at': time.time(),
-                }
-                await self.publish({'type': 'message', 'source': cur_src, 'message': reply_msg_in_caller, 'seq': self.stream_seq})
-            if peer_is_error:
+                err_msg_in_target['seq'] = self.stream_seq
+                await self.publish({'type': 'message', 'source': target_src, 'message': err_msg_in_target, 'seq': self.stream_seq})
+                peer_res = err_msg_in_target
+            finally:
+                if cur_sub_task:
+                    self.queued_tasks_by_bot.get(target_id, set()).discard(cur_sub_task)
+                self.pending_stickers_var.reset(sub_stks_token)
+                self.pending_sticker_var.reset(sub_stk_token)
+                self.choices_prompt_var.reset(sub_cp_token)
+                self.choices_var.reset(sub_choices_token)
+                if sub_thought_token is not None and hasattr(self, 'thought_prefix_var'):
+                    self.thought_prefix_var.reset(sub_thought_token)
+                self.stream_prefix_var.reset(sub_prefix_token)
+                self.turn_id_var.reset(sub_turn_token)
+                self.source_context.reset(src_token)
+                self.room_context.reset(room_token)
+                self.bot_context.reset(bot_token)
+                self.call_chain_var.reset(chain_token)
+                self.hop_depth.reset(depth_token)
+                self.parent_stream_room_var.reset(parent_stream_token)
+                self._reply_box_by_sig.pop(reply_box_key, None)
+                if self._reply_box_by_sig.get(cur_sig) is reply_box_list:
+                    self._reply_box_by_sig.pop(cur_sig, None)
+                replies = list(reply_box_list)
+                if not replies and isinstance(peer_res, dict) and str(peer_res.get('text') or '').strip():
+                    replies.append({
+                        'from_bot_id': target_id,
+                        'from_bot_name': target_label,
+                        'text': str(peer_res.get('text') or '').strip(),
+                    })
+
+            trace_items = list((peer_res or {}).get('trace') or [])
+            with contextlib.suppress(Exception):
+                ts_str = time.strftime('%Y-%m-%d %H:%M:%S')
+                tools_str = ', '.join(str(t.get('tool') or '') for t in trace_items if isinstance(t, dict)) if trace_items else '直接处理'
+                reply_summary = (' / '.join(r['text'] for r in replies) if replies else '（未回发消息，已在自身会话内处理）')[:200]
+                digest_line = (
+                    f"- **{ts_str}** [{cur_node_label}·{from_bot['name']} -> {target_node_label}·{target_bot['name']}] "
+                    f"指令: `{text[:120]}` | 工具: `{tools_str}` | 回发: {reply_summary}"
+                )
+                self.vault.append_work_log(digest_line)
+
+            if replies:
+                combined_reply = '\n\n'.join(str(r.get('text') or '') for r in replies if r.get('text')).strip()
+                peer_is_error = str((peer_res or {}).get('kind') or '') == 'error'
+                if depth == 0 and not should_wait and combined_reply:
+                    asyncio.create_task(
+                        self._deliver_async_peer_callback(
+                            caller_bot_id=from_id,
+                            caller_room_id=room_id,
+                            caller_src=cur_src,
+                            peer_id=target_id,
+                            peer_label=target_label,
+                            sent_text=text,
+                            peer_reply=combined_reply,
+                            is_error=peer_is_error,
+                        )
+                    )
+                if peer_is_error:
+                    return {
+                        'ok': False,
+                        'status': 'error',
+                        'delivery_state': 'delivered_but_errored',
+                        'error': combined_reply,
+                        'target_node': target_node_label,
+                        'target_source': target_src,
+                        'from_bot_id': target_id,
+                        'from_bot_name': target_label,
+                        'sent_text': text,
+                    }
                 return {
-                    'ok': False,
-                    'status': 'error',
-                    'error': combined_reply,
+                    'ok': True,
+                    'status': 'replied',
+                    'delivery_state': 'delivered_and_replied',
                     'target_node': target_node_label,
                     'target_source': target_src,
+                    'pc_sentinel_online': bool(self.is_dsh_online()) if target_src == 'pc' and hasattr(self, 'is_dsh_online') else None,
                     'from_bot_id': target_id,
                     'from_bot_name': target_label,
                     'sent_text': text,
+                    'reply': combined_reply,
+                    'replies': replies,
+                    'target_trace_count': len(trace_items),
                 }
             return {
                 'ok': True,
-                'status': 'replied',
+                'status': 'delivered_no_reply',
+                'delivery_state': 'delivered_and_processed',
                 'target_node': target_node_label,
                 'target_source': target_src,
-                'from_bot_id': target_id,
-                'from_bot_name': target_label,
+                'to_bot_id': target_id,
+                'to_bot_name': target_label,
                 'sent_text': text,
-                'reply': combined_reply,
-                'replies': replies,
                 'target_trace_count': len(trace_items),
-                '_already_emitted_turn_bubbles': bool(reply_msg_in_caller is not None),
-                '_final_emitted_msg': reply_msg_in_caller,
+                'note': f'消息已送达「{target_label}」并在其独立会话中执行完毕（对方处理了 {len(trace_items)} 步工具）。',
             }
-        return {
-            'ok': True,
-            'status': 'delivered_no_reply',
-            'target_node': target_node_label,
-            'target_source': target_src,
-            'to_bot_id': target_id,
-            'to_bot_name': target_label,
-            'sent_text': text,
-            'target_trace_count': len(trace_items),
-            'note': f'消息已送达「{target_label}」并在其专属会话中执行完毕（对方处理了 {len(trace_items)} 步工具）。',
-        }
+
+        peer_task = asyncio.create_task(_run_peer_turn())
+        if not should_wait:
+            await asyncio.sleep(0)
+            return {
+                'ok': True,
+                'status': 'dispatched_async',
+                'delivery_state': 'queued_async',
+                'target_node': target_node_label,
+                'target_source': target_src,
+                'to_bot_id': target_id,
+                'to_bot_name': target_label,
+                'sent_text': text,
+                'inbound_message_id': inbound_msg.get('id', ''),
+                'note': (
+                    f'已将任务投递至「{target_label}」独立会话并在后台启动执行；'
+                    f'对方完成后系统会唤醒你向主人转达结果，你现在可以立即以自己的身份回复主人继续聊天！'
+                ),
+            }
+        return await asyncio.shield(peer_task)
+
+    async def _deliver_async_peer_callback(
+        self,
+        caller_bot_id: str,
+        caller_room_id: str,
+        caller_src: str,
+        peer_id: str,
+        peer_label: str,
+        sent_text: str,
+        peer_reply: str,
+        is_error: bool = False,
+    ) -> None:
+        """
+        Deliver an async background delegation completion strictly via the Caller Bot's own voice & room,
+        NEVER injecting the Peer Bot's bubble or CoT into the Caller Bot's conversation!
+        """
+        src = normalize_node_source(caller_src)
+        async with self._get_bot_lock(caller_bot_id, src):
+            caller_bot = get_assistant(self.store, caller_bot_id, source=src)
+            cb_turn_id = 'turn-' + secrets.token_hex(6)
+            b_tok = self.bot_context.set(caller_bot_id)
+            r_tok = self.room_context.set(caller_room_id)
+            s_tok = self.source_context.set(src)
+            t_tok = self.turn_id_var.set(cb_turn_id)
+            p_tok = self.stream_prefix_var.set('')
+            th_tok = self.thought_prefix_var.set('') if hasattr(self, 'thought_prefix_var') else None
+            cb_trace = [{
+                'tool': 'send_message_callback',
+                'arguments': {'from_bot_id': peer_id, 'from_bot_name': peer_label, 'task': sent_text[:160]},
+                'result': {'ok': not is_error, 'reply': peer_reply[:600]},
+                'duration_ms': 1,
+                'status': 'error' if is_error else 'done',
+            }]
+            my_exec = {'bot_id': caller_room_id, 'source': src, 'goal': f'汇总「{peer_label}」后台任务结果', 'trace': cb_trace, 'tool': f'收到「{peer_label}」回执', 'started_at': time.time()}
+            self.executions_by_node_bot[f'{src}:{caller_room_id}'] = my_exec
+            try:
+                api_key = self.store.config.effective_api_key(big=False) or self.store.config.effective_api_key(big=True)
+                model = self.store.config.effective_model(bot_model=caller_bot.get('model', ''), big=False) or self.store.config.effective_model(bot_model=caller_bot.get('model', ''), big=True)
+                report_text = ''
+                caller_thought_out = ''
+                if api_key and model:
+                    await self._set_stream(
+                        text=f'正在汇总「{peer_label}」后台完成结果…',
+                        tool=f'收到「{peer_label}」回执',
+                        speaker_id=caller_bot_id,
+                        speaker_name=caller_bot['name'],
+                        thought=None,
+                    )
+                    sys_p = (
+                        '【角色设定与最高响应准则】\n' + self.persona(caller_bot_id) + '\n\n'
+                        '【后台协作回执转达规则】：你此前派发给同事 Bot 的异步后台任务刚刚完成。请严格站在你自己的身份与口吻下，把完成结果简明自然地汇报给主人；严禁冒充同事 Bot 的名字自称。'
+                    )
+                    cb_prompt = (
+                        f'【系统后台协作回执 · 来自「{peer_label}」】\n'
+                        f'- 原派发指令：{sent_text[:400]}\n'
+                        f'- 对方执行状态：{"报错" if is_error else "已完成"}\n'
+                        f'- 对方回传结果：\n{peer_reply[:3000]}\n\n'
+                        f'请直接以「{caller_bot["name"]}」自己的身份向主人汇报这项后台任务的完成结果。'
+                    )
+                    with contextlib.suppress(Exception):
+                        resp = await self.complete(
+                            [{'role': 'system', 'content': sys_p}, {'role': 'user', 'content': cb_prompt}],
+                            tools=None,
+                            big=False,
+                        )
+                        raw_c = self._clean_and_filter_dot_text(resp.get('content') or '')
+                        clean_c, _ = self._extract_reply_piece(raw_c)
+                        clean_c, _, tag_th, _ = self._extract_all_tags(clean_c or raw_c)
+                        report_text = self._clean_and_filter_dot_text(clean_c)
+                        caller_thought_out = str(resp.get('thought') or resp.get('reasoning_content') or tag_th or '').strip()
+                if not report_text:
+                    report_text = (
+                        f'主人，刚才派给「{peer_label}」的后台任务执行出错了：{peer_reply}'
+                        if is_error
+                        else f'主人，刚才派给「{peer_label}」在后台处理的任务已经完成啦，结果如下：\n\n{peer_reply}'
+                    )
+                await self.emit(
+                    report_text,
+                    'error' if is_error else 'chat',
+                    track=False,
+                    bot_id=caller_room_id,
+                    from_bot_id=caller_bot_id,
+                    from_bot_name=caller_bot['name'],
+                    from_node=src,
+                    thought=caller_thought_out,
+                    trace=cb_trace,
+                    source=src,
+                )
+            finally:
+                self._clear_bot_stream(caller_room_id, source=src)
+                with contextlib.suppress(Exception):
+                    await self.publish({'type': 'stream', 'source': src, 'bot_id': caller_room_id, 'turn_id': cb_turn_id, 'stream': None, 'seq': self.stream_seq})
+                    await self.publish({'type': 'execution', 'source': src, 'bot_id': caller_room_id, 'execution': None, 'seq': self.stream_seq})
+                if th_tok is not None and hasattr(self, 'thought_prefix_var'):
+                    self.thought_prefix_var.reset(th_tok)
+                self.stream_prefix_var.reset(p_tok)
+                self.turn_id_var.reset(t_tok)
+                self.source_context.reset(s_tok)
+                self.room_context.reset(r_tok)
+                self.bot_context.reset(b_tok)

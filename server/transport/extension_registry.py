@@ -26,10 +26,25 @@ class ExtensionRegistry:
         self.sticker_packs: Dict[str, Dict[str, Any]] = {}
         self._plugins_dir: Path | None = None
 
+    @staticmethod
+    def _safe_openai_tool_name(raw_name: str) -> str:
+        import hashlib
+        import re
+        s = (raw_name or '').strip()
+        if re.fullmatch(r'[a-zA-Z0-9_-]{1,64}', s):
+            return s
+        ascii_part = re.sub(r'[^a-zA-Z0-9_-]', '', s)[:32].strip('_-')
+        digest = hashlib.md5(s.encode('utf-8')).hexdigest()[:8]
+        return f'custom_{ascii_part}_{digest}' if ascii_part else f'custom_tool_{digest}'
+
     def register_tool(self, plugin: ToolPlugin) -> None:
         name = getattr(plugin, 'name', '').strip()
         if name:
-            self.tool_plugins[name] = plugin
+            safe_name = self._safe_openai_tool_name(name)
+            self.tool_plugins[safe_name] = plugin
+            if safe_name != name:
+                setattr(plugin, '_display_name', name)
+                setattr(plugin, 'name', safe_name)
 
     def register_search(self, plugin: SearchPlugin) -> None:
         name = getattr(plugin, 'name', '').strip()
@@ -103,19 +118,28 @@ class ExtensionRegistry:
 
     def tool_schemas(self) -> List[Dict[str, Any]]:
         schemas: List[Dict[str, Any]] = []
-        for name, plugin in self.tool_plugins.items():
+        seen_names: set[str] = set()
+        for name, plugin in list(self.tool_plugins.items()):
+            safe_name = self._safe_openai_tool_name(name)
+            if safe_name in seen_names:
+                continue
+            seen_names.add(safe_name)
+            disp = getattr(plugin, '_display_name', '')
+            desc = getattr(plugin, 'description', f'Plugin tool {name}')
+            if disp and disp not in desc:
+                desc = f'[{disp}] {desc}'
             schemas.append({
                 'type': 'function',
                 'function': {
-                    'name': name,
-                    'description': getattr(plugin, 'description', f'Plugin tool {name}'),
+                    'name': safe_name,
+                    'description': desc,
                     'parameters': getattr(plugin, 'parameters', {'type': 'object', 'properties': {}}),
                 },
             })
         return schemas
 
     async def execute_tool(self, name: str, args: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
-        plugin = self.tool_plugins.get(name)
+        plugin = self.tool_plugins.get(name) or self.tool_plugins.get(self._safe_openai_tool_name(name))
         if not plugin:
             return {'error': f'Unknown tool plugin: {name}'}
         return await plugin.execute(args, context)

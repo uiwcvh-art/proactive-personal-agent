@@ -36,27 +36,14 @@ final class DisplayInputHelper {
     static final int SHELL_UID = 2000;
 
     // DisplayManager.VIRTUAL_DISPLAY_FLAG_* (including hidden constants)
-    private static final int FLAG_PUBLIC = 1 << 0;
-    private static final int FLAG_OWN_CONTENT_ONLY = 1 << 3;
-    private static final int FLAG_SUPPORTS_TOUCH = 1 << 6;
-    private static final int FLAG_ROTATES_WITH_CONTENT = 1 << 7;
-    private static final int FLAG_DESTROY_CONTENT_ON_REMOVAL = 1 << 8;
-    private static final int FLAG_TRUSTED = 1 << 10;
-    private static final int FLAG_OWN_DISPLAY_GROUP = 1 << 11;
-    private static final int FLAG_ALWAYS_UNLOCKED = 1 << 12;
-    private static final int FLAG_TOUCH_FEEDBACK_DISABLED = 1 << 13;
-    private static final int FLAG_OWN_FOCUS = 1 << 14;
-    private static final int FLAG_STEAL_TOP_FOCUS_DISABLED = 1 << 16;
-
-    static final int INJECT_MODE_ASYNC = 0;
-    static final int INJECT_MODE_WAIT_FOR_RESULT = 1;
-    static final int VIRTUAL_KEYBOARD = -1;
-    static final int USER_CURRENT = -2;
-
+    private static final int FLAG_PUBLIC = 1 << 0, FLAG_SECURE = 1 << 2, FLAG_OWN_CONTENT_ONLY = 1 << 3;
+    private static final int FLAG_SUPPORTS_TOUCH = 1 << 6, FLAG_ROTATES_WITH_CONTENT = 1 << 7, FLAG_DESTROY_CONTENT_ON_REMOVAL = 1 << 8;
+    private static final int FLAG_TRUSTED = 1 << 10, FLAG_OWN_DISPLAY_GROUP = 1 << 11, FLAG_ALWAYS_UNLOCKED = 1 << 12;
+    private static final int FLAG_TOUCH_FEEDBACK_DISABLED = 1 << 13, FLAG_OWN_FOCUS = 1 << 14, FLAG_STEAL_TOP_FOCUS_DISABLED = 1 << 16;
+    static final int INJECT_MODE_ASYNC = 0, INJECT_MODE_WAIT_FOR_RESULT = 1, VIRTUAL_KEYBOARD = -1, USER_CURRENT = -2;
     // Cached reflection handles for zero-overhead touch injection & keep-awake
     private static Object sInputManager;
-    private static Method sInjectInputEventMethod;
-    private static Method sSetDisplayIdMethod;
+    private static Method sInjectInputEventMethod, sSetDisplayIdMethod;
     static Object sPowerManager;
     static Method sUserActivityMethod;
 
@@ -91,10 +78,18 @@ final class DisplayInputHelper {
     private DisplayInputHelper() {}
 
     static int displayFlags(int sdk, boolean trusted, boolean ownDisplayGroup) {
+        return displayFlags(sdk, trusted, ownDisplayGroup, true);
+    }
+
+    static int displayFlags(int sdk, boolean trusted, boolean ownDisplayGroup, boolean secure) {
         // Strictly omit FLAG_ROTATES_WITH_CONTENT (1 << 7) so DisplayContent never computes
         // a square/landscape mOverrideDisplayInfo (largest app 1552x1552) that causes first-frame oversized fonts.
+        // Include FLAG_SECURE (1 << 2) by default so Alipay/WeChat payment/verification windows can render on VirtualDisplay.
         int flags = FLAG_PUBLIC | FLAG_OWN_CONTENT_ONLY | FLAG_SUPPORTS_TOUCH
             | FLAG_DESTROY_CONTENT_ON_REMOVAL;
+        if (secure) {
+            flags |= FLAG_SECURE;
+        }
         if (sdk >= Build.VERSION_CODES.TIRAMISU) {
             flags |= FLAG_TOUCH_FEEDBACK_DISABLED;
             if (trusted) {
@@ -130,17 +125,42 @@ final class DisplayInputHelper {
                 if (realMetrics.densityDpi >= 120 && realMetrics.densityDpi <= 800) {
                     realDpi = realMetrics.densityDpi;
                 }
+                try {
+                    Display.Mode mode = mainDisp.getMode();
+                    if (mode != null && mode.getPhysicalWidth() >= 720 && mode.getPhysicalHeight() >= 720) {
+                        rw = mode.getPhysicalWidth();
+                        rh = mode.getPhysicalHeight();
+                    }
+                } catch (Throwable ignored) {}
+            }
+        } catch (Throwable ignored) {}
+        try {
+            Object wm = Class.forName("android.view.WindowManagerGlobal").getMethod("getWindowManagerService").invoke(null);
+            if (wm != null) {
+                Point initialSize = new Point();
+                wm.getClass().getMethod("getInitialDisplaySize", int.class, Point.class).invoke(wm, Display.DEFAULT_DISPLAY, initialSize);
+                if (initialSize.x >= 720 && initialSize.y >= 720) {
+                    rw = initialSize.x;
+                    rh = initialSize.y;
+                }
+                int baseDpi = (Integer) wm.getClass().getMethod("getInitialDisplayDensity", int.class).invoke(wm, Display.DEFAULT_DISPLAY);
+                if (baseDpi >= 120 && baseDpi <= 800) {
+                    realDpi = baseDpi;
+                }
             }
         } catch (Throwable ignored) {}
 
         int shortSide = Math.min(rw, rh);
         int longSide = Math.max(rw, rh);
 
-        // Lock VirtualDisplay geometry to 720x1584 @ 320dpi (swDp = 360dp, XHDPI 2.0x density bucket)
-        // matching Display 0's portrait aspect ratio and 360dp layout width while keeping ImageReader lightweight.
-        int targetW = 720;
-        int targetH = roundTo16(720f * ((float) longSide / (float) shortSide), 1280, 1920);
-        int targetDpi = 320;
+        // Lock VirtualDisplay geometry & DPI 1:1 with Display 0's physical portrait dimensions and densityDpi!
+        // In Android AOSP (ActivityRecord.ensureActivityConfiguration), moving a Task between Display 0 and
+        // VirtualDisplay via moveRootTaskToDisplay triggers a full Activity Relaunch (restarting Alipay/WeChat)
+        // if densityDpi, screenWidthDp, or smallestScreenWidthDp differs. Matching Display 0 1:1 guarantees
+        // 100% lossless zero-relaunch task migration (promote / pull_back) AND native font scaling.
+        int targetW = shortSide;
+        int targetH = longSide;
+        int targetDpi = realDpi;
 
         int targetPreviewShort;
         if ("compact".equals(tier) || "small".equals(tier) || "mini".equals(tier)) {
@@ -194,6 +214,9 @@ final class DisplayInputHelper {
 
     static void ensureAwakeAndUnlocked(int displayId) {
         pokeDisplayAwake(displayId);
+        // Never inject KEYCODE_WAKEUP onto Display 0 or dismiss Display 0's keyguard;
+        // VirtualDisplay uses FLAG_ALWAYS_UNLOCKED so waking only targets displayId (> 0).
+        if (displayId <= 0) return;
         boolean interactive = true;
         try {
             if (sPowerManager != null) {
@@ -202,16 +225,7 @@ final class DisplayInputHelper {
         } catch (Throwable ignored) {}
         if (!interactive) {
             try {
-                injectKey(0, KeyEvent.KEYCODE_WAKEUP);
-            } catch (Throwable ignored) {}
-            try {
-                Object wm = Class.forName("android.view.WindowManagerGlobal").getMethod("getWindowManagerService").invoke(null);
-                for (Method m : wm.getClass().getMethods()) {
-                    if (m.getName().equals("dismissKeyguard") && m.getParameterTypes().length == 2) {
-                        m.invoke(wm, null, null);
-                        break;
-                    }
-                }
+                injectKey(displayId, KeyEvent.KEYCODE_WAKEUP);
             } catch (Throwable ignored) {}
         }
     }
@@ -382,67 +396,237 @@ final class DisplayInputHelper {
         return "";
     }
 
-    static List<?> queryTasksOnDisplay(Object atm, int targetDisplayId) {
+    private static List<?> unwrapTaskList(Object raw) {
+        if (raw == null) return java.util.Collections.emptyList();
+        if (raw instanceof List<?>) return (List<?>) raw;
         try {
-            Method getTasks4 = null, getTasks3 = null;
-            for (Method m : atm.getClass().getMethods()) {
-                if (m.getName().equals("getTasks")) {
-                    if (m.getParameterTypes().length == 4) getTasks4 = m;
-                    else if (m.getParameterTypes().length == 3) getTasks3 = m;
-                }
-            }
-            if (getTasks4 != null) {
-                return (List<?>) getTasks4.invoke(atm, 50, false, false, targetDisplayId);
-            } else if (getTasks3 != null) {
-                return (List<?>) getTasks3.invoke(atm, 50, false, false);
-            }
+            Object list = raw.getClass().getMethod("getList").invoke(raw);
+            if (list instanceof List<?>) return (List<?>) list;
         } catch (Throwable ignored) {}
         return java.util.Collections.emptyList();
     }
 
-    static void invokeMoveRootTaskToDisplay(Object atm, int taskId, int targetDisplayId, boolean onTop) {
-        if (taskId <= 0) return;
+    static List<?> queryTasksOnDisplay(Object atm, int targetDisplayId) {
+        if (atm == null) return java.util.Collections.emptyList();
+        Method getTasks4 = null, getTasks3 = null, getTasks1 = null;
         try {
             for (Method m : atm.getClass().getMethods()) {
-                String n = m.getName();
-                if ((n.equals("moveRootTaskToDisplay") || n.equals("moveStackToDisplay")) && m.getParameterTypes().length == 3) {
-                    m.invoke(atm, taskId, targetDisplayId, onTop);
-                    return;
+                if (m.getName().equals("getTasks")) {
+                    int n = m.getParameterTypes().length;
+                    if (n == 4) getTasks4 = m;
+                    else if (n == 3) getTasks3 = m;
+                    else if (n == 1) getTasks1 = m;
+                }
+            }
+        } catch (Throwable ignored) {}
+        if (getTasks4 != null) {
+            try {
+                List<?> res = unwrapTaskList(getTasks4.invoke(atm, 50, false, false, targetDisplayId));
+                if (!res.isEmpty() || getTasks3 == null) return res;
+            } catch (Throwable ignored) {}
+        }
+        if (getTasks3 != null) {
+            try {
+                return unwrapTaskList(getTasks3.invoke(atm, 50, false, false));
+            } catch (Throwable ignored) {}
+        }
+        if (getTasks1 != null) {
+            try {
+                return unwrapTaskList(getTasks1.invoke(atm, 50));
+            } catch (Throwable ignored) {}
+        }
+        return java.util.Collections.emptyList();
+    }
+
+    static boolean isTaskOnDisplay(Object atm, int taskId, int targetDisplayId) {
+        if (atm == null || taskId <= 0) return false;
+        try {
+            Class<?> taskInfoCls = Class.forName("android.app.TaskInfo");
+            Field displayField = taskInfoCls.getField("displayId");
+            Field taskIdField = taskInfoCls.getField("taskId");
+            for (Object t : queryTasksOnDisplay(atm, targetDisplayId)) {
+                if (t == null) continue;
+                if (taskIdField.getInt(t) == taskId && displayField.getInt(t) == targetDisplayId) {
+                    return true;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
+    private static Bundle buildDisplayActivityOptions(int targetDisplayId) {
+        try {
+            ActivityOptions opts = ActivityOptions.makeBasic().setLaunchDisplayId(targetDisplayId);
+            if (targetDisplayId > 0) {
+                try {
+                    opts.getClass().getMethod("setLaunchWindowingMode", int.class).invoke(opts, 1);
+                } catch (Throwable ignored) {}
+            }
+            return opts.toBundle();
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    static boolean isHomeOrLauncherPackage(String pkg) {
+        if (pkg == null) return true;
+        String low = pkg.trim().toLowerCase();
+        return low.isEmpty() || low.contains("launcher") || low.contains("home") || "com.android.systemui".equals(low) || "android".equals(low);
+    }
+
+    static int extractRootTaskId(Object taskInfo, Field taskIdField) {
+        if (taskInfo == null) return -1;
+        try {
+            Field rootField = taskInfo.getClass().getField("rootTaskId");
+            int rtid = rootField.getInt(taskInfo);
+            if (rtid > 0) return rtid;
+        } catch (Throwable ignored) {}
+        try {
+            return taskIdField.getInt(taskInfo);
+        } catch (Throwable ignored) {
+            return -1;
+        }
+    }
+
+    static boolean invokeRemoveTask(Object atm, int taskId) {
+        if (taskId <= 0) return false;
+        if (atm != null) {
+            try {
+                for (Method m : atm.getClass().getMethods()) {
+                    if (m.getName().equals("removeTask") && m.getParameterTypes().length == 1) {
+                        Object r = m.invoke(atm, taskId);
+                        if (!(r instanceof Boolean) || (Boolean) r) return true;
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+        try {
+            shell("am", "stack", "remove", String.valueOf(taskId));
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    static void setDisplayRemoveModeDestroy(int displayId) {
+        if (displayId <= 0) return;
+        try {
+            Object wm = Class.forName("android.view.WindowManagerGlobal").getMethod("getWindowManagerService").invoke(null);
+            if (wm != null) {
+                for (Method m : wm.getClass().getMethods()) {
+                    if (m.getName().equals("setRemoveContentMode") && m.getParameterTypes().length == 2) {
+                        // REMOVE_MODE_DESTROY_CONTENT = 2 prevents reparenting VirtualDisplay tasks onto Display 0 on release()
+                        m.invoke(wm, displayId, 2);
+                        break;
+                    }
                 }
             }
         } catch (Throwable ignored) {}
     }
 
+    static boolean invokeMoveRootTaskToDisplay(Object atm, int taskId, int targetDisplayId, boolean onTop) {
+        if (taskId <= 0) return false;
+        if (atm != null) {
+            Method moveRoot2 = null, moveRoot3 = null, moveStack2 = null, moveStack3 = null;
+            try {
+                for (Method m : atm.getClass().getMethods()) {
+                    String n = m.getName();
+                    int len = m.getParameterTypes().length;
+                    if (n.equals("moveRootTaskToDisplay")) {
+                        if (len == 2) moveRoot2 = m;
+                        else if (len == 3) moveRoot3 = m;
+                    } else if (n.equals("moveStackToDisplay")) {
+                        if (len == 2) moveStack2 = m;
+                        else if (len == 3) moveStack3 = m;
+                    }
+                }
+            } catch (Throwable ignored) {}
+            if (moveRoot2 != null) {
+                try { moveRoot2.invoke(atm, taskId, targetDisplayId); } catch (Throwable ignored) {}
+                if (isTaskOnDisplay(atm, taskId, targetDisplayId)) return true;
+            }
+            if (moveRoot3 != null) {
+                try { moveRoot3.invoke(atm, taskId, targetDisplayId, onTop); } catch (Throwable ignored) {}
+                if (isTaskOnDisplay(atm, taskId, targetDisplayId)) return true;
+            }
+            if (moveStack2 != null) {
+                try { moveStack2.invoke(atm, taskId, targetDisplayId); } catch (Throwable ignored) {}
+                if (isTaskOnDisplay(atm, taskId, targetDisplayId)) return true;
+            }
+            if (moveStack3 != null) {
+                try { moveStack3.invoke(atm, taskId, targetDisplayId, onTop); } catch (Throwable ignored) {}
+                if (isTaskOnDisplay(atm, taskId, targetDisplayId)) return true;
+            }
+        }
+        try {
+            shell("am", "display", "move-stack", String.valueOf(taskId), String.valueOf(targetDisplayId));
+        } catch (Throwable ignored) {}
+        return atm != null && isTaskOnDisplay(atm, taskId, targetDisplayId);
+    }
+
     static void invokeMoveTaskToFront(Object atm, int taskId) {
-        if (taskId <= 0) return;
+        invokeMoveTaskToFront(atm, taskId, Display.DEFAULT_DISPLAY);
+    }
+
+    static boolean invokeMoveTaskToFront(Object atm, int taskId, int targetDisplayId) {
+        if (atm == null || taskId <= 0) return false;
+        // Never allow bringing a task to front for a VirtualDisplay if the task is still on Display 0!
+        if (targetDisplayId > 0 && !isTaskOnDisplay(atm, taskId, targetDisplayId)) {
+            return false;
+        }
+        if (targetDisplayId == Display.DEFAULT_DISPLAY) {
+            // NEVER yank Launcher / Home / SystemUI to the front of Display 0!
+            try {
+                Class<?> taskInfoCls = Class.forName("android.app.TaskInfo");
+                Field taskIdField = taskInfoCls.getField("taskId");
+                Field topField = taskInfoCls.getField("topActivity");
+                for (Object t : queryTasksOnDisplay(atm, Display.DEFAULT_DISPLAY)) {
+                    if (t == null) continue;
+                    if (taskIdField.getInt(t) == taskId) {
+                        ComponentName top = (ComponentName) topField.get(t);
+                        String topPkg = top != null ? top.getPackageName() : "";
+                        if (isHomeOrLauncherPackage(topPkg)) {
+                            return false;
+                        }
+                        break;
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+        Bundle opts = buildDisplayActivityOptions(targetDisplayId);
         try {
             for (Method m : atm.getClass().getMethods()) {
                 if (m.getName().equals("startActivityFromRecents") && m.getParameterTypes().length == 2) {
-                    m.invoke(atm, taskId, null);
-                    return;
+                    m.invoke(atm, taskId, opts);
+                    return true;
                 }
             }
         } catch (Throwable ignored) {}
         try {
             for (Method m : atm.getClass().getMethods()) {
                 if (m.getName().equals("moveTaskToFront") && m.getParameterTypes().length == 5) {
-                    m.invoke(atm, null, SHELL_PACKAGE, taskId, 0, null);
-                    return;
+                    m.invoke(atm, null, SHELL_PACKAGE, taskId, 0, opts);
+                    return true;
                 }
             }
         } catch (Throwable ignored) {}
+        return false;
     }
 
     static void guardAndContainLaunchOnDisplay(Object atm, int displayId, String targetPkg, int mainBeforeTaskId, String mainBeforePkg) {
-        if (atm == null || displayId <= 0 || "dev.bubuki.proactive".equals(targetPkg)) return;
+        if (atm == null || displayId <= 0 || targetPkg == null || targetPkg.isEmpty() || "dev.bubuki.proactive".equals(targetPkg)) return;
         try {
             Class<?> taskInfoCls = Class.forName("android.app.TaskInfo");
             Field displayField = taskInfoCls.getField("displayId");
             Field taskIdField = taskInfoCls.getField("taskId");
             Field topField = taskInfoCls.getField("topActivity");
             Field baseField = taskInfoCls.getField("baseActivity");
-            for (int check = 0; check < 2; check++) {
-                if (check > 0) Thread.sleep(55L);
+            int[] waitsMs = new int[]{0, 60, 90, 120};
+            for (int w : waitsMs) {
+                if (w > 0) Thread.sleep(w);
+                boolean movedAny = false;
+                boolean escapedTopOnMain = false;
+                int idx = 0;
                 for (Object t : queryTasksOnDisplay(atm, Display.DEFAULT_DISPLAY)) {
                     if (t == null) continue;
                     if (displayField.getInt(t) != Display.DEFAULT_DISPLAY) continue;
@@ -451,32 +635,69 @@ final class DisplayInputHelper {
                     ComponentName base = (ComponentName) baseField.get(t);
                     String topPkg = top != null ? top.getPackageName() : "";
                     String basePkg = base != null ? base.getPackageName() : "";
-                    if (tid != mainBeforeTaskId && !targetPkg.isEmpty() && (targetPkg.equals(topPkg) || targetPkg.equals(basePkg)) && !targetPkg.equals(mainBeforePkg)) {
-                        invokeMoveRootTaskToDisplay(atm, tid, displayId, true);
-                        if (mainBeforeTaskId > 0) {
-                            invokeMoveTaskToFront(atm, mainBeforeTaskId);
+                    boolean matchesTarget = targetPkg.equals(topPkg) || targetPkg.equals(basePkg);
+                    if (matchesTarget && (tid != mainBeforeTaskId || !targetPkg.equals(mainBeforePkg))) {
+                        if (idx == 0) escapedTopOnMain = true;
+                        int rootTid = extractRootTaskId(t, taskIdField);
+                        if (invokeMoveRootTaskToDisplay(atm, rootTid, displayId, true)) {
+                            if (!targetPkg.equals(topPackageOnDisplay(displayId))) {
+                                invokeMoveTaskToFront(atm, tid, displayId);
+                            }
+                            movedAny = true;
                         }
                     }
+                    idx++;
+                }
+                if (movedAny && mainBeforeTaskId > 0 && !isHomeOrLauncherPackage(mainBeforePkg) && !targetPkg.equals(mainBeforePkg)) {
+                    String nowMainTop = topPackageOnDisplay(Display.DEFAULT_DISPLAY);
+                    if (isHomeOrLauncherPackage(nowMainTop)) {
+                        invokeMoveTaskToFront(atm, mainBeforeTaskId, Display.DEFAULT_DISPLAY);
+                    }
+                }
+                if (!escapedTopOnMain && targetPkg.equals(topPackageOnDisplay(displayId))) {
                     break;
                 }
             }
         } catch (Throwable ignored) {}
     }
 
-    static String launchOnDisplay(int displayId, String component, int userId) throws Exception {
-        String[] parts = component.split("/");
-        String pkg = parts[0];
-        String cls = parts[1].startsWith(".") ? pkg + parts[1] : parts[1];
-        Object atm = null;
-        int mainBeforeTaskId = -1;
-        String mainBeforePkg = "";
+    static int[] promoteTopTaskToMainDisplay(int displayId) {
+        if (displayId <= 0) return new int[]{-1, 0};
         try {
-            atm = Class.forName("android.app.ActivityTaskManager").getMethod("getService").invoke(null);
+            Object atm = Class.forName("android.app.ActivityTaskManager").getMethod("getService").invoke(null);
+            Class<?> taskInfoCls = Class.forName("android.app.TaskInfo");
+            Field displayField = taskInfoCls.getField("displayId");
+            Field taskIdField = taskInfoCls.getField("taskId");
+            Field topField = taskInfoCls.getField("topActivity");
+            for (Object t : queryTasksOnDisplay(atm, displayId)) {
+                if (t == null) continue;
+                if (displayField.getInt(t) != displayId) continue;
+                int tid = taskIdField.getInt(t);
+                ComponentName top = (ComponentName) topField.get(t);
+                String topPkg = top != null ? top.getPackageName() : "";
+                if ("dev.bubuki.proactive".equals(topPkg)) continue;
+                boolean moved = invokeMoveRootTaskToDisplay(atm, tid, Display.DEFAULT_DISPLAY, true);
+                if (moved) {
+                    invokeMoveTaskToFront(atm, tid, Display.DEFAULT_DISPLAY);
+                    return new int[]{tid, 1};
+                }
+                return new int[]{tid, 0};
+            }
+        } catch (Throwable ignored) {}
+        return new int[]{-1, 0};
+    }
+
+    static int pullTaskFromMainToVirtualDisplay(int displayId, int preferredTaskId, String preferredPkg) {
+        if (displayId <= 0) return -1;
+        try {
+            Object atm = Class.forName("android.app.ActivityTaskManager").getMethod("getService").invoke(null);
             Class<?> taskInfoCls = Class.forName("android.app.TaskInfo");
             Field displayField = taskInfoCls.getField("displayId");
             Field taskIdField = taskInfoCls.getField("taskId");
             Field topField = taskInfoCls.getField("topActivity");
             Field baseField = taskInfoCls.getField("baseActivity");
+            boolean hasExplicitFilter = preferredTaskId > 0 || (preferredPkg != null && !preferredPkg.isEmpty());
+            int fallbackTid = -1;
             for (Object t : queryTasksOnDisplay(atm, Display.DEFAULT_DISPLAY)) {
                 if (t == null) continue;
                 if (displayField.getInt(t) != Display.DEFAULT_DISPLAY) continue;
@@ -485,49 +706,194 @@ final class DisplayInputHelper {
                 ComponentName base = (ComponentName) baseField.get(t);
                 String topPkg = top != null ? top.getPackageName() : "";
                 String basePkg = base != null ? base.getPackageName() : "";
-                if (!"dev.bubuki.proactive".equals(pkg) && (pkg.equals(topPkg) || pkg.equals(basePkg))) {
-                    invokeMoveRootTaskToDisplay(atm, tid, displayId, true);
-                } else if (mainBeforeTaskId < 0) {
-                    mainBeforeTaskId = tid;
-                    mainBeforePkg = topPkg;
+                if ("dev.bubuki.proactive".equals(topPkg) || topPkg.contains("launcher") || topPkg.contains("home") || "com.android.systemui".equals(topPkg)) {
+                    continue;
+                }
+                if (preferredTaskId > 0 && tid == preferredTaskId) {
+                    if (invokeMoveRootTaskToDisplay(atm, tid, displayId, true)) {
+                        invokeMoveTaskToFront(atm, tid, displayId);
+                        return tid;
+                    }
+                    return -1;
+                }
+                if (preferredPkg != null && !preferredPkg.isEmpty() && (preferredPkg.equals(topPkg) || preferredPkg.equals(basePkg))) {
+                    if (invokeMoveRootTaskToDisplay(atm, tid, displayId, true)) {
+                        invokeMoveTaskToFront(atm, tid, displayId);
+                        return tid;
+                    }
+                    return -1;
+                }
+                if (!hasExplicitFilter && fallbackTid < 0) {
+                    fallbackTid = tid;
+                }
+            }
+            if (!hasExplicitFilter && fallbackTid > 0) {
+                if (invokeMoveRootTaskToDisplay(atm, fallbackTid, displayId, true)) {
+                    invokeMoveTaskToFront(atm, fallbackTid, displayId);
+                    return fallbackTid;
                 }
             }
         } catch (Throwable ignored) {}
+        return -1;
+    }
 
-        setFullscreenWindowingMode(displayId);
-        Intent intent = new Intent(Intent.ACTION_MAIN)
-            .setComponent(new ComponentName(pkg, cls))
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        if ("dev.bubuki.proactive".equals(pkg)) {
-            intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP);
-        } else {
-            intent.addCategory(Intent.CATEGORY_LAUNCHER);
-        }
-        ActivityOptions actOpts = ActivityOptions.makeBasic().setLaunchDisplayId(displayId);
+    private static String resolveEnabledLauncherComponent(String pkg, int userId) {
         try {
-            actOpts.getClass().getMethod("setLaunchWindowingMode", int.class).invoke(actOpts, 1);
-        } catch (Throwable ignored) {}
-        Bundle options = actOpts.toBundle();
-        try {
-            if (atm != null) {
-                for (Method m : atm.getClass().getMethods()) {
-                    if (m.getName().equals("startActivityAsUser") && m.getParameterTypes().length == 12) {
-                        int res = (Integer) m.invoke(
-                            atm, null, SHELL_PACKAGE, null, intent, null, null, null,
-                            0, 0, null, options, userId == 0 ? USER_CURRENT : userId
-                        );
-                        if (res >= 0) {
-                            guardAndContainLaunchOnDisplay(atm, displayId, pkg, mainBeforeTaskId, mainBeforePkg);
-                            return "startActivityAsUser ok (" + res + ")";
-                        }
-                        break;
+            String resolved = shell(
+                "cmd", "package", "resolve-activity", "--brief",
+                "--user", String.valueOf(userId),
+                "-a", "android.intent.action.MAIN",
+                "-c", "android.intent.category.LAUNCHER",
+                pkg
+            );
+            if (resolved != null) {
+                for (String line : resolved.split("\\r?\\n")) {
+                    String s = line.trim();
+                    if (s.contains("/") && !s.startsWith("priority=") && !s.contains(" ")) {
+                        return s;
                     }
                 }
             }
         } catch (Throwable ignored) {}
-        String output = shell("am", "start", "--display", String.valueOf(displayId), "--user", String.valueOf(userId), "-f", "0x18008000", "-n", component);
+        return "";
+    }
+
+    static String launchOnDisplay(int displayId, String component, int userId) throws Exception {
+        if (displayId <= 0) {
+            throw new Exception("拒绝在主屏 (displayId=" + displayId + ") 启动虚拟屏应用");
+        }
+        String[] parts = component.split("/");
+        String pkg = parts[0];
+        Object atm = null;
+        int mainBeforeTaskId = -1;
+        String mainBeforePkg = "";
+        int existingMainTaskId = -1;
+        int existingMainRootTaskId = -1;
+        int existingVirtualTaskId = -1;
+
+        setFullscreenWindowingMode(displayId);
+
+        try {
+            atm = Class.forName("android.app.ActivityTaskManager").getMethod("getService").invoke(null);
+            Class<?> taskInfoCls = Class.forName("android.app.TaskInfo");
+            Field displayField = taskInfoCls.getField("displayId");
+            Field taskIdField = taskInfoCls.getField("taskId");
+            Field topField = taskInfoCls.getField("topActivity");
+            Field baseField = taskInfoCls.getField("baseActivity");
+
+            // Record Display 0's true top task BEFORE touching any tasks so we can protect Display 0
+            for (Object t : queryTasksOnDisplay(atm, Display.DEFAULT_DISPLAY)) {
+                if (t == null) continue;
+                if (displayField.getInt(t) != Display.DEFAULT_DISPLAY) continue;
+                int tid = taskIdField.getInt(t);
+                ComponentName top = (ComponentName) topField.get(t);
+                ComponentName base = (ComponentName) baseField.get(t);
+                String topPkg = top != null ? top.getPackageName() : "";
+                String basePkg = base != null ? base.getPackageName() : "";
+                if (mainBeforeTaskId < 0) {
+                    mainBeforeTaskId = tid;
+                    mainBeforePkg = topPkg;
+                }
+                if (!"dev.bubuki.proactive".equals(pkg) && existingMainTaskId < 0 && (pkg.equals(topPkg) || pkg.equals(basePkg))) {
+                    existingMainTaskId = tid;
+                    existingMainRootTaskId = extractRootTaskId(t, taskIdField);
+                }
+            }
+
+            if (!"dev.bubuki.proactive".equals(pkg)) {
+                for (Object vt : queryTasksOnDisplay(atm, displayId)) {
+                    if (vt == null) continue;
+                    if (displayField.getInt(vt) != displayId) continue;
+                    int vtid = taskIdField.getInt(vt);
+                    ComponentName vtop = (ComponentName) topField.get(vt);
+                    ComponentName vbase = (ComponentName) baseField.get(vt);
+                    String vtopPkg = vtop != null ? vtop.getPackageName() : "";
+                    String vbasePkg = vbase != null ? vbase.getPackageName() : "";
+                    if (pkg.equals(vtopPkg) || pkg.equals(vbasePkg)) {
+                        existingVirtualTaskId = vtid;
+                        break;
+                    }
+                }
+                if (existingVirtualTaskId > 0) {
+                    if (!pkg.equals(topPackageOnDisplay(displayId))) {
+                        invokeMoveTaskToFront(atm, existingVirtualTaskId, displayId);
+                        for (int i = 0; i < 4 && !pkg.equals(topPackageOnDisplay(displayId)); i++) {
+                            Thread.sleep(45L);
+                        }
+                    }
+                    if (pkg.equals(topPackageOnDisplay(displayId))) {
+                        return "already_on_virtual_display_brought_to_front (" + existingVirtualTaskId + ")";
+                    }
+                }
+                if (existingMainTaskId > 0) {
+                    // Never hijack an app that the user is actively viewing on physical Display 0 right now!
+                    if (existingMainTaskId == mainBeforeTaskId && pkg.equals(mainBeforePkg) && !isHomeOrLauncherPackage(mainBeforePkg)) {
+                        boolean screenInteractive = true;
+                        try {
+                            android.os.PowerManager pm = systemContext().getSystemService(android.os.PowerManager.class);
+                            if (pm != null) screenInteractive = pm.isInteractive();
+                        } catch (Throwable ignored) {}
+                        if (screenInteractive) {
+                            throw new Exception("主人当前正在主屏前台使用该应用 (" + pkg + ")，为避免抢占前台或导致主屏返回桌面，已暂停拉入虚拟屏");
+                        }
+                    }
+                    int moveTid = existingMainRootTaskId > 0 ? existingMainRootTaskId : existingMainTaskId;
+                    boolean moved = invokeMoveRootTaskToDisplay(atm, moveTid, displayId, true);
+                    if (moved || isTaskOnDisplay(atm, existingMainTaskId, displayId)) {
+                        if (!pkg.equals(topPackageOnDisplay(displayId))) {
+                            invokeMoveTaskToFront(atm, existingMainTaskId, displayId);
+                        }
+                        if (mainBeforeTaskId > 0 && mainBeforeTaskId != existingMainTaskId && !isHomeOrLauncherPackage(mainBeforePkg)) {
+                            String nowMainTop = topPackageOnDisplay(Display.DEFAULT_DISPLAY);
+                            if (isHomeOrLauncherPackage(nowMainTop)) {
+                                invokeMoveTaskToFront(atm, mainBeforeTaskId, Display.DEFAULT_DISPLAY);
+                            }
+                        }
+                        for (int i = 0; i < 4 && !pkg.equals(topPackageOnDisplay(displayId)); i++) {
+                            Thread.sleep(45L);
+                        }
+                        if (pkg.equals(topPackageOnDisplay(displayId))) {
+                            return "moved_existing_task_losslessly (" + existingMainTaskId + ")";
+                        }
+                    } else if (existingMainTaskId != mainBeforeTaskId && !pkg.equals(mainBeforePkg)) {
+                        // Critical fix for singleTask apps (WeChat/Alipay): if a background task remains on Display 0,
+                        // AOSP `am start --display <vdId>` will reuse that task on Display 0 and pop it to foreground!
+                        // Remove the idle background task record first so `am start` creates a task strictly on `displayId`.
+                        invokeRemoveTask(atm, moveTid);
+                        Thread.sleep(40L);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            if (e.getMessage() != null && e.getMessage().contains("主人当前正在主屏前台使用")) {
+                throw e;
+            }
+        } catch (Throwable ignored) {}
+
+        String flagsHex = "dev.bubuki.proactive".equals(pkg) ? "0x14000000" : "0x10200000";
+        String output = shell(
+            "am", "start", "--display", String.valueOf(displayId), "--windowingMode", "1",
+            "--user", String.valueOf(userId), "-f", flagsHex, "-n", component
+        );
+        if (output.contains("Error") || output.contains("Exception") || output.contains("does not exist") || output.contains("Permission Denial") || output.contains("Unknown option")) {
+            if (output.contains("Unknown option")) {
+                output = shell(
+                    "am", "start", "--display", String.valueOf(displayId),
+                    "--user", String.valueOf(userId), "-f", flagsHex, "-n", component
+                );
+            }
+            if (output.contains("Error") || output.contains("Exception") || output.contains("does not exist") || output.contains("Permission Denial")) {
+                String altComp = resolveEnabledLauncherComponent(pkg, userId);
+                if (!altComp.isEmpty() && !altComp.equals(component)) {
+                    output = shell(
+                        "am", "start", "--display", String.valueOf(displayId),
+                        "--user", String.valueOf(userId), "-f", flagsHex, "-n", altComp
+                    );
+                }
+            }
+        }
         guardAndContainLaunchOnDisplay(atm, displayId, pkg, mainBeforeTaskId, mainBeforePkg);
-        if (output.contains("Error") || output.contains("Exception")) {
+        if ((output.contains("Error") || output.contains("Exception")) && !pkg.equals(topPackageOnDisplay(displayId))) {
             throw new Exception(output.substring(0, Math.min(300, output.length())));
         }
         return output;
@@ -567,44 +933,26 @@ final class DisplayInputHelper {
         } catch (Throwable ignored) {}
         if (thread == null) {
             try {
-                Constructor<?> ctor = at.getDeclaredConstructor();
-                ctor.setAccessible(true);
+                Constructor<?> ctor = at.getDeclaredConstructor(); ctor.setAccessible(true);
                 thread = ctor.newInstance();
-                Field sCur = at.getDeclaredField("sCurrentActivityThread");
-                sCur.setAccessible(true);
-                sCur.set(null, thread);
-                Field mSys = at.getDeclaredField("mSystemThread");
-                mSys.setAccessible(true);
-                mSys.setBoolean(thread, true);
+                Field sCur = at.getDeclaredField("sCurrentActivityThread"); sCur.setAccessible(true); sCur.set(null, thread);
+                Field mSys = at.getDeclaredField("mSystemThread"); mSys.setAccessible(true); mSys.setBoolean(thread, true);
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                     try {
-                        Class<?> cc = Class.forName("android.app.ConfigurationController");
-                        Class<?> internal = Class.forName("android.app.ActivityThreadInternal");
-                        Constructor<?> ccCtor = cc.getDeclaredConstructor(internal);
-                        ccCtor.setAccessible(true);
-                        Object controller = ccCtor.newInstance(thread);
-                        Field mCc = at.getDeclaredField("mConfigurationController");
-                        mCc.setAccessible(true);
-                        mCc.set(thread, controller);
+                        Class<?> cc = Class.forName("android.app.ConfigurationController"), internal = Class.forName("android.app.ActivityThreadInternal");
+                        Constructor<?> ccCtor = cc.getDeclaredConstructor(internal); ccCtor.setAccessible(true);
+                        Field mCc = at.getDeclaredField("mConfigurationController"); mCc.setAccessible(true); mCc.set(thread, ccCtor.newInstance(thread));
                     } catch (Throwable ignored) {}
                 }
                 try {
                     Class<?> abd = Class.forName("android.app.ActivityThread$AppBindData");
-                    Constructor<?> abdCtor = abd.getDeclaredConstructor();
-                    abdCtor.setAccessible(true);
+                    Constructor<?> abdCtor = abd.getDeclaredConstructor(); abdCtor.setAccessible(true);
                     Object data = abdCtor.newInstance();
-                    ApplicationInfo ai = new ApplicationInfo();
-                    ai.packageName = SHELL_PACKAGE;
-                    Field appInfoField = abd.getDeclaredField("appInfo");
-                    appInfoField.setAccessible(true);
-                    appInfoField.set(data, ai);
-                    Field boundField = at.getDeclaredField("mBoundApplication");
-                    boundField.setAccessible(true);
-                    boundField.set(thread, data);
+                    ApplicationInfo ai = new ApplicationInfo(); ai.packageName = SHELL_PACKAGE;
+                    Field appInfoField = abd.getDeclaredField("appInfo"); appInfoField.setAccessible(true); appInfoField.set(data, ai);
+                    Field boundField = at.getDeclaredField("mBoundApplication"); boundField.setAccessible(true); boundField.set(thread, data);
                 } catch (Throwable ignored) {}
-            } catch (Throwable fallback) {
-                thread = at.getMethod("systemMain").invoke(null);
-            }
+            } catch (Throwable fallback) { thread = at.getMethod("systemMain").invoke(null); }
         }
         Context sys = (Context) at.getDeclaredMethod("getSystemContext").invoke(thread);
         try {
@@ -620,33 +968,18 @@ final class DisplayInputHelper {
 
     static void drawAiGridOverlay(Bitmap bmp) {
         if (bmp == null) return;
-        int w = bmp.getWidth();
-        int h = bmp.getHeight();
+        int w = bmp.getWidth(), h = bmp.getHeight(), cols = 6, rows = 10;
         Canvas c = new Canvas(bmp);
-        Paint linePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        linePaint.setColor(0x5500E5FF);
-        linePaint.setStrokeWidth(1f);
-        Paint bgPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        bgPaint.setColor(0x77000000);
-        Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        textPaint.setColor(0xDDFFFFFF);
-        textPaint.setTextSize(Math.max(10f, w / 42f));
-        int cols = 6;
-        int rows = 10;
-        for (int col = 1; col < cols; col++) {
-            float x = w * col / (float) cols;
-            c.drawLine(x, 0, x, h, linePaint);
-        }
-        for (int row = 1; row < rows; row++) {
-            float y = h * row / (float) rows;
-            c.drawLine(0, y, w, y, linePaint);
-        }
+        Paint linePaint = new Paint(Paint.ANTI_ALIAS_FLAG); linePaint.setColor(0x5500E5FF); linePaint.setStrokeWidth(1f);
+        Paint bgPaint = new Paint(Paint.ANTI_ALIAS_FLAG); bgPaint.setColor(0x77000000);
+        Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG); textPaint.setColor(0xDDFFFFFF); textPaint.setTextSize(Math.max(10f, w / 42f));
+        for (int col = 1; col < cols; col++) { float x = w * col / (float) cols; c.drawLine(x, 0, x, h, linePaint); }
+        for (int row = 1; row < rows; row++) { float y = h * row / (float) rows; c.drawLine(0, y, w, y, linePaint); }
         String[] letters = {"A", "B", "C", "D", "E", "F"};
         for (int r = 0; r < rows; r++) {
             for (int col = 0; col < cols; col++) {
                 String label = letters[col] + (r + 1);
-                float cx = w * (col + 0.08f) / cols;
-                float cy = h * (r + 0.22f) / rows;
+                float cx = w * (col + 0.08f) / cols, cy = h * (r + 0.22f) / rows;
                 c.drawRect(cx - 2f, cy - textPaint.getTextSize(), cx + textPaint.measureText(label) + 2f, cy + 3f, bgPaint);
                 c.drawText(label, cx, cy, textPaint);
             }

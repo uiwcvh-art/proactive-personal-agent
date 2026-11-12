@@ -4,6 +4,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import os
+import re
 import threading
 
 try:
@@ -40,59 +41,60 @@ def atomic_write(path: Path, text: str):
                 pass
 
 SELF_ARCH_SKILL_MD = (
-    '# 🏛️ DeepSeek Bridge (DSB / DS-Claw) 自身系统与多端记忆架构说明书\n'
-    '当主人询问「你的记忆是怎么整理的 / 为什么没整理 / 你的架构是什么 / 怎么跨端通信 / 手机和电脑端怎么配合」时，以此文档为唯一权威事实依据。\n\n'
-    '## 一、四节点多端对称与云上记忆中枢（`Windows一/二` + `安卓一/二` + `云电脑`）\n'
-    '1. **云端统一大脑与记忆中枢**：\n'
-    '   - 你的主控服务端（Brain + MemoryEngine + Vault）运行在云端宿主机（`/opt/proactive-agent/server`），真实持久化数据目录为 `/opt/proactive-agent/data/`。\n'
-    '   - 所有记忆库（`memory_vault/`）、状态（`state.json`）与工具路由都在云端统一维护。\n'
-    '2. **四节点独立会话与单端独立开关（`node_overrides`）**：\n'
-    '   - 系统支持 4 个客户端节点：`Windows一` (`source="pc"`)、`Windows二` (`source="pc2"`)、`安卓一` (`source="phone"`)、`安卓二` (`source="phone2"`)。\n'
-    '   - 所有节点共用 4 位常驻 Bot：`主理人` (`companion`)、`研究助手` (`research`)、`杠精` (`contrarian`)、`鲸鱼娘` (`whalechan`)。\n'
-    '   - **全局设定 vs 单端独立开关**：Bot 的名字、角色设定 (`instructions`)、模型 (`model`)、工具集 (`tools`) 为全端统一；而「好奇心主动搭话 (`curiosity_enabled`)」与「通知提醒 (`notify`)」按节点存储在 `node_overrides` 中（例如手机 `安卓一` 开启好奇心、平板 `安卓二` 关闭好奇心，互不干扰）。\n'
-    '3. **极简跨端/跨 Bot 协同规则（`send_message` 与 `dsh_workspace`）**：\n'
-    '   - 发给同端同事：`send_message(to_bot_id="研究助手", text="...")`。\n'
-    '   - 发给跨端指定 Bot：`send_message(to_bot_id="Windows一:白珂", text="...")` 或 `send_message(to_bot_id="安卓一:白珂", text="...")`。\n'
-    '   - 电脑端 `Windows一` 本机桌面与窗口应用操控：在电脑端会话中可直接调用 `dsh_workspace(op="cua_desktop", action="list_windows"|"get_window_state"|"activate_window"|"click"|"type_text"|"press_key"|"scroll", window_id=..., include_screenshot=true)` 操控 QQ/浏览器等 Windows 桌面软件，或调用 `run_bash` (`pc_shell`) 与 `dsh_workspace(op="dispatch_session")`。\n'
-    '   - **单向调用、自动回传**：主叫方调用 `send_message` 后，系统自动唤醒目标 Bot 执行任务并直接把目标 Bot 的正文回复带回主叫方会话（展示为「➔ 发给 ...」与「... · 协作汇报」），主叫方本轮立即完成；被叫方收到「📩 来自 ...」后只需直接用自然语言正文回答（**被叫方禁止再次调用 `send_message` 回传**，以免产生重复消息）。\n'
-    '4. **手机端 (`phone_workspace`) 真实路径与验证码/扫码规范**：\n'
-    '   - `phone_workspace(op="push_file", path="...")` 将云端文件推入手机的真实路径为 `/sdcard/Download/DeepSeek Claw/`，并自动触发系统 MediaScanner 刷新媒体库，在手机 QQ/微信扫码页点击「相册」即可直接选中刚推送的二维码图片。\n'
-    '   - 读取手机短信验证码时，优先调用 `phone_workspace(op="notifications", action="list")` 查看通知收件箱，或调用 `phone_workspace(op="open", target="信息")` 打开系统短信 App 查看画面，严禁依赖无权限的 `content query --uri content://sms`。\n\n'
-    '## 二、三层记忆金库（`memory_vault/`）与路径访问铁律\n'
-    '1. **三层记忆结构**：\n'
-    '   - **第 1 层 · 核心置顶与画像层（`profile/` & `INDEX.md`）**：\n'
-    '     - `memory_vault/INDEX.md`：记忆库全量双链总目录。\n'
-    '     - `memory_vault/profile/pinned_memories.md`：最高优先级的置顶核心记忆与关键事务最终定论，可通过 `memory_pin(action="pin"|"unpin"|"list")` 管理。\n'
-    '     - `memory_vault/profile/personal_impression.md` & `memory_vault/profile/user_traits.md`：主人立体个人印象档案与核心偏好日志。\n'
-    '   - **第 2 层 · 原子笔记与待办层（`notes/`、`tasks/`、`playbooks/`）**：\n'
-    '     - `memory_vault/notes/*.md`：Zettelkasten 原子事实笔记（如订阅台账、接口配置、专项结论）。\n'
-    '     - `memory_vault/tasks/active_deadlines.md` & `sniffed_opportunities.md`：死线与待办。\n'
-    '   - **第 3 层 · 按需技能与时间线流水层（`skills/`、`timeline/`、`logs/`）**：\n'
-    '     - `memory_vault/skills/INDEX.md` & `memory_vault/skills/*.md`：零额外 Token 按需加载的技能书（含本篇 `self_architecture.md`）。\n'
-    '     - `memory_vault/timeline/YYYY-MM-DD.md` & `work_log.md`：每日完整对话流水与跨端一句话协同日志。\n'
-    '2. **为什么在 `run_bash` 或 `cloud_desktop` 里直接 `find .` 看不到宿主机的 `memory_vault/`？**\n'
-    '   - `run_bash` 运行在受限的沙箱工作区（`/opt/proactive-agent/data/workspace`），`cloud_desktop` 运行在独立的 Linux 桌面容器中；出于安全隔离设计，宿主机目录 `/opt/proactive-agent/data/memory_vault/` **不会直接暴露为云电脑容器 `/workspace` 下的普通子文件夹**。\n'
-    '   - **正确访问方式**：读写记忆库必须直接调用服务端原生工具 `read_file("memory_vault/...")`、`write_file("memory_vault/...")`、`edit_file("memory_vault/...")`、`memory_search(query="...")`、`memory_pin(...)` 或 `custom_tool(action="open_skill", name="...")`！\n\n'
-    '## 三、双轨记忆整理与 Prefix KV Cache 100% 保护机制\n'
-    '1. **机制一：闲时隐藏整理（`sleep_time_consolidate`）**\n'
-    '   - 当主人聊完停顿闲置后，后台引擎会自动静默运行 `sleep_time_consolidate`（全程隐藏，不打扰聊天流、不发多余通知），自动提取已完成操作、新偏好与个人印象更新写入 `memory_vault/`。\n'
-    '2. **机制二：尾部增量注入（“放最底下” · Tail Memory Delta）**\n'
-    '   - 会话开头的 `messages[0]`（System Prompt）在会话期间严格保持冻结，以确保 200K 上下文窗口内 100% 命中上游 LLM 的 Prefix KV Cache。\n'
-    '   - 每当记忆库或跨端拓扑发生变更时，系统自动生成 `[System Memory Delta / 最新记忆同步]` 追加并锚定在当前对话历史尾部，后续轮次依然 100% 命中 KV Cache。\n'
+    '# 🏛️ DeepSeek Bridge (DSB / DS-Claw) 自身系统、多端分治与事件黑板架构说明书 (v4.0)\n'
+    '当主人询问「你的架构是什么 / 多端怎么协同 / 黑板怎么用 / 闹钟和看门狗在哪 / 记忆怎么整理 / 云电脑是什么」时，以此文档为唯一权威事实依据。\n\n'
+    '## 一、三域物理拓扑与分端独立 Bot 花名册（`手机端` + `Windows 电脑端` + `共享云电脑`）\n'
+    '1. **云端统一中枢（`vps-jp` · `/opt/proactive-agent`）**：\n'
+    '   - 核心大脑（`Brain` + `BlackboardEngine` + `MemoryEngine` + `Vault`）常驻云端 `/opt/proactive-agent/server`，持久化目录为 `/opt/proactive-agent/data/`。\n'
+    '   - 记忆金库（`memory_vault/`）、事件黑板（`blackboard`）、多端消息与归档检索库（SQLite FTS5）均在云端统一维护。\n'
+    '2. **不同端采用不同名字的专属常驻 Bot（`home_node: "phone" | "pc"`）+ 档案一键导入导出**：\n'
+    '   - **手机端（`source="phone" / "phone2"`）**：常驻手机专属助理团（如主助理/白珂 `companion`、研究助手 `research`、杠精 `contrarian`、鲸鱼娘 `whalechan`），专职掌控手机虚拟屏 `phone_workspace` 与共享云电脑 `cloud_desktop`。\n'
+    '   - **电脑端（`source="pc" / "pc2"`）**：常驻电脑专属助理团（默认：总工程师「司工」`pc_engineer`、深度调研「探微」`pc_research`、红队审校「审校」`pc_reviewer`、桌面伴侣「云汐」`pc_companion`），专职掌控 Windows 本机 `dsh_workspace`（含 `cua_desktop`、Git Bash `pc_shell`、DSH 原生会话 `dispatch_session`）**以及直接操控共享云电脑 `cloud_desktop`**！\n'
+    '   - **为什么分端不同名？** 全局名字唯一，在黑板上 `@司工`、`@白珂`、`@探微`、`@杠精` 零歧义直达对应端的专属 Bot，再也不会发生跨端同名混淆。\n'
+    '   - **快速导出与导入档案（`.dsb-bot.json`）**：支持通过 `/api/bots/{bot_id}/export` 与 `/api/bots/import`（或工作坊面板按钮）一键导出/恢复任意 Bot 的人设、外观、历史对话、置顶记忆与关联笔记，换 Bot 或重置后可秒级无损回归。\n'
+    '3. **全天候共享 Linux 云电脑（`cloud_desktop` · 手机端与电脑端均可直接操控！）**：\n'
+    '   - 运行在独立隔离的 `proactive-desktop.service`（1 vCPU · 1GB RAM + 2GB Swap · 10GB SSD，X11 `:91` + Chromium CDP `@b1..@bN` + Tmux 持久终端 + `~/workspace`）。\n'
+    '   - **电脑端和手机端都拥有 `cloud_desktop` 直接控制权**：适合挂机长任务、隔离环境测试、Linux 编译抓取与跨端文件暂存（云电脑桌面自带 `~/workspace/ARCHITECTURE.md` 自述档案）。\n\n'
+    '## 二、彻底废除点对点 `send_message` 乱象 —— 全面改用事件驱动「共享黑板 (`blackboard`)」+ `peek_bots`\n'
+    '1. **为什么废除互相发消息（`send_message`）？**\n'
+    '   - 旧式点对点同步发消息会导致长耗时工具阻塞、循环互回与上下文污染。现已全面退役，统一由 **`blackboard`（事件黑板）** 与 **`peek_bots`（只读窥视镜）** 承担多 Bot 调度。\n'
+    '2. **事件黑板（`blackboard`）六大核心能力**：\n'
+    '   - **毫秒级发帖与 `@唤醒`（`<50ms` 瞬时返回，绝不阻塞当前工具轮）**：\n'
+    '     调用 `blackboard(action="post", content="...", mentions=["@司工"])` 或 `@everyone` / `@self`。工具在毫秒内立即返回 `{ok: true, post_id}`，后台异步用极简提示词（*“有人在黑板 @ 了你，请自己扫黑板处理”*）唤醒被点名的 Bot 自主读板干活。\n'
+    '   - **插话抢占指导（`steer=True`）**：\n'
+    '     当主人发出第二轮新指导，或你在黑板发帖带 `steer=True` 给正在忙的 Bot / DSH 会话时，系统直接打断其第一轮旧操作（保留已完成步骤轨迹），像真人插话一样带着第二轮新指导立即继续！电脑端 `dsh_workspace(op="dispatch_session")` 默认秒回（`wait=False`），若目标会话正忙则自动以 `mode="steer"` 插话打断续跑。\n'
+    '   - **看板认领防撞单（`action="claim"`）**：\n'
+    '     面对 `@everyone` 悬赏帖，空闲 Bot 调用 `blackboard(action="claim", post_id="...")` 原子认领（带 15 分钟租约超时自动释放），绝不重复劳动。\n'
+    '   - **产物交接棒（`artifact_path` + `next_action`）**：\n'
+    '     长代码、数据与报告写进工作区文件，黑板帖直接挂载 `artifact_path="workspace/..."` 与 `next_action="..."` 干净交棒。\n'
+    '   - **按需双盲验收门禁（`review_by` —— 仅在主人或任务明确要求时启用）**：\n'
+    '     平时普通任务直接结项；仅当明确要求审查验收时传入 `review_by="@审校"`（或 `@杠精`），提交 `action="complete"` 后自动流转 `review_required` 并唤醒审校员执行 `action="review", verdict="approved"|"rejected"`。\n'
+    '   - **闹钟、定时提醒与零 Token 事件看门狗合一**：\n'
+    '     黑板原生支持定时与执行动作：传 `at_time="07:30"` / `delay_minutes=15` / `daily_time="08:00"` 配合 `exec_action="wake_bot" | "ring_alarm" | "notify_user"`（默认 `@self` 到点自动叫醒自己或拉响手机闹钟）；支持挂载零 Token 探针 `watch={"kind": "file_exists"|"cmd_exit"|"cmd_contains"|"http_status", "target": "..."}`，后台用纯 Python 轮询（等待期消耗 **0 LLM Token**），条件满足瞬间贴上证据并 `@` 唤醒目标 Bot！\n'
+    '3. **跨端进度只读窥视镜（`peek_bots`）**：\n'
+    '   - 想快速知道其他端/其他 Bot 干到哪了？直接调用 `peek_bots(target="all" | "<Bot名>", limit=5)`，毫秒级只读获取各 Bot 所在端（`phone`/`pc`）、实时状态（`idle`/`running`）、当前执行工具、流式输出片段、最新消息与名下黑板任务，无需发消息打扰对方。\n\n'
+    '## 三、原生 Agent 工具历史格式、98%~99% 缓存命中与满 100K 分段式局部压缩\n'
+    '1. **100% 还原原生 Agent 训练分布（`assistant.tool_calls` + `role: "tool"`）**：\n'
+    '   - 历史消息不再压扁成伪造的文字旁白，而是严格按大模型原生 Agent 训练格式保留真实的 `assistant(tool_calls)` 与 `role: "tool"` 结果序列（跨轮次自动剥离旧 `reasoning_content`，同轮内完整保留思维链），彻底消除工具调用格式漂移与输出报错。\n'
+    '2. **Append-Only 前缀缓存（98%~99% 命中）+ 满 100K「告一段落」分段局部压缩**：\n'
+    '   - 对话总上下文 **小于 `100K` Tokens 时绝不触发自动压缩**，全程纯追加（Append-Only），配合尾部 `[System Memory Delta]` 保持 98%~99% Prefix KV Cache 高命中率。\n'
+    '   - 当上下文 **达到或超过 `100K` Tokens** 时，触发**分段式局部压缩**：绝不一刀切清空全部对话，而是自动识别前序「已告一段落」的旧话题边界，仅将前半段已完结事项浓缩为结构化归档摘要（原文同步存入 `memory_vault/notes/` 与 SQLite FTS5 供 `conversation_search` 随时召回），原地替换旧片段，完整保留近期正在推进的 30K~40K 原生对话与工具上下文！\n'
+    '3. **三层记忆金库（`memory_vault/`）访问铁律**：\n'
+    '   - 读写记忆必须使用原生工具 `read_file("memory_vault/...")`、`write_file`、`edit_file`、`memory_search`、`memory_pin`；闲置时由后台 `sleep_time_consolidate` 静默整理沉淀。\n'
 )
 
 SKILLS_INDEX_MD = (
     '# 🛠️ 按需技能库索引 (Skills Index)\n\n'
     '> 日常对话不预载技能正文以节省 Token；需要时请直接调用 `read_file("memory_vault/skills/<name>.md")` 或 `custom_tool(action="open_skill", name="<name>")`。\n\n'
     '## 📌 置顶必读核心技能\n'
-    '- **[[skills/self_architecture]]** (`memory_vault/skills/self_architecture.md`)：**白珂自身系统与记忆架构说明书**（双端对称与云上记忆中枢、三层 `memory_vault/` 真实路径与为什么不能用 bash find、3分钟闲时隐藏整理 `sleep_time_consolidate`、以及保护 200K Prefix KV Cache 的「放最底下」尾部增量记忆同步机制）。当主人问起你的架构、记忆怎么整理、为什么没整理或记忆路径时，必须先读此文件！\n'
+    '- **[[skills/self_architecture]]** (`memory_vault/skills/self_architecture.md`)：**DSB v4.0 自身系统、分端专属 Bot、事件黑板 (`blackboard`) 与满 100K 局部压缩架构说明书**（涵盖：手机/电脑分端独立花名册与 `.dsb-bot.json` 快速导入导出、`@mention` 事件黑板与闹钟/零Token看门狗合一、`peek_bots` 跨Bot进度窥视、双端直控 `cloud_desktop` 云电脑、原生 `tool_calls` 历史格式及 `<100K` 免压缩 / `>=100K` 告一段落局部压缩）。当主人问起架构、多端协同、黑板、闹钟或记忆机制时必读！\n'
 )
 
 TEMPLATES = {
     'INDEX.md': (
         '# 共生记忆库\n\n'
         '所有记忆都可以查看、修改。只记录已知事实；猜测必须标注。\n'
-        '> 📌 **架构自省置顶索引**：[[skills/self_architecture]]（白珂自身系统与双轨记忆整理架构说明）｜[[skills/INDEX]]（技能库目录）｜[[profile/pinned_memories]]（核心钉住记忆）\n\n'
+        '> 📌 **架构自省置顶索引**：[[skills/self_architecture]]（自身系统与双轨记忆整理架构说明）｜[[skills/INDEX]]（技能库目录）｜[[profile/pinned_memories]]（核心钉住记忆）\n\n'
     ),
     'skills/INDEX.md': SKILLS_INDEX_MD,
     'skills/self_architecture.md': SELF_ARCH_SKILL_MD,
@@ -141,7 +143,6 @@ class Vault:
             if not self.path(path).exists() or path in ('skills/self_architecture.md', 'skills/INDEX.md'):
                 self.write(path, text)
         self.prune_storage()
-        self.log('记忆库就绪。')
         self.reindex()
 
     def path(self, name: str) -> Path:
@@ -160,17 +161,26 @@ class Vault:
 
     def files(self):
         with self.lock:
+            excluded_dirs = {'.history', '.trash', '_trash'}
             subdirs = [self.root] + sorted(
                 p for p in self.root.iterdir()
-                if p.is_dir() and not p.is_symlink() and p.name != '.history'
+                if p.is_dir() and not p.is_symlink() and p.name not in excluded_dirs and not p.name.startswith('.')
             )
             dir_sig = tuple((d.name, d.stat().st_mtime_ns) for d in subdirs)
             if self._files_cache and self._files_cache[0] == dir_sig:
                 return list(self._files_cache[1])
-            items = [{'path': p.relative_to(self.root).as_posix(), 'bytes': p.stat().st_size,
-                      'modified': p.stat().st_mtime} for p in sorted(self.root.rglob('*.md'))
-                     if not p.is_symlink() and p.resolve().is_relative_to(self.root)
-                     and '.history' not in p.relative_to(self.root).parts]
+            items = []
+            for p in sorted(self.root.rglob('*.md')):
+                if p.is_symlink() or not p.resolve().is_relative_to(self.root):
+                    continue
+                rel_parts = p.relative_to(self.root).parts
+                if any(part in excluded_dirs or part.startswith('.') or (part != rel_parts[-1] and part.startswith('_')) for part in rel_parts):
+                    continue
+                items.append({
+                    'path': p.relative_to(self.root).as_posix(),
+                    'bytes': p.stat().st_size,
+                    'modified': p.stat().st_mtime,
+                })
             self._files_cache = (dir_sig, items)
             return list(items)
 
@@ -356,6 +366,14 @@ class Vault:
                 txt = self.read(rel)
             except Exception:
                 continue
+            head_low = '\n'.join(txt.splitlines()[:12]).lower()
+            if 'index: false' in head_low:
+                stem_low = Path(rel).stem.lower()
+                if not (
+                    any(kw in q for kw in ('worldbook', '世界书', 'asmr', stem_low))
+                    or any(t in stem_low for t in terms if len(t) >= 3)
+                ):
+                    continue
             low = txt.lower()
             score = sum(3 if t in low else 0 for t in terms)
             if q in low:
@@ -384,7 +402,14 @@ class Vault:
                         snap_saved = self._save_snapshot(rel_name, old_text, new_text=text)
                 except Exception:
                     pass
-            if old_text != text and rel_name not in ('INDEX.md', 'skills/INDEX.md', 'timeline/work_log.md') and not rel_name.startswith(('timeline/', 'logs/', 'config/', '.history/')):
+            head_new = '\n'.join(text.splitlines()[:12]).lower()
+            is_unindexed = 'index: false' in head_new
+            if (
+                old_text != text
+                and not is_unindexed
+                and rel_name not in ('INDEX.md', 'skills/INDEX.md', 'timeline/work_log.md')
+                and not rel_name.startswith(('timeline/', 'logs/', 'config/', '.history/', '.trash/', '_trash/'))
+            ):
                 changed_core = True
             atomic_write(p, text)
             st = p.stat()
@@ -412,11 +437,17 @@ class Vault:
                     combined = ('\n'.join(headers).strip() + '\n\n' if headers else '# 手机通知收敛日志\n\n') + '\n'.join(items[-300:]) + '\n'
             self.write(name, combined)
 
-    def log(self, text):
+    def log(self, text, bot_id: str | None = None):
         today = datetime.now(TZ).strftime('%Y-%m-%d')
-        path = f'timeline/{today}.md'
-        if not self.path(path).exists():
-            self.write(path, f'# {today}\n')
+        safe_bot = re.sub(r'[^a-zA-Z0-9_-]', '', str(bot_id or '').strip())
+        if safe_bot:
+            path = f'timeline/bots/{safe_bot}/{today}.md'
+            if not self.path(path).exists():
+                self.write(path, f'---\nindex: false\n---\n# {today} ({safe_bot})\n')
+        else:
+            path = f'timeline/{today}.md'
+            if not self.path(path).exists():
+                self.write(path, f'# {today}\n')
         self.append(path, f'- {now_iso()} {text}')
 
     def append_work_log(self, summary: str) -> str:
@@ -453,8 +484,34 @@ class Vault:
             cap = max(1, min(100, int(limit or 25)))
             return items[-cap:]
 
+    def _should_exclude_from_index(self, rel_path: str) -> bool:
+        parts = Path(rel_path).parts
+        if any(part in ('.history', '.trash', '_trash') or part.startswith('.') or part.startswith('_') for part in parts):
+            return True
+        if rel_path == 'work-log.md' and (self.root / 'timeline' / 'work_log.md').exists():
+            return True
+        try:
+            head_txt = '\n'.join(self.read(rel_path).splitlines()[:12])
+            if 'index: false' in head_txt.lower():
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _prune_empty_parents(self, start_dir: Path) -> None:
+        cur = start_dir
+        while cur != self.root and cur.is_relative_to(self.root):
+            try:
+                if cur.exists() and cur.is_dir() and not any(cur.iterdir()):
+                    cur.rmdir()
+                    cur = cur.parent
+                else:
+                    break
+            except Exception:
+                break
+
     def reindex(self):
-        all_files = self.files()
+        all_files = [f for f in self.files() if not self._should_exclude_from_index(f['path'])]
         skill_entries = [
             f'- [[{f["path"][:-3]}]] (`memory_vault/{f["path"]}`)'
             for f in all_files
@@ -469,3 +526,87 @@ class Vault:
         other_links = [f'- [[{f["path"][:-3]}]]' for f in all_files if f['path'] != 'INDEX.md' and f['path'] not in priority_paths]
         links = '\n'.join(top_links + other_links)
         self.write('INDEX.md', TEMPLATES['INDEX.md'] + links + '\n')
+
+    def purge_history_backups(self, rel_name: str) -> list[str]:
+        clean = str(rel_name or '').removeprefix('memory_vault/').lstrip('/')
+        safe_rel = clean.replace('/', '__')
+        hist_root = self.root / '.history'
+        removed: list[str] = []
+        if not hist_root.exists():
+            return removed
+        for pattern in (f'{safe_rel}.*.md', f'*{safe_rel}*.md'):
+            for f in sorted(hist_root.glob(pattern)):
+                if f.is_file() and not f.is_symlink():
+                    try:
+                        f.unlink()
+                        removed.append(f.name)
+                    except Exception:
+                        pass
+        return removed
+
+    def delete(self, name: str, purge: bool = True) -> dict:
+        clean = str(name or '').removeprefix('memory_vault/').lstrip('/')
+        if clean in ('INDEX.md', 'skills/INDEX.md', 'skills/self_architecture.md', 'profile/personal_impression.md', 'profile/user_traits.md'):
+            raise ValueError(f'受保护的核心记忆库文件禁止删除: {clean}')
+        with self.lock:
+            p = self.path(clean)
+            rel_name = clean
+            snap_saved = None
+            purged_backups: list[str] = []
+            if p.exists() and p.is_file():
+                rel_name = p.relative_to(self.root).as_posix()
+                old_text = p.read_text(encoding='utf-8', errors='replace')
+                if not purge:
+                    snap_saved = self._save_snapshot(rel_name, old_text, new_text='')
+                parent_dir = p.parent
+                p.unlink()
+                self._prune_empty_parents(parent_dir)
+            elif purge:
+                purged_backups = self.purge_history_backups(rel_name)
+                if not purged_backups:
+                    raise ValueError(f'要删除的记忆库文件不存在: memory_vault/{clean}')
+            else:
+                raise ValueError(f'要删除的记忆库文件不存在: memory_vault/{clean}')
+            if purge:
+                purged_backups.extend(x for x in self.purge_history_backups(rel_name) if x not in purged_backups)
+            self._read_cache.pop(rel_name, None)
+            self._files_cache = None
+            self.reindex()
+        return {
+            'ok': True,
+            'deleted': f'memory_vault/{rel_name}',
+            'resolved_path': f'memory_vault/{rel_name}',
+            'purged': bool(purge),
+            'purged_history_backups': purged_backups,
+            'previous_backup': snap_saved,
+        }
+
+    def move(self, src: str, dst: str) -> dict:
+        clean_src = str(src or '').removeprefix('memory_vault/').lstrip('/')
+        clean_dst = str(dst or '').removeprefix('memory_vault/').lstrip('/')
+        if clean_src == clean_dst:
+            return {'ok': False, 'error': f'源路径与目标路径相同 (memory_vault/{clean_src})，无需移动'}
+        if clean_src in ('INDEX.md', 'skills/INDEX.md', 'skills/self_architecture.md'):
+            raise ValueError(f'受保护的核心索引文件禁止移动: {clean_src}')
+        with self.lock:
+            p_src = self.path(clean_src)
+            p_dst = self.path(clean_dst)
+            if not p_src.exists() or not p_src.is_file():
+                raise ValueError(f'源文件不存在: memory_vault/{clean_src}')
+            rel_src = p_src.relative_to(self.root).as_posix()
+            rel_dst = p_dst.relative_to(self.root).as_posix()
+            if rel_src == rel_dst:
+                return {'ok': False, 'error': f'源路径与目标路径相同 (memory_vault/{rel_src})，无需移动'}
+            content = p_src.read_text(encoding='utf-8', errors='replace')
+            self.write(rel_dst, content)
+            src_parent = p_src.parent
+            p_src.unlink()
+            self._prune_empty_parents(src_parent)
+            self._read_cache.pop(rel_src, None)
+            self._files_cache = None
+            self.reindex()
+        return {
+            'ok': True,
+            'moved_from': f'memory_vault/{rel_src}',
+            'moved_to': f'memory_vault/{rel_dst}',
+        }

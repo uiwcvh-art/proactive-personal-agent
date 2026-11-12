@@ -20,6 +20,7 @@ from typing import Any
 
 class ContextSearchEngine:
     OFFLOAD_THRESHOLD_CHARS = 4_800
+    UI_WORKSPACE_OFFLOAD_THRESHOLD_CHARS = 16_000
     CHUNK_SIZE_CHARS = 1_200
     MAX_TRANSIENT_TOOL_CONTEXTS = 50
     TRANSIENT_TOOL_TTL_SECONDS = 48 * 3600
@@ -239,28 +240,19 @@ class ContextSearchEngine:
         bot_filter = (bot_id or 'all').strip()
         excl = exclude_msg_ids or set()
         scored: dict[str, tuple[float, dict]] = {}
+        if not terms:
+            return {
+                'ok': False,
+                'query': query,
+                'bot_id': bot_filter,
+                'count': 0,
+                'results': [],
+                'error': '检索词 query 不能为空（请提供具体的搜索关键词）',
+            }
 
         with self._lock:
             conn = self._connect()
             try:
-                if not terms:
-                    sql = 'SELECT * FROM messages_store'
-                    params: list[Any] = []
-                    if bot_filter and bot_filter != 'all':
-                        sql += ' WHERE bot_id = ?'
-                        params.append(bot_filter)
-                    sql += ' ORDER BY created_at DESC LIMIT ?'
-                    params.append(limit * 3)
-                    rows = [
-                        r for r in conn.execute(sql, params).fetchall()
-                        if str(r['msg_id']) not in excl or str(r['kind']) == 'compact_summary'
-                    ][:limit]
-                    return {
-                        'query': query,
-                        'bot_id': bot_filter,
-                        'count': len(rows),
-                        'results': [self._format_msg_row(r) for r in rows],
-                    }
 
                 # 1. FTS5 search if available
                 if self._fts5_available:
@@ -377,19 +369,22 @@ class ContextSearchEngine:
         start_line = 1
         chunk_idx = 0
 
-        for idx, ln in enumerate(lines, start=1):
-            cur_lines.append(ln)
-            cur_len += len(ln) + 1
-            if cur_len >= self.CHUNK_SIZE_CHARS:
-                header = f'{tool_name} lines {start_line}-{idx}'
-                chunks.append((chunk_idx, header, '\n'.join(cur_lines)))
-                chunk_idx += 1
-                cur_lines = []
-                cur_len = 0
-                start_line = idx + 1
+        for idx, raw_ln in enumerate(lines, start=1):
+            # Split single ultra-long lines (e.g. 100KB JSON dumps) into <= CHUNK_SIZE_CHARS segments (P1-12 / B-1)
+            segments = [raw_ln[i:i + self.CHUNK_SIZE_CHARS] for i in range(0, max(1, len(raw_ln)), self.CHUNK_SIZE_CHARS)]
+            for seg in segments:
+                cur_lines.append(seg)
+                cur_len += len(seg) + 1
+                if cur_len >= self.CHUNK_SIZE_CHARS:
+                    header = f'{tool_name} lines {start_line}-{idx}'
+                    chunks.append((chunk_idx, header, '\n'.join(cur_lines)[:self.CHUNK_SIZE_CHARS + 200]))
+                    chunk_idx += 1
+                    cur_lines = []
+                    cur_len = 0
+                    start_line = idx + 1
         if cur_lines or not chunks:
             header = f'{tool_name} lines {start_line}-{len(lines)}'
-            chunks.append((chunk_idx, header, '\n'.join(cur_lines) if cur_lines else full_text[:self.CHUNK_SIZE_CHARS]))
+            chunks.append((chunk_idx, header, ('\n'.join(cur_lines) if cur_lines else full_text)[:self.CHUNK_SIZE_CHARS + 200]))
 
         with self._lock:
             conn = self._connect()
@@ -442,15 +437,29 @@ class ContextSearchEngine:
     def maybe_offload_tool_output(self, tool_name: str, args: dict, result: Any, bot_id: str = 'companion', turn_id: str = '', **kwargs) -> str:
         """
         Implements mksglu/context-mode offloading:
-        If a tool result serialized to JSON/text exceeds OFFLOAD_THRESHOLD_CHARS (12,000 chars),
-        stores the full verbatim output into SQLite FTS5 and returns a high-density digest + `ctx_id` as a JSON string.
-        Always returns a `str` so OpenAI-compatible `role: "tool"` messages never fail schema validation!
+        Strips any raw base64 screenshot payloads (`_image_b64`, `_multimodal_b64`, `image`) BEFORE serialization
+        so 100KB+ images NEVER pollute `role="tool"` JSON or `ctx-*` FTS5 chunks (fixes 17-1 / 18-4).
         """
+        if isinstance(result, dict):
+            stripped_chars = 0
+            for img_k in ('_image_b64', '_multimodal_b64', 'image'):
+                val = result.get(img_k)
+                if isinstance(val, str) and len(val) > 256:
+                    stripped_chars = max(stripped_chars, len(val))
+                    result.pop(img_k, None)
+            if stripped_chars > 0:
+                result['_image_attached'] = True
+                result['_image_chars_stripped'] = stripped_chars
         try:
             serialized = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
         except Exception:
             serialized = str(result)
-        if tool_name in ('conversation_search', 'ctx_search') or len(serialized) <= self.OFFLOAD_THRESHOLD_CHARS:
+        threshold = (
+            self.UI_WORKSPACE_OFFLOAD_THRESHOLD_CHARS
+            if tool_name in ('phone_workspace', 'cloud_desktop', 'dsh_workspace', 'phone_macro')
+            else self.OFFLOAD_THRESHOLD_CHARS
+        )
+        if tool_name in ('conversation_search', 'ctx_search', 'stay_silent') or len(serialized) <= threshold:
             return serialized
 
         ctx_id = self.store_tool_context(tool_name, args, serialized, bot_id=bot_id)
@@ -474,25 +483,50 @@ class ContextSearchEngine:
         }
         return json.dumps(digest, ensure_ascii=False)
 
-    def ctx_search(self, query: str, ctx_id: str = '', limit: int = 8) -> dict:
+    def ctx_search(self, query: str, ctx_id: str = '', limit: int = 8, bot_id: str = '') -> dict:
         terms = self._extract_query_terms(query)
         limit = max(1, min(20, int(limit or 8)))
         cid = (ctx_id or '').strip()
+        b_filter = (bot_id or '').strip()
+        if b_filter == 'all':
+            b_filter = ''
         scored: dict[tuple[str, int], tuple[float, dict]] = {}
 
         with self._lock:
             conn = self._connect()
             try:
+                if cid:
+                    exists_row = conn.execute('SELECT 1 FROM tool_contexts WHERE ctx_id = ? LIMIT 1', (cid,)).fetchone()
+                    if not exists_row:
+                        exists_chunk = conn.execute('SELECT 1 FROM tool_chunks WHERE ctx_id = ? LIMIT 1', (cid,)).fetchone()
+                        if not exists_chunk:
+                            return {
+                                'ok': False,
+                                'query': query,
+                                'ctx_id': cid,
+                                'count': 0,
+                                'chunks': [],
+                                'error': f'未找到指定的上下文块 ctx_id="{cid}"（该 ID 不存在或已被清理，请省略 ctx_id 参数全局搜索）',
+                            }
                 if not terms:
-                    sql = 'SELECT * FROM tool_chunks'
-                    params: list[Any] = []
-                    if cid:
-                        sql += ' WHERE ctx_id = ?'
-                        params.append(cid)
-                    sql += ' ORDER BY created_at DESC, chunk_idx ASC LIMIT ?'
-                    params.append(limit)
-                    rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
-                    return {'query': query, 'ctx_id': cid, 'count': len(rows), 'chunks': rows}
+                    if not cid:
+                        return {
+                            'ok': False,
+                            'query': query,
+                            'ctx_id': 'all',
+                            'count': 0,
+                            'chunks': [],
+                            'error': '检索词 query 不能为空（请提供具体的搜索关键词或指定 ctx_id）',
+                        }
+                    sql = 'SELECT * FROM tool_chunks WHERE ctx_id = ? ORDER BY created_at DESC, chunk_idx ASC LIMIT ?'
+                    params: list[Any] = [cid, limit]
+                    rows = []
+                    for r in conn.execute(sql, params).fetchall():
+                        rd = dict(r)
+                        if len(str(rd.get('content') or '')) > 800:
+                            rd['content'] = str(rd['content'])[:800] + '...(truncated)'
+                        rows.append(rd)
+                    return {'ok': True, 'query': query, 'ctx_id': cid, 'count': len(rows), 'chunks': rows}
 
                 if self._fts5_available:
                     safe_fts = [re.sub(r'["\'()*^:\-+]', ' ', t).strip() for t in terms if re.sub(r'["\'()*^:\-+]', ' ', t).strip()]
@@ -503,12 +537,16 @@ class ContextSearchEngine:
                                 SELECT c.*, bm25(tool_chunks_fts) AS rank_score
                                 FROM tool_chunks_fts f
                                 JOIN tool_chunks c ON c.ctx_id = f.ctx_id AND c.chunk_idx = CAST(f.chunk_idx AS INTEGER)
+                                LEFT JOIN tool_contexts tc ON tc.ctx_id = c.ctx_id
                                 WHERE tool_chunks_fts MATCH ?
                             """
                             params = [fts_expr]
                             if cid:
                                 sql += ' AND c.ctx_id = ?'
                                 params.append(cid)
+                            elif b_filter:
+                                sql += ' AND (tc.bot_id = ? OR tc.bot_id IS NULL)'
+                                params.append(b_filter)
                             sql += ' ORDER BY rank_score ASC LIMIT ?'
                             params.append(limit * 2)
                             for r in conn.execute(sql, params).fetchall():
@@ -520,15 +558,18 @@ class ContextSearchEngine:
                 like_clauses = []
                 like_params: list[Any] = []
                 for t in terms[:6]:
-                    like_clauses.append('(content LIKE ? OR header LIKE ?)')
+                    like_clauses.append('(c.content LIKE ? OR c.header LIKE ?)')
                     pat = f'%{t}%'
                     like_params.extend([pat, pat])
                 where_sql = ' OR '.join(like_clauses)
-                sql = f'SELECT * FROM tool_chunks WHERE ({where_sql})'
+                sql = f'SELECT c.* FROM tool_chunks c LEFT JOIN tool_contexts tc ON tc.ctx_id = c.ctx_id WHERE ({where_sql})'
                 if cid:
-                    sql = f'SELECT * FROM tool_chunks WHERE ctx_id = ? AND ({where_sql})'
+                    sql = f'SELECT c.* FROM tool_chunks c WHERE c.ctx_id = ? AND ({where_sql})'
                     like_params = [cid] + like_params
-                sql += ' ORDER BY created_at DESC, chunk_idx ASC LIMIT ?'
+                elif b_filter:
+                    sql += ' AND (tc.bot_id = ? OR tc.bot_id IS NULL)'
+                    like_params.append(b_filter)
+                sql += ' ORDER BY c.created_at DESC, c.chunk_idx ASC LIMIT ?'
                 like_params.append(limit * 3)
                 for r in conn.execute(sql, like_params).fetchall():
                     row_d = dict(r)
@@ -544,6 +585,7 @@ class ContextSearchEngine:
 
         ranked = sorted(scored.values(), key=lambda x: x[0], reverse=True)[:limit]
         return {
+            'ok': True,
             'query': query,
             'ctx_id': cid or 'all',
             'count': len(ranked),
@@ -553,7 +595,7 @@ class ContextSearchEngine:
                     'chunk_idx': item[1]['chunk_idx'],
                     'tool_name': item[1]['tool_name'],
                     'header': item[1]['header'],
-                    'content': item[1]['content'],
+                    'content': (str(item[1]['content'])[:800] + '...(truncated)') if len(str(item[1].get('content') or '')) > 800 else item[1]['content'],
                     'score': round(item[0], 2),
                 }
                 for item in ranked
@@ -609,9 +651,10 @@ class ContextSearchEngine:
         with self._lock:
             conn = self._connect()
             try:
-                conn.execute('DELETE FROM blackboard WHERE key = ?', (k,))
+                cur = conn.execute('DELETE FROM blackboard WHERE key = ?', (k,))
                 conn.commit()
-                return {'deleted': True, 'key': k}
+                existed = int(cur.rowcount or 0) > 0
+                return {'ok': existed, 'deleted': existed, 'existed': existed, 'key': k, **({'error': f'共享黑板中未找到 key="{k}"'} if not existed else {})}
             finally:
                 conn.close()
 

@@ -28,12 +28,13 @@ class PulseAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         runCatching {
             serviceInfo?.let { info ->
-                // Subscribe to window state transitions & window changes instead of TYPES_ALL_MASK,
-                // and avoid FEEDBACK_SPOKEN / FLAG_REQUEST_ENHANCED_WEB_ACCESSIBILITY so we never
-                // trigger system-wide TalkBack/WebView accessibility overhead or high-frequency scroll/content IPC wakeups.
-                info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or AccessibilityEvent.TYPE_WINDOWS_CHANGED
+                // Include TYPE_WINDOW_CONTENT_CHANGED (throttled to 250ms) so Chromium/XWeb/Nebula WebViews
+                // in WeChat & Alipay initialize their accessibility DOM trees without TalkBack/high-frequency overhead.
+                info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
+                    AccessibilityEvent.TYPE_WINDOWS_CHANGED or
+                    AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
                 info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
-                info.notificationTimeout = 80L
+                info.notificationTimeout = 250L
                 info.flags = (info.flags or
                     AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS or
                     AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
@@ -242,11 +243,15 @@ class PulseAccessibilityService : AccessibilityService() {
                                 }
 
                                 fun traverse(node: AccessibilityNodeInfo?, depth: Int) {
-                                    if (node == null || depth > 42 || collected.size >= 110 || ++visitedNodes > 650) return
+                                    if (node == null || depth > 55 || collected.size >= 130 || ++visitedNodes > 2000) return
                                     val visible = try { node.isVisibleToUser } catch (t: Throwable) { true }
 
                                     val rawRect = Rect()
                                     try { node.getBoundsInScreen(rawRect) } catch (t: Throwable) {}
+                                    // Prune off-screen ViewPager pages (e.g. WeChat/Alipay inactive tabs) so bottom tab bars are never cut off
+                                    if (strictVisible && depth > 2 && !visible && rawRect.width() > 0 && rawRect.height() > 0 && !Rect.intersects(rawRect, screenRect)) {
+                                        return
+                                    }
                                     val rect = Rect(rawRect)
                                     val intersects = rect.intersect(screenRect) && rect.width() >= 6 && rect.height() >= 6
 
@@ -782,6 +787,9 @@ class PulseAccessibilityService : AccessibilityService() {
             val likelyBlank = snap.nodes.isEmpty() || snap.activePackage.isBlank()
             val pkgSafe = snap.activePackage.ifBlank { "unknown" }
             val layoutSig = "${snap.screenW}x${snap.screenH}_${pkgSafe}_${snap.treeHash}_n${snap.nodes.size}"
+            val realDpi = DisplayInputHelper.queryDisplayRealSize(snap.displayId)?.optInt("dpi", 0)?.takeIf { it > 0 }
+                ?: ((snap.screenW * 160) / 360).coerceIn(240, 640)
+            val realSwDp = ((snap.screenW * 160f) / realDpi).toInt().coerceAtLeast(320)
             return JSONObject()
                 .put("displayId", snap.displayId)
                 .put("package", pkgSafe)
@@ -792,8 +800,10 @@ class PulseAccessibilityService : AccessibilityService() {
                 .put("settled", settled)
                 .put("layoutStable", settled)
                 .put("settle_ms", if (fromCache) 0L else snap.settleMs)
-                .put("densityDpi", 320)
-                .put("screenWidthDp", 360)
+                .put("dpi", realDpi)
+                .put("swDp", realSwDp)
+                .put("densityDpi", realDpi)
+                .put("screenWidthDp", realSwDp)
                 .put("fontScale", 1.0)
                 .put("likely_blank", likelyBlank)
                 .put("layout_signature", layoutSig)

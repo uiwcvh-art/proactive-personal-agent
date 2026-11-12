@@ -210,10 +210,23 @@ class IntegrationHubPlugin:
             masked = {}
             for k, v in cfg_all.items():
                 if isinstance(v, dict):
-                    masked[k] = {
+                    entry = {
                         sk: ('***' + str(sv)[-4:] if any(s in sk.lower() for s in ('key', 'token', 'password', 'secret')) and len(str(sv)) > 4 else sv)
                         for sk, sv in v.items()
                     }
+                    if k == 'email':
+                        addr = str(v.get('address') or '').lower()
+                        prov = str(v.get('provider') or '').lower()
+                        is_outlook = prov == 'outlook' or any(d in addr for d in ('@outlook.', '@hotmail.', '@live.'))
+                        oauth_cli = (root / 'outlook_mail_cli.py').is_file() and (root / '.config' / 'outlook_oauth.json').is_file()
+                        if is_outlook:
+                            entry['auth_mode'] = 'oauth2_outlook_cli (ready)' if oauth_cli else 'imap_basic_auth_deprecated_by_microsoft'
+                            entry['connectivity_note'] = (
+                                '微软已禁用个人 Outlook 账号 IMAP Basic Auth；已自动桥接至工作区 outlook_mail_cli.py (OAuth2)'
+                                if oauth_cli else
+                                '微软已禁用个人 Outlook 账号 IMAP Basic Auth，请配置 OAuth2 令牌 (.config/outlook_oauth.json)'
+                            )
+                    masked[k] = entry
                 else:
                     masked[k] = 'configured'
             return {'configured': masked}
@@ -329,14 +342,29 @@ class IntegrationHubPlugin:
         if app_name in ('email', 'gmail', 'outlook', 'qq', '163', 'icloud', 'imap', 'smtp') or act.startswith('email_'):
             email_cfg = dict(cfg_all.get(app_name) or cfg_all.get('email') or {})
             email_cfg.update({k: v for k, v in params.items() if k in ('provider', 'address', 'password', 'imap_host', 'imap_port', 'smtp_host', 'smtp_port')})
+            addr_low = str(email_cfg.get('address') or '').lower()
+            prov_low = str(email_cfg.get('provider') or app_name or '').lower()
+            is_outlook = prov_low == 'outlook' or any(d in addr_low for d in ('@outlook.', '@hotmail.', '@live.'))
+            cli_script = root / 'outlook_mail_cli.py'
+            oauth_cfg = root / '.config' / 'outlook_oauth.json'
+            if is_outlook and cli_script.is_file() and oauth_cfg.is_file() and act in ('email_list', 'list', '', 'email_read', 'read', 'email_search', 'search'):
+                return await self._run_outlook_oauth_cli(cli_script, act, query, params)
             if not email_cfg.get('address') or not email_cfg.get('password'):
+                if cli_script.is_file() and oauth_cfg.is_file() and act in ('email_list', 'list', '', 'email_read', 'read', 'email_search', 'search'):
+                    return await self._run_outlook_oauth_cli(cli_script, act, query, params)
                 return {
                     'error': '邮箱凭据尚未配置。请先调用 integration_hub(op="configure", app="email", config={"provider":"gmail|outlook|qq|163", "address":"你的邮箱", "password":"应用专用密码/授权码"})。'
                 }
             if act in ('email_list', 'list', ''):
-                return await asyncio.to_thread(self._imap_list, email_cfg, params, query)
+                res_imap = await asyncio.to_thread(self._imap_list, email_cfg, params, query)
+                if isinstance(res_imap, dict) and res_imap.get('error') and cli_script.is_file() and oauth_cfg.is_file():
+                    return await self._run_outlook_oauth_cli(cli_script, act, query, params)
+                return res_imap
             if act in ('email_read', 'read'):
-                return await asyncio.to_thread(self._imap_read, email_cfg, params)
+                res_imap = await asyncio.to_thread(self._imap_read, email_cfg, params)
+                if isinstance(res_imap, dict) and res_imap.get('error') and cli_script.is_file() and oauth_cfg.is_file():
+                    return await self._run_outlook_oauth_cli(cli_script, act, query, params)
+                return res_imap
             if act in ('email_send', 'send'):
                 return await asyncio.to_thread(self._smtp_send, email_cfg, params)
 
@@ -399,6 +427,44 @@ class IntegrationHubPlugin:
                 return {'error': f'ACI 执行失败: {str(e)[:240]}'}
 
         return {'error': f'未找到对应的内置执行器或尚未配置 {app_name}/{action} 的凭据。可先调用 op="catalog" 查看支持列表。'}
+
+    async def _run_outlook_oauth_cli(self, cli_script: Path, act: str, query: str, params: dict[str, Any]) -> dict[str, Any]:
+        import sys as _sys
+        cmd = [_sys.executable, str(cli_script)]
+        limit = max(1, min(30, int(params.get('limit') or 10)))
+        if act in ('email_read', 'read'):
+            msg_id = str(params.get('id') or params.get('message_id') or query or '').strip()
+            if not msg_id:
+                return {'error': 'email_read 需要传入 params={"id": "邮件ID"}'}
+            cmd.extend(['read', msg_id])
+        elif query or params.get('query'):
+            kw = str(query or params.get('query') or '').strip()
+            cmd.extend(['search', kw, '--limit', str(limit)])
+        else:
+            cmd.extend(['list', '--limit', str(limit)])
+            if params.get('unread_only'):
+                cmd.append('--unread')
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(cli_script.parent),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=25.0)
+            out_s = out_b.decode('utf-8', errors='replace').strip()
+            err_s = err_b.decode('utf-8', errors='replace').strip()
+            if proc.returncode != 0:
+                return {'ok': False, 'auth_mode': 'oauth2_outlook_cli', 'error': (err_s or out_s or f'exit {proc.returncode}')[:500]}
+            try:
+                parsed = json.loads(out_s)
+                if isinstance(parsed, dict):
+                    return {'ok': True, 'auth_mode': 'oauth2_outlook_cli', **parsed}
+                return {'ok': True, 'auth_mode': 'oauth2_outlook_cli', 'messages': parsed}
+            except Exception:
+                return {'ok': True, 'auth_mode': 'oauth2_outlook_cli', 'output': out_s[:4000]}
+        except Exception as e:
+            return {'ok': False, 'auth_mode': 'oauth2_outlook_cli', 'error': str(e)[:300]}
 
     def _resolve_mail_hosts(self, cfg: dict[str, Any]) -> dict[str, Any]:
         addr = str(cfg.get('address') or '').strip()

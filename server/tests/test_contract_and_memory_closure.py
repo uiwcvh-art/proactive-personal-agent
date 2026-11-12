@@ -333,12 +333,14 @@ def test_task4_self_architecture_skill_and_index_registration(env):
     vault = app.state.vault
 
     arch_doc = vault.read("skills/self_architecture.md")
-    assert ("多端对称" in arch_doc or "双端对称" in arch_doc)
+    assert "分端独立 Bot 花名册" in arch_doc
     assert "dsh_workspace" in arch_doc
-    assert "send_message" in arch_doc
-    assert "/opt/proactive-agent/data/memory_vault" in arch_doc
+    assert "cloud_desktop" in arch_doc
+    assert "blackboard" in arch_doc
+    assert "peek_bots" in arch_doc
+    assert "/opt/proactive-agent/data" in arch_doc
     assert "sleep_time_consolidate" in arch_doc
-    assert "放最底下" in arch_doc
+    assert "100K" in arch_doc
 
     root_idx = vault.read("INDEX.md")
     skills_idx = vault.read("skills/INDEX.md")
@@ -358,21 +360,29 @@ def test_plain_at_mention_auto_dispatches_send_message_and_pc_retains_dsh_worksp
         },
     )
     pc_received_tools = []
+    phone_step = {"n": 0}
 
     async def mock_complete(messages, tools=None, big=False):
         cur_src = brain.source_context.get()
-        cur_depth = brain.hop_depth.get()
-        if cur_src == "pc" and cur_depth > 0:
+        cur_bot = brain.bot_context.get()
+        if cur_src == "pc" and cur_bot == "pc_engineer":
             tool_names = [t["function"]["name"] for t in (tools or [])]
             pc_received_tools.extend(tool_names)
             return {
                 "role": "assistant",
-                "content": "电脑端白珂收到！已用 dsh_workspace 检查 QQ 消息并回复。",
+                "content": "电脑端司工收到黑板提醒！已用 dsh_workspace 检查 QQ 消息并回复。",
             }
-        # Phone bot accidentally writes plain-text @Windows一:白珂 without tool_calls
+        phone_step["n"] += 1
+        if phone_step["n"] == 1:
+            return {
+                "role": "assistant",
+                "content": "@Windows一:司工 电脑端，主人让余转一句：你好，帮他看看QQ信息",
+                "tool_calls": [],
+            }
+        assert any(m.get("role") == "tool" and "post_id" in str(m.get("content", "")) for m in messages)
         return {
             "role": "assistant",
-            "content": "@Windows一:白珂 电脑端，主人让余转一句：你好，帮他看看QQ信息",
+            "content": "已经在黑板 @ 电脑端司工去检查 QQ 消息啦！",
             "tool_calls": [],
         }
 
@@ -383,9 +393,19 @@ def test_plain_at_mention_auto_dispatches_send_message_and_pc_retains_dsh_worksp
     )
     assert r.status_code == 200
     body = r.json()
-    assert "电脑端白珂收到" in body.get("text", "")
+    assert "电脑端司工" in body.get("text", "")
+    assert body.get("from_bot_id") == "companion"
+    for _ in range(30):
+        if pc_received_tools:
+            break
+        import time as _t
+        _t.sleep(0.02)
     assert "dsh_workspace" in pc_received_tools
+    assert "cloud_desktop" in pc_received_tools
+    assert "blackboard" in pc_received_tools
+    assert "peek_bots" in pc_received_tools
     assert "send_message" not in pc_received_tools
+    assert brain._is_current_bot_vision_capable() is True
 
 
 def test_action_promise_and_fake_write_interception_plus_scroll_loop_tolerance(env):
@@ -576,14 +596,14 @@ def test_phone_workspace_b64_strip_and_settle_and_vault_history_purge(env):
     assert "_multimodal_b64" not in tap_out
     assert len(json.dumps(tap_out, ensure_ascii=False)) < 3000
 
-    # 2c. Press back when first attempt doesn't change treeHash auto-retries and reports key_consumed=True (18-1)
+    # 2c. Press back fires strictly ONCE even when treeHash does not change (never multi-pops back stack!)
     rpc_step["tap_settled"] = False
     brain._last_phone_tree_hash = "com.android.launcher:same111"
     key_out = asyncio.run(brain._tool_phone_workspace({"op": "press", "key": "back"}))
-    assert rpc_step["key_calls"] == 2
-    assert key_out["key_consumed"] is True
+    assert rpc_step["key_calls"] == 1
+    assert key_out["key_consumed"] is False
     assert key_out["tree_hash_before"] == "com.android.launcher:same111"
-    assert key_out["tree_hash_after"] == "com.android.settings:changed222"
+    assert key_out["tree_hash_after"] == "com.android.launcher:same111"
 
     # 2d. maybe_offload_tool_output strips any residual _image_b64 so ctx_offloaded is never triggered by images (17-1 / 18-4)
     fake_heavy = {"ok": True, "op": "ui_tree", "ui_tree": "@e1 按钮", "_image_b64": "A" * 160000}
@@ -627,6 +647,261 @@ def test_phone_workspace_b64_strip_and_settle_and_vault_history_purge(env):
     assert isinstance(type_out.get("steps_executed"), list) and len(type_out["steps_executed"]) == 3
     assert [s["op"] for s in type_out["steps_executed"]] == ["tap", "text", "key"]
     assert type_out["treeHash"] == type_out["tree_hash"]
+
+
+def test_context_window_adjustment_and_hard_enforcement(env):
+    """
+    Verify:
+    1. Updating `auto_compact_tokens` via `POST /api/config` persists cleanly to workspace/settings.json without being overwritten by stale workspace mtimes.
+    2. When `reported_tokens` (e.g., 68000) exceeds a newly lowered `auto_compact_tokens` (e.g., 32000), `POST /api/config` triggers auto-compaction immediately without being blocked by the old 1.35x cap.
+    3. `_build_turn_messages_and_tools` enforces the hard Context Window budget on `clean_recent`.
+    """
+    app, client = env
+    store = app.state.store
+    brain = app.state.brain
+
+    # Touch workspace/bots.json with a newer mtime to simulate active workspace edits
+    bots_ws = store.workspace_dir / "bots.json"
+    if bots_ws.exists():
+        import os
+        st = bots_ws.stat()
+        os.utime(bots_ws, (st.st_atime + 5, st.st_mtime + 5))
+
+    # Add 10 messages (~1000 tokens each) and set last_prompt_tokens to 68000 (simulating tool-heavy turn)
+    for i in range(5):
+        store.message("user", f"用户长消息 {i}: " + ("测试内容" * 220), bot_id="companion", source="phone")
+        store.message("assistant", f"助手长回复 {i}: " + ("回复内容" * 220), bot_id="companion", source="phone")
+    brain.memory_engine.last_prompt_tokens["phone:companion"] = 68000
+    brain.memory_engine.last_prompt_tokens["companion"] = 68000
+
+    res = client.post("/api/config?source=phone", json={"auto_compact_tokens": 32000})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["auto_compact_tokens"] == 32000
+    assert store.config.auto_compact_tokens == 32000
+    assert "phone:companion" in body.get("compacted_bots", [])
+    assert body["context_by_bot"]["companion"]["current_tokens"] < 32000
+
+    # Verify hard context window slicing in _build_turn_messages_and_tools when window is 18800 (history budget 4000)
+    store.update_config({"auto_compact_tokens": 18800})
+    for i in range(12):
+        store.message("user", f"窗口裁剪测试 {i}: " + ("窗口受限内容" * 200), bot_id="companion", source="phone")
+        store.message("assistant", f"窗口裁剪回复 {i}: " + ("窗口受限回复" * 200), bot_id="companion", source="phone")
+    store.message("user", "最新一条用户问题", bot_id="companion", source="phone")
+    bot_obj = store.state["assistants"][0]
+    turn_msgs, _, _, _ = asyncio.run(brain._build_turn_messages_and_tools("companion", "phone", bot_obj))
+    hist_msgs = turn_msgs[1:]
+    total_hist_tok = sum(brain.memory_engine.estimate_tokens(m.get("content", "")) + 12 for m in hist_msgs)
+    assert total_hist_tok <= 4500
+    assert "最新一条用户问题" in str(hist_msgs[-1].get("content", ""))
+
+
+def test_cross_bot_reply_send_message_and_shell_error_exit_code(env):
+    """
+    Verify:
+    1. When Bot A sends a `send_message` to Bot B (e.g., `research` or `contrarian`), Bot B at `hop_depth == 1`
+       CAN call `send_message` back to Bot A without getting `此助手未启用该工具`, and its reply is delivered via `_reply_box_by_sig`.
+    2. When `phone_workspace(op="shell")` fails with an error and no `ok` field, `exit_code` is `-1` (never `0` alongside `ok: false`).
+    """
+    app, client = env
+    brain = app.state.brain
+    client.post(
+        "/api/config",
+        json={
+            "api_base_url": "https://api.openai.com/v1",
+            "api_key": "sk-test-key",
+            "default_model": "gpt-4.1-mini",
+        },
+    )
+
+    step = {"n": 0}
+    res_done = {"ok": False}
+
+    async def mock_complete(messages, tools=None, big=False):
+        cur_bot = brain.bot_context.get()
+        if cur_bot == "research":
+            res_step = sum(1 for m in messages if m.get("role") == "tool")
+            if res_step == 0:
+                return {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_bb_reply",
+                            "type": "function",
+                            "function": {
+                                "name": "blackboard",
+                                "arguments": json.dumps({"action": "complete", "post_id": "bb-1", "summary": "研究助手已在黑板正式结项回执！"}, ensure_ascii=False),
+                            },
+                        }
+                    ],
+                }
+            res_done["ok"] = True
+            return {"role": "assistant", "content": "研究助手已在黑板正式结项回执！"}
+        step["n"] += 1
+        if step["n"] == 1:
+            return {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_to_research",
+                        "type": "function",
+                        "function": {
+                            "name": "blackboard",
+                            "arguments": json.dumps({"action": "post", "mentions": ["@research"], "text": "请检查并在黑板结项回执"}, ensure_ascii=False),
+                        },
+                    }
+                ],
+            }
+        return {"role": "assistant", "content": "已在黑板派发给研究助手处理。"}
+
+    brain.complete = mock_complete
+    r = client.post("/api/chat", json={"text": "让研究助手回信", "bot_id": "companion", "source": "phone"})
+    assert r.status_code == 200
+    body = r.json()
+    assert "黑板派发给研究助手" in body.get("text", "")
+    assert body.get("from_bot_id") == "companion"
+    for _ in range(30):
+        if res_done["ok"]:
+            break
+        import time as _t
+        _t.sleep(0.02)
+    assert res_done["ok"] is True
+    comp_msgs = [m for m in app.state.store.state["messages"] if m.get("bot_id") == "companion"]
+    assert not any(m.get("kind") == "bot_reply" for m in comp_msgs)
+
+    # Verify phone_workspace(op="shell") error exit_code is -1, never 0
+    async def mock_failed_rpc(op, args, timeout=32.0):
+        return {"error": "Root 工具进程握手未完成 (daemon_handshake_timeout)"}
+
+    brain._raw_phone_rpc = mock_failed_rpc
+    sh_res = asyncio.run(brain._tool_phone_workspace({"op": "shell", "command": "id"}))
+    assert sh_res["ok"] is False
+    assert sh_res["exit_code"] == -1
+
+
+def test_dot_filter_goal_mode_and_stay_silent_tool(env):
+    app, client = env
+    brain = app.state.brain
+    client.post(
+        "/api/config",
+        json={
+            "api_base_url": "https://api.openai.com/v1",
+            "api_key": "fixture",
+            "default_model": "gpt-4.1-mini",
+        },
+    )
+
+    # 1. Single-dot and leading-dot filter
+    assert brain._clean_and_filter_dot_text(".") == ""
+    assert brain._clean_and_filter_dot_text("  。  ") == ""
+    assert brain._clean_and_filter_dot_text("...") == ""
+    assert brain._clean_and_filter_dot_text(".喵，主人好！") == "喵，主人好！"
+
+    # 2. Mid-loop unfulfilled action promise & thought-only dropout detection
+    assert brain._is_unfulfilled_action_promise(
+        "日期选择器已打开，25 号在第三行、第四列，余按坐标点它喵。",
+        user_text="查票",
+        trace=[{"tool": "phone_workspace"}],
+    ) is True
+    assert brain._is_unfulfilled_action_promise(
+        ".",
+        user_text="打开必应搜索",
+        trace=[{"tool": "phone_workspace"}],
+        thought="Let me open https://www.bing.com directly. Let me do that.",
+    ) is True
+
+    # 3. /goal help card when called with no args, and full Goal Mode loop with self-healing + complete_goal when called with args
+    r_help = client.post("/api/chat", json={"text": "/goal", "bot_id": "companion", "source": "phone"})
+    assert r_help.status_code == 200
+    assert "(`/goal`" in r_help.json().get("text", "")
+
+    step_g = {"n": 0}
+
+    async def mock_goal_complete(messages, tools=None, big=False, tool_choice=None):
+        step_g["n"] += 1
+        if step_g["n"] == 1:
+            # Simulate upstream emitting a single dot "." with thought intending to act
+            return {
+                "role": "assistant",
+                "content": ".",
+                "thought": "让我先查看状态。",
+                "tool_calls": [],
+            }
+        if step_g["n"] == 2:
+            # Self-healed retry executes system_status
+            return {
+                "role": "assistant",
+                "content": ".余先检查一下系统状态喵。",
+                "tool_calls": [
+                    {
+                        "id": "call_goal_st",
+                        "type": "function",
+                        "function": {"name": "system_status", "arguments": "{}"},
+                    }
+                ],
+            }
+        if step_g["n"] == 3:
+            # Explicit complete_goal invocation required by persistent Goal Mode engine
+            return {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_goal_done",
+                        "type": "function",
+                        "function": {
+                            "name": "complete_goal",
+                            "arguments": json.dumps(
+                                {"summary": "系统通道一切正常", "verified_evidence": "system_status=ok"},
+                                ensure_ascii=False,
+                            ),
+                        },
+                    }
+                ],
+            }
+        return {
+            "role": "assistant",
+            "content": ".喵，目标已全部完成并核验无误，系统通道一切正常！",
+            "tool_calls": [],
+        }
+
+    brain.complete = mock_goal_complete
+    r_goal = client.post("/api/chat", json={"text": "/goal 检查系统状态并汇总汇报", "bot_id": "companion", "source": "phone"})
+    assert r_goal.status_code == 200
+    g_body = r_goal.json()
+    assert "喵，目标已全部完成" in g_body["text"]
+    assert not g_body["text"].startswith(".")
+    assert app.state.store.state.get("last_goal_run", {}).get("status") == "completed"
+    assert app.state.store.state.get("last_goal_run", {}).get("steps") == 2
+
+    # 4. stay_silent tool in curiosity and run_scheduled suppresses bubbles and notifications
+    before_count = len(app.state.store.state["messages"])
+
+    async def mock_silent_curiosity(messages, tools=None, big=False, bot_id="companion", tool_choice=None):
+        return {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_silent_1",
+                    "type": "function",
+                    "function": {
+                        "name": "stay_silent",
+                        "arguments": json.dumps({"reason": "主人刚忙完，当前无紧急事项，保持安静", "snooze_minutes": 30}, ensure_ascii=False),
+                    },
+                }
+            ],
+        }
+
+    brain.llm.complete_silent = mock_silent_curiosity
+    cur_res = asyncio.run(brain.curiosity(manual=True, bot_id="companion", source="phone"))
+    assert cur_res.get("silent") is True
+    assert cur_res.get("status") == "silent"
+    assert len(app.state.store.state["messages"]) == before_count
+
+
 
 
 

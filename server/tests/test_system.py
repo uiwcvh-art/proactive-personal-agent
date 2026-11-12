@@ -52,7 +52,7 @@ def test_chat_curiosity_snooze_and_real_result(env):
     app,c=env
     m=c.post('/api/trigger-curiosity').json()
     assert m['engine']=='local_prompt'
-    assert m['id'] in app.state.store.state['pending']
+    assert m['id'] not in app.state.store.state['pending']
     r=c.post('/api/chat',json={'text':'我想整理本周任务，卡在不知道先做什么。'})
     assert r.status_code==200
     assert '我想整理本周任务' in '\n'.join(app.state.vault.read(f['path']) for f in app.state.vault.files() if f['path'].startswith('timeline/'))
@@ -95,16 +95,15 @@ def test_websocket_encrypted_push_and_ack(env):
         m=c.post('/api/trigger-curiosity').json()
         push=CryptoBox.frame(key,ws.receive_json())
         assert push['message']['id']==m['id']
-        assert CryptoBox.frame(key,ws.receive_json())['stage']==1
         ws.send_json(CryptoBox.seal(key,{'type':'ack','ids':[m['id']]}))
         ev1 = CryptoBox.frame(key,ws.receive_json())
-        if ev1['type'] == 'user_notification':
+        while ev1['type'] in ('user_notification', 'stream', 'execution', 'goal_status'):
             ev1 = CryptoBox.frame(key,ws.receive_json())
         assert ev1['type']=='ack'
 
 def test_snoozed_reconnect_does_not_replay_overlay(env):
     app,c=env
-    message=c.post('/api/trigger-curiosity').json()
+    message=c.post('/api/test-escalation').json()
     app.state.store.state['pending'][message['id']]['stage']=3
     c.post('/api/snooze',json={'minutes':60})
     key,packet=sealed(app,{})

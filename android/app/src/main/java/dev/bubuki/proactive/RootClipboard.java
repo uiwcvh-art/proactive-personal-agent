@@ -23,12 +23,47 @@ final class RootClipboard {
         if (cp != null && !cp.isEmpty()) pb.environment().put("CLASSPATH", cp);
         java.lang.Process broker=pb.start();
         try(BufferedReader in=new BufferedReader(new InputStreamReader(broker.getInputStream(),StandardCharsets.UTF_8));BufferedWriter out=new BufferedWriter(new OutputStreamWriter(broker.getOutputStream(),StandardCharsets.UTF_8))){
-            out.write(new JSONObject().put("text",text).toString()+"\n");out.flush();line(in);
+            out.write(new JSONObject().put("op","paste").put("text",text).toString()+"\n");out.flush();line(in);
             try{
                 RootCommands.run("input","-d",String.valueOf(displayId),"keyevent","279");
                 try{Thread.sleep(240L);}catch(InterruptedException ignored){}
             }
             finally{out.write("restore\n");out.flush();line(in);}
         }finally{if(broker.isAlive())broker.destroy();}
+    }
+
+    String getText() throws Exception {
+        if (android.os.Process.myUid() != 0) throw new SecurityException("只允许 Root 读取剪贴板");
+        ProcessBuilder pb = new ProcessBuilder("/system/bin/app_process", "/system/bin", "dev.bubuki.proactive.RootClipboardBroker").redirectError(new File("/dev/null"));
+        String cp = System.getenv("CLASSPATH");
+        if (cp == null || cp.isEmpty()) cp = System.getProperty("java.class.path", "");
+        if (cp != null && !cp.isEmpty()) pb.environment().put("CLASSPATH", cp);
+        java.lang.Process broker = pb.start();
+        try (BufferedReader in = new BufferedReader(new InputStreamReader(broker.getInputStream(), StandardCharsets.UTF_8));
+             BufferedWriter out = new BufferedWriter(new OutputStreamWriter(broker.getOutputStream(), StandardCharsets.UTF_8))) {
+            out.write(new JSONObject().put("op", "get").toString() + "\n");
+            out.flush();
+            String reply = line(in);
+            return new JSONObject(reply).optString("text", "");
+        } finally {
+            if (broker.isAlive()) broker.destroy();
+        }
+    }
+
+    void setText(String text) throws Exception {
+        if (android.os.Process.myUid() != 0) throw new SecurityException("只允许 Root 写入剪贴板");
+        ProcessBuilder pb = new ProcessBuilder("/system/bin/app_process", "/system/bin", "dev.bubuki.proactive.RootClipboardBroker").redirectError(new File("/dev/null"));
+        String cp = System.getenv("CLASSPATH");
+        if (cp == null || cp.isEmpty()) cp = System.getProperty("java.class.path", "");
+        if (cp != null && !cp.isEmpty()) pb.environment().put("CLASSPATH", cp);
+        java.lang.Process broker = pb.start();
+        try (BufferedReader in = new BufferedReader(new InputStreamReader(broker.getInputStream(), StandardCharsets.UTF_8));
+             BufferedWriter out = new BufferedWriter(new OutputStreamWriter(broker.getOutputStream(), StandardCharsets.UTF_8))) {
+            out.write(new JSONObject().put("op", "set").put("text", text != null ? text : "").toString() + "\n");
+            out.flush();
+            line(in);
+        } finally {
+            if (broker.isAlive()) broker.destroy();
+        }
     }
 }

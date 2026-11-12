@@ -9,12 +9,17 @@ class Escalation:
         self.last_test=0
 
     async def track(self,message,demo=False):
+        if not demo and message.get('kind') not in ('deadline', 'escalation_demo'):
+            return
         with self.store.lock:
             s=self.store.state
             s.setdefault('pending', {})[message['id']]={'id':message['id'],'text':message['text'][:3000],
                 'created_at':time.time(),'stage':1,'last_email':0,'emails':0,'demo':demo,'email_status':'pending'}
             self.store.save()
         await self.publish({'type':'escalation','stage':1,'message':message,'id':message['id'],'demo':demo})
+
+    async def enqueue(self,message,demo=True):
+        return await self.track(message,demo=demo)
 
     async def ack(self,ids):
         with self.store.lock:
@@ -41,10 +46,10 @@ class Escalation:
         if not c.host or not c.recipient or not (c.sender or c.username):
             return {'sent':False,'reason':'尚未配置 SMTP 主机、收件邮箱和发件地址'}
         msg=EmailMessage()
-        msg['Subject']=('【共生 · 测试】' if test else '【共生 · 等你拍板】')+'替你准备的成果还没看呢'
+        msg['Subject']=('【DeepSeek Claw · 测试】' if test else '【DeepSeek Claw · 等你拍板】')+'替你准备的成果还没看呢'
         msg['From']=c.sender or c.username
         msg['To']=c.recipient
-        msg.set_content(f'喂，你的外部前额叶来敲门啦。\n\n{text}\n\n打开共生 App 查看、回复，或选择「别吵我 1 小时」即可停止催单。\n本项目每个待办最多发送 3 封催单邮件。')
+        msg.set_content(f'主人，DeepSeek Claw 来敲门啦。\n\n{text}\n\n打开 DeepSeek Claw 查看、回复，或选择「别吵我 1 小时」即可停止催单。\n本项目每个待办最多发送 3 封催单邮件。')
         context=ssl.create_default_context()
         cls=smtplib.SMTP_SSL if c.security=='ssl' else smtplib.SMTP
         kwargs={'context':context} if c.security=='ssl' else {}
@@ -68,6 +73,8 @@ class Escalation:
         if self.store.state['snooze_until']>now: return
         c=self.store.config
         for p in list(self.store.state['pending'].values()):
+            if not p.get('demo'):
+                continue
             age=now-p['created_at']
             t2,t3=(4,8) if p['demo'] else (c.email_after_minutes*60,c.overlay_after_minutes*60)
             if age>=t2 and p['emails']<3 and (not p['last_email'] or now-p['last_email']>=900):

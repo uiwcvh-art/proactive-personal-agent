@@ -13,10 +13,41 @@ import java.nio.charset.StandardCharsets;
 public final class RootDisplayServer {
     private static final String RPC_PREFIX = "PULSE_RPC:";
 
+    private static void killStaleInstances() {
+        int myPid = android.os.Process.myPid();
+        File procDir = new File("/proc");
+        File[] entries = procDir.listFiles();
+        if (entries == null) return;
+        for (File entry : entries) {
+            String name = entry.getName();
+            if (!name.matches("\\d+")) continue;
+            int pid;
+            try {
+                pid = Integer.parseInt(name);
+            } catch (NumberFormatException e) {
+                continue;
+            }
+            if (pid == myPid || pid <= 1) continue;
+            File cmdlineFile = new File(entry, "cmdline");
+            try (FileInputStream fis = new FileInputStream(cmdlineFile)) {
+                byte[] buf = new byte[256];
+                int n = fis.read(buf);
+                if (n <= 0) continue;
+                int zeroIdx = 0;
+                while (zeroIdx < n && buf[zeroIdx] != 0) zeroIdx++;
+                String argv0 = new String(buf, 0, zeroIdx, StandardCharsets.UTF_8).trim();
+                if ("dev.bubuki.proactive:root".equals(argv0)) {
+                    android.os.Process.killProcess(pid);
+                }
+            } catch (Throwable ignored) {}
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         if (android.os.Process.myUid() != 0 && android.os.Process.myUid() != 2000) {
             throw new SecurityException("Root display tools require uid 0 or 2000");
         }
+        killStaleInstances();
         final PrintStream rpcOut = new PrintStream(new FileOutputStream(FileDescriptor.out), true, "UTF-8");
         final BufferedReader rpcIn = new BufferedReader(new InputStreamReader(new FileInputStream(FileDescriptor.in), StandardCharsets.UTF_8));
         // Redirect System.out to System.err so any Android framework/vendor println never pollutes our RPC pipe
@@ -59,25 +90,47 @@ public final class RootDisplayServer {
         }
 
         final String token = args.length > 0 ? args[0] : "";
+        final java.util.concurrent.ExecutorService rpcWorkers = java.util.concurrent.Executors.newCachedThreadPool(r -> {
+            Thread t = new Thread(r, "pulse-root-worker");
+            t.setDaemon(true);
+            return t;
+        });
         new Thread(() -> {
             try {
-                rpcOut.println(RPC_PREFIX + "READY:" + token);
-                rpcOut.flush();
+                synchronized (rpcOut) {
+                    rpcOut.println(RPC_PREFIX + "READY:" + token);
+                    rpcOut.flush();
+                }
                 String line;
                 while ((line = rpcIn.readLine()) != null) {
-                    line = line.trim();
-                    if (line.isEmpty()) continue;
+                    final String reqLine = line.trim();
+                    if (reqLine.isEmpty()) continue;
+                    String reqId = "";
                     try {
-                        org.json.JSONObject parsed = new org.json.JSONObject(line);
+                        org.json.JSONObject parsed = new org.json.JSONObject(reqLine);
                         if ("exit".equals(parsed.optString("op"))) break;
+                        reqId = parsed.optString("_req_id", "");
                     } catch (Throwable ignored) {}
-                    String response = runtime.execute(line);
-                    rpcOut.println(RPC_PREFIX + response);
-                    rpcOut.flush();
+                    final String finalReqId = reqId;
+                    rpcWorkers.submit(() -> {
+                        String response = runtime.execute(reqLine);
+                        if (!finalReqId.isEmpty()) {
+                            try {
+                                org.json.JSONObject respObj = new org.json.JSONObject(response);
+                                respObj.put("_req_id", finalReqId);
+                                response = respObj.toString();
+                            } catch (Throwable ignored) {}
+                        }
+                        synchronized (rpcOut) {
+                            rpcOut.println(RPC_PREFIX + response);
+                            rpcOut.flush();
+                        }
+                    });
                 }
             } catch (Throwable t) {
                 t.printStackTrace(System.err);
             } finally {
+                rpcWorkers.shutdownNow();
                 runtime.close();
                 System.exit(0);
             }

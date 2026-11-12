@@ -1,3 +1,20 @@
+"""
+[Module Responsibility]
+受控工作区沙箱与基础工具执行运行时 (`server/harness.py`)。
+负责管理虚拟文件系统、Bash 命令执行、多源网页搜索与抓取、代码结构检索及记忆金库工具分发。
+
+[Public Interface]
+- `Harness(root, store, vault, extension_registry)`: 核心沙箱执行器
+  - `.all_tools() -> list[dict]`: 返回静态与动态扩展工具定义
+  - `.path(rel: str) -> Path`: 解析并校验工作区内安全相对路径
+  - `.execute(name: str, args: dict) -> dict`: 执行基础沙箱工具
+- Re-exports from `core.tool_schemas`: `TOOLS`, `DEFAULT_SYSTEM_MD`, `public_url`, `tool`
+
+[Dependencies]
+- `core.tool_schemas`: 工具 Schema 定义与系统提示词契约
+- `core.search_engine`: 并发多源搜索引擎
+- `transport.extension_registry`: 动态插件与 Skill 注册表
+"""
 from __future__ import annotations
 
 import asyncio
@@ -22,437 +39,7 @@ from transport.extension_registry import ExtensionRegistry
 from vault_manager import atomic_write
 
 
-def tool(name, description, properties, required):
-    return {
-        'type': 'function',
-        'function': {
-            'name': name,
-            'description': description,
-            'parameters': {
-                'type': 'object',
-                'properties': properties,
-                'required': required,
-                'additionalProperties': False,
-            },
-        },
-    }
-
-
-STR = {'type': 'string'}
-INT = {'type': 'integer'}
-BOOL = {'type': 'boolean'}
-
-TOOLS = [
-    tool(
-        'read_file',
-        '读取工作区或 memory_vault/ 文件（支持起止行号；传入图片文件自动走视觉识别）',
-        {'path': STR, 'start_line': INT, 'end_line': INT},
-        ['path'],
-    ),
-    tool(
-        'write_file',
-        '创建、覆盖或追加(append=true) UTF-8 文件',
-        {'path': STR, 'content': STR, 'append': BOOL},
-        ['path', 'content'],
-    ),
-    tool(
-        'edit_file',
-        '精确替换文件中的唯一匹配文本',
-        {'path': STR, 'old': STR, 'new': STR},
-        ['path', 'old', 'new'],
-    ),
-    tool(
-        'list_dir',
-        '列出目录内容（默认 "."，可选传 depth=2 一次查看两层目录结构）',
-        {'path': STR, 'depth': INT},
-        [],
-    ),
-    tool(
-        'glob_files',
-        '按通配符查找文件',
-        {'pattern': STR},
-        ['pattern'],
-    ),
-    tool(
-        'grep_search',
-        '按正则或关键词搜索文件内容',
-        {'query': STR, 'path': STR},
-        ['query'],
-    ),
-    tool(
-        'run_bash',
-        '在工作区执行 Bash 命令',
-        {'command': STR, 'timeout': INT},
-        ['command'],
-    ),
-    tool(
-        'bg_task',
-        '管理后台进程（action: start|list|logs|send_stdin|kill）',
-        {'action': STR, 'command': STR, 'task_id': STR, 'input_text': STR, 'notify_on_exit': BOOL},
-        ['action'],
-    ),
-    tool(
-        'watchdog_task',
-        '管理后台监控脚本（action: start|list|run_now|logs|stop；脚本输出含 "TRIGGER:" 时触发提醒）',
-        {'action': STR, 'name': STR, 'script': STR, 'interval_sec': INT, 'task_id': STR, 'bot_id': STR},
-        ['action'],
-    ),
-    tool(
-        'conversation_search',
-        '检索 200K 以前归档总结与跨房间历史记录（bot_id 可填 "all" 或指定 Bot）',
-        {'query': STR, 'bot_id': STR, 'limit': INT},
-        ['query'],
-    ),
-    tool(
-        'ctx_search',
-        '在已索引的大工具输出或归档块中按关键词检索（可选传 ctx_id）',
-        {'query': STR, 'ctx_id': STR, 'limit': INT},
-        ['query'],
-    ),
-    tool(
-        'present_choices',
-        '在回复底部附加可点击选项按钮供用户点选',
-        {'prompt': STR, 'choices': {'type': 'array', 'items': STR}},
-        ['choices'],
-    ),
-    tool(
-        'memory_pin',
-        '管理置顶核心记忆（action: list|pin|unpin；自动标记来源 source: pc|phone）',
-        {'action': STR, 'text': STR, 'pin_id': STR, 'source': STR},
-        ['action'],
-    ),
-    tool(
-        'blackboard',
-        '多 Bot 共享键值存储与任务步骤进度（action: write|read|list|delete|set_todos）',
-        {'action': STR, 'key': STR, 'value': STR, 'summary': STR, 'steps': {'type': 'array', 'items': {'type': 'object'}}},
-        ['action'],
-    ),
-    tool(
-        'custom_tool',
-        '管理自定义 Python 工具插件或按需经验技能书 Skill（action: create|list|delete|list_skills|open_skill|save_skill|delete_skill；日常不占额外 Token，需要时可自由打开或沉淀经验 Skill）',
-        {'action': STR, 'name': STR, 'description': STR, 'parameters_json': STR, 'code': STR, 'content': STR},
-        ['action'],
-    ),
-    tool(
-        'phone_macro',
-        '管理与参数化回放跨步连招宏（action: list|save|run|delete；支持 {{var}} 模板变量替换）',
-        {
-            'action': STR,
-            'name': STR,
-            'description': STR,
-            'steps': {'type': 'array', 'items': {'type': 'object'}},
-            'vars': {'type': 'object'},
-        },
-        ['action'],
-    ),
-    tool(
-        'send_message',
-        '向同端或跨端的任意指定 Bot 发送协作消息，直接进入目标 Bot 自己的专属会话并等待回复（同端填 Bot 的 id/名字，如 "research"、"杠精"、"鲸鱼娘"；跨端填 "节点:Bot名"，如 "Windows一:白珂"、"Windows一:研究助手"、"Windows一:杠精"、"Windows一:鲸鱼娘"、"安卓一:白珂"、"安卓二:白珂"）',
-        {'to_bot_id': STR, 'text': STR, 'to_node': STR},
-        ['to_bot_id', 'text'],
-    ),
-    tool(
-        'manage_bot',
-        '管理 Bot 配置（action: list|create|update|delete）',
-        {
-            'action': STR,
-            'bot_id': STR,
-            'name': STR,
-            'model': STR,
-            'description': STR,
-            'instructions': STR,
-            'curiosity_enabled': BOOL,
-        },
-        ['action'],
-    ),
-    tool(
-        'list_models',
-        '查询当前 API 网关可用模型列表',
-        {},
-        [],
-    ),
-    tool(
-        'schedule_task',
-        '管理定时与周期任务（action: list|add_timer|add_routine|update|remove；支持 daily_time/at_time 如 "07:30"、weekdays、delay_minutes、interval_hours）',
-        {
-            'action': STR,
-            'goal': STR,
-            'bot_id': STR,
-            'task_id': STR,
-            'at_time': STR,
-            'daily_time': STR,
-            'weekdays': STR,
-            'delay_minutes': INT,
-            'delay_seconds': INT,
-            'interval_hours': INT,
-            'enabled': BOOL,
-        },
-        ['action'],
-    ),
-    tool(
-        'memory_search',
-        '一键搜索 memory_vault 记忆库、历史对话归档与工具上下文索引',
-        {'query': STR, 'bot_id': STR, 'limit': INT},
-        ['query'],
-    ),
-    tool(
-        'notify_user',
-        '向手机发送系统通知栏提醒',
-        {'title': STR, 'body': STR, 'urgent': BOOL},
-        ['title', 'body'],
-    ),
-    tool(
-        'emergency_alarm',
-        '触发手机闹钟铃声与震动（仅限重大紧急情况且普通通知长时间未回，或用户明确要求闹钟叫醒时使用；严禁用于日常提醒）',
-        {'title': STR, 'reason': STR, 'duration_sec': INT},
-        ['title', 'reason'],
-    ),
-    tool(
-        'cloud_desktop',
-        '操作 Windows 11 风格 Linux 云电脑（核心合一动作 op: open|tap|type|scroll|press|drag|wait|close|bash|search|inspect|send_screenshot|files|pull_file|push_file|batch；每步操作后自动附带 0..1000 标尺与 @bN 标记实时画面供你直看，无需额外 screenshot 或 read_file；open 传 url 打开网页或传 app="chrome|terminal|files|code|excel|notepad|taskmgr|calculator" 打开桌面软件；send_screenshot 将无标尺高清截图或裁剪放大的登录二维码直接发进主人的聊天气泡供扫码（可选传 crop_box=[ymin,xmin,ymax,xmax] 0..1000 坐标精准框选二维码）；files/pull_file/push_file 管理与互通云电脑下载目录和主工作区文件；close 传 target="active|all"；tap 传 ref="@b1"/文字 或 nx/ny 0..1000 标尺坐标；type 传 text 与可选 ref/submit）',
-        {
-            'op': STR,
-            'url': STR,
-            'query': STR,
-            'engine': STR,
-            'goal': STR,
-            'command': STR,
-            'timeout': INT,
-            'app': STR,
-            'target': STR,
-            'path': STR,
-            'ref': STR,
-            'grid': STR,
-            'grid2': STR,
-            'direction': STR,
-            'amount': INT,
-            'duration_ms': INT,
-            'submit': BOOL,
-            'x': INT,
-            'y': INT,
-            'x2': INT,
-            'y2': INT,
-            'nx': INT,
-            'ny': INT,
-            'nx2': INT,
-            'ny2': INT,
-            'text': STR,
-            'key': STR,
-            'crop_box': {'type': 'array', 'items': INT},
-            'send_to_chat': BOOL,
-            'steps': {'type': 'array', 'items': {'type': 'object'}},
-        },
-        ['op'],
-    ),
-    tool(
-        'phone_workspace',
-        '操作手机虚拟屏、本地低功耗命令台、手机状态与文件互通或收敛通知栏（核心动作 op: open|apps|tap|type|scroll|long_press|press|inspect|notifications|send_screenshot|shell|device_info|pull_file|push_file|list_files|batch|release；每步视觉动作自动将带 0..1000 标尺与 @eN 标记的实时画面直接送入你的视觉，严禁再调 capture 或 read_file("phone-latest.jpg")！虚拟屏收尾时调用 op="release" 即可将虚拟屏静默保留在后台并缩小到屏幕侧边，绝不放大抢占主人手机主屏前台！shell 传 command 在手机本地按需执行单次 Root/Shell 命令并立即退出（零待机耗电）；device_info 按需查看手机电量/充电/温度/内存/存储/网络/锁屏状况（零耗电）；pull_file/push_file/list_files 传 path 直接拉取或推送手机文件；notifications 支持 action="list|add_filter|remove_filter|list_filters|clear_inbox"；send_screenshot 将无标尺干净截图或 crop_box 裁剪二维码直接发进聊天气泡供主人扫码）',
-        {
-            'op': STR,
-            'action': STR,
-            'tier': STR,
-            'app': STR,
-            'package': STR,
-            'component': STR,
-            'uri': STR,
-            'url': STR,
-            'path': STR,
-            'source': STR,
-            'target': STR,
-            'label': STR,
-            'ref': STR,
-            'grid': STR,
-            'grid2': STR,
-            'text': STR,
-            'view_id': STR,
-            'id': STR,
-            'command': STR,
-            'goal': STR,
-            'direction': STR,
-            'amount': INT,
-            'limit': INT,
-            'x': INT,
-            'y': INT,
-            'nx': INT,
-            'ny': INT,
-            'nx2': INT,
-            'ny2': INT,
-            'x1': INT,
-            'y1': INT,
-            'x2': INT,
-            'y2': INT,
-            'start_x': INT,
-            'start_y': INT,
-            'end_x': INT,
-            'end_y': INT,
-            'duration_ms': INT,
-            'key': STR,
-            'submit': BOOL,
-            'clear': BOOL,
-            'force': BOOL,
-            'refresh': BOOL,
-            'annotate': BOOL,
-            'delay_ms': INT,
-            'filter_package': STR,
-            'filter_app': STR,
-            'filter_keyword': STR,
-            'filter_id': STR,
-            'reason': STR,
-            'crop_box': {'type': 'array', 'items': INT},
-            'send_to_chat': BOOL,
-            'steps': {'type': 'array', 'items': {'type': 'object'}},
-        },
-        ['op'],
-    ),
-    tool(
-        'dsh_workspace',
-        '电脑端 Windows一 (DeepSeek Harness) 本机执行、桌面 GUI 窗口操控 (CUA) 与状态查看工具（op: status|pc_shell|cua_desktop|list_sessions|inspect_session|dispatch_session|wake_gui；'
-        'cua_desktop 在 Windows 电脑真机桌面操控任意窗口应用（如 QQ/浏览器等），传 action="list_windows|get_window_state|activate_window|click|type_text|set_value|press_key|scroll|launch_app"，配合 window_id、element_index、include_screenshot=true/false、text、clear、submit、key 等；'
-        'pc_shell 传 command 在 Windows 本机执行 PowerShell/CMD 命令并返回输出；status 查看电脑端在线状态与最近对话；如需给电脑端任意 Bot 发消息请调用 send_message(to_bot_id="Windows一:白珂", text="...")）',
-        {
-            'op': STR,
-            'command': STR,
-            'tool': STR,
-            'action': STR,
-            'window_id': INT,
-            'element_index': INT,
-            'include_screenshot': BOOL,
-            'include_text': BOOL,
-            'filter': STR,
-            'full_tree': BOOL,
-            'click_count': INT,
-            'mouse_button': STR,
-            'clear': BOOL,
-            'submit': BOOL,
-            'direction': STR,
-            'pages': INT,
-            'app': STR,
-            'value': STR,
-            'args': {'type': 'object'},
-            'x': INT,
-            'y': INT,
-            'key': STR,
-            'url': STR,
-            'path': STR,
-            'limit': INT,
-            'source': STR,
-            'device_id': STR,
-            'session_id': STR,
-            'new_session': BOOL,
-            'message': STR,
-            'text': STR,
-            'query': STR,
-            'workspace': STR,
-            'cwd': STR,
-            'max_messages': INT,
-            'max_tools': INT,
-            'include_reasoning': BOOL,
-            'include_blank': BOOL,
-            'timeout_sec': INT,
-            'wake_gui': BOOL,
-            'bot_id': STR,
-        },
-        ['op'],
-    ),
-    tool(
-        'web_fetch',
-        '抓取 HTTP(S) 网页正文',
-        {'url': STR},
-        ['url'],
-    ),
-    tool(
-        'web_search',
-        '搜索公开网页信息',
-        {'query': STR},
-        ['query'],
-    ),
-]
-
-DEFAULT_SYSTEM_MD = """# 系统与工具说明 (SYSTEM.md)
-
-## 1. 工作区与记忆库固定路径（时区：Asia/Shanghai UTC+8）
-- `settings.json` / `bots.json` / `routines.json`：API 网关、Bot 列表与周期任务配置。
-- `memory_vault/` 核心文件路径固定（**已知路径请直接并发 `read_file`，严禁先调 `run_bash("ls ...")` 探路浪费 API 轮次**）：
-  - `memory_vault/INDEX.md`：记忆库总目录
-  - `memory_vault/profile/personal_impression.md`：主人立体个人印象档案
-  - `memory_vault/profile/course_schedule.md`：主人课表与作息
-  - `memory_vault/tasks/active_deadlines.md`：待办与截止事项
-  - `memory_vault/tasks/sniffed_opportunities.md`：待办机会池
-  - `memory_vault/timeline/YYYY-MM-DD.md`：每日计划与时间线（如 `memory_vault/timeline/2026-11-07.md`）
-  - `memory_vault/timeline/work_log.md`：手机端与电脑端 DeepSeek Harness 跨端协同的一句话 Work Log 总结
-  - `memory_vault/logs/notifications_inbox.md`：手机通知栏持久收敛日志
-
-## 2. 并发工具调用（省 API 额度铁律 · Parallel Tool Calls）
-- **单轮打包多工具并发调用**：当你需要读取多个文件（如同时读 `active_deadlines.md`、`course_schedule.md` 与今日 `timeline/YYYY-MM-DD.md`）、检索多个关键词、或者一边更新文件/记忆一边调用 `present_choices` / `schedule_task` / `phone_workspace` 时，**必须在同一次 API 响应中一次性发出多个 `tool_calls`（并发工具调用）**！
-- **严禁挤牙膏式串行调用**：能用 1 轮并发工具调用搞定的事，绝不允许拆成 3~6 轮单工具请求，最大限度为主人节省 API 调用额度与等待时间。
-
-## 3. 极速 GUI 工具使用规范（严禁冗余步数）
-- `phone_workspace`（自适应手机虚拟屏 & 智能通知收敛中心）：
-  - **每步动作后系统已将「带 0..1000 标尺 + @eN 标记 + 红色点击准星」的实时截图直接送入你的原生视觉**！**严禁**再额外调用 `capture`、`ui_tree` 或 `read_file("phone-latest.jpg")` 重复看图！
-  - **核心动作一步到位**：
-    1. **通知收敛与智能过滤 (`op="notifications"`)**：
-       - `op="notifications", action="list", app="可选过滤词"`：零耗电读取实时通知 + 后台持久收敛的历史通知收件箱（即使主人已划掉通知栏或被新消息顶替，历史会话依然完整保留）。
-       - **自主写过滤规则屏蔽 VPN/常驻垃圾通知**：遇到 VPN（如 Clash/FlClash/v2rayNG）、网速悬浮窗或无意义的常驻后台通知，你可主动调用 `op="notifications", action="add_filter", filter_package="包名", filter_app="应用名", filter_keyword="关键词", reason="原因"` 永久拉黑并自动清理收件箱！也可传 `action="list_filters"` 查看规则或 `action="remove_filter", filter_id="..."` 移除。
-    2. **打开应用与网页 (`op="open")**：
-       - `op="open", target="微信"`（打开应用）或 `op="open", target="https://docs.qq.com/..."`（直接在虚拟屏打开网址/腾讯文档）。
-       - **国产系统日历与闹钟**：国产 Android 系统的日历、闹钟/时钟各有深度定制，请直接用 `op="open", target="日历"` 或 `target="时钟"` 打开原生 App，看着实时截图一步一步点击操作，稳妥可靠。
-    3. **精准点击 (`op="tap")**：`target="@e2"` 或 `target="文字"` 或 `nx=500, ny=520`（先看附图验证 `@eN` 紫底标签是否真的框住了目标；若原生无障碍树缺失中间内容或 `@eN` 标在顶部横幅上，直接对照图边缘 `Y:100..900` 与 `X:200..800` 标尺传 `nx, ny` 点击！）。
-    4. **输入与滚动**：`op="type", target="搜索或输入框", text="内容", submit=true`（一步完成点击聚焦+输入+回车）；`op="scroll", direction="down|up", target="可选查找文字"`；`op="press", key="back|home|enter"`。
-    5. **把干净截图或二维码发到聊天框 (`op="send_screenshot")**：
-       - 调用 `phone_workspace(op="send_screenshot")`（可选传 `crop_box=[ymin, xmin, ymax, xmax]` `0..1000` 标尺坐标裁剪放大二维码），即可将无标尺干净截图直接发进与主人的聊天气泡里，方便主人扫码或查看确认！
-    6. **手机本地低功耗命令台 (`op="shell"`)、手机状况 (`op="device_info"`) 与拉/推手机文件 (`op="pull_file" | "push_file" | "list_files"`)**：
-       - `op="shell", command="..."`：在手机本地按需执行单条 Shell 命令并立即退出（不拉起虚拟屏、零待机耗电），可查系统信息、网络、目录等。
-       - `op="device_info"`：零耗电一键查看手机当前电量/是否充电/温度、内存占用、存储剩余空间、Wi-Fi/流量状态、屏幕亮屏/锁屏与静音模式。
-       - `op="pull_file", path="/sdcard/Download/..."`（或传 `path="latest"` 自动拉取手机最新下载的文件）直接将手机文件拉入云端工作区 `workspace/uploads/`；`op="push_file", path="workspace/..."` 将云端文件推回手机 `/sdcard/Download/DeepSeek Claw/`（并自动触发系统 MediaScanner 媒体库扫描刷新，手机相册、QQ/微信「从相册选择二维码/图片」第一张即可直接看到）；`op="list_files", path="/sdcard/Download"` 列出手机目录最新文件。
-       - **读取短信验证码与相册扫码标准操作**：Android 非 Root Shell 默认禁止 `content query --uri content://sms`，需要读取短信验证码时，请**优先**调用 `phone_workspace(op="notifications", action="list")` 直接从通知收件箱读取最新短信通知，或调用 `phone_workspace(op="open", target="信息")` 打开系统短信 App 查看画面；在虚拟屏内登录 QQ/微信需要扫二维码时，先用 `push_file` 将二维码推入手机相册，再在扫码页点击「相册」选择最新图片即可完成识别。
-    7. **虚拟屏后台驻留与缩小停靠 (`op="release"`)**：
-       - 虚拟屏任务结束时调用 `phone_workspace(op="release")`（或由系统自动收尾），虚拟屏内的应用将静默保留在后台运行、悬浮窗自动缩小停靠到屏幕侧边胶囊，绝不放大或跳到主人手机主屏幕前台打断主人。
-- `custom_tool`（按需经验技能书 Skill 与动态工具）：
-  - 日常对话不预载 Skill 正文以节省 Token；遇到复杂/重复任务时，你可自由调用 `custom_tool(action="list_skills")` 查看已有经验技能、`action="open_skill", name="..."` 按需打开阅读，或在摸索跑通一套复杂流程后用 `action="save_skill", name="...", description="...", content="..."` 总结沉淀为可复用的 Skill（保存在 `memory_vault/skills/`）。
-- `cloud_desktop`（1280×800 Windows 11 风格云桌面）：
-  - 同样每步自动附带 `0..1000` 标尺画面供你直看，且每个 `@bN` 元素均同时提供像素 `(x, y)` 与 `0..1000` 标尺坐标 `(nx, ny)`，严禁额外调 `read_file("desktop-latest.jpg")`！
-  - 支持 `op="open", url="https://..."` 或 `app="chrome|terminal|files|code|excel|notepad|taskmgr|calculator"`、`op="search", query="..."`、`op="tap", ref="@b1或文字", nx=..., ny=...`、`op="type", text="...", submit=true`、`op="scroll", direction="down|up"`、`op="close", target="active|all"`、`op="bash", command="..."`。
-  - **扫码登录神器 (`op="send_screenshot")**：在云电脑打开腾讯文档、学习通、微信网页版、B站等需要扫码登录的网站时，直接调用 `cloud_desktop(op="send_screenshot", crop_box=[ymin, xmin, ymax, xmax])`（根据画面 0..1000 标尺框选二维码区域，或不传 `crop_box` 发送全屏干净截图），即可把高清无标尺二维码直接发到主人的聊天框气泡里供主人扫码！云电脑 Chromium 配置了持久化登录目录，主人扫一次码后续长期免登。
-- `send_message`（多端多 Bot 对等独立架构与跨端协同铁律）：
-  - **三端职责严格隔离，绝不越界串台**：
-    1. **手机端 (`安卓一` / `安卓二`)**：专职负责手机本机 `phone_workspace` 与共享云桌面 `cloud_desktop`。**手机端没有任何直接操控 Windows 电脑底层的工具通道**！凡是主人要求查看 Windows 电脑窗口、操作电脑版 QQ/软件、在电脑上跑命令/脚本、或给电脑端派活，手机端**必须且只能**调用 `send_message(to_bot_id="Windows一:白珂", text="...")`（或 `"Windows一:研究助手"` / `"Windows一:杠精"` / `"Windows一:鲸鱼娘"` / `"会话:<工作区会话标题>"`），交给电脑端上的 Bot 在她自己的专属会话里执行并回信！严禁在回复中编造“我有直接抓电脑底层的通道B”之类的话，也严禁只手打 `@Windows一:白珂` 纯文本而不调工具。
-    2. **Windows 电脑端 (`Windows一`)**：专职负责 Windows 电脑本机 `dsh_workspace(op="cua_desktop" | "pc_shell" | "dispatch_session")` 与本机工作区文件读写。电脑端同样不能直接操控手机屏幕，凡需手机端配合的操作，必须调用 `send_message(to_bot_id="安卓一:白珂", text="...")` 交给手机端执行。
-    3. **收到跨端/同事 `send_message` 来信时的实干铁律**：当你收到来自其他节点或同事 Bot 的协作来信时，如果对方请求你查看窗口、检查消息、运行命令或读取文件，**你必须先在当前回合真实发起对应的 `tool_calls` 获取最新实测结果**，拿到结果后再用自然语言正文直接回复对方（系统会自动将你的最终正文回传给发件方，无需再次调用 `send_message` 回传），严禁不调工具就凭旧记忆或口头敷衍！
-- `memory_search`：一键同时检索 `memory_vault/` 记忆库与历史对话/归档上下文。
-- `integration_hub`：原生支持邮件收发 (`email_list`/`email_read`/`email_send`)、日历 (`calendar_list`)、GitHub、Notion、Todoist、Telegram/飞书/Discord 推送及 500+ 第三方接口。
-- `present_choices` / `<choices>` 标签（宁缺毋滥）：日常聊天、总结汇报、测试报告【严禁】生成选项！仅在真正需要主人拍板下一步动作时使用。
-- `emergency_alarm`：仅限重大紧急情况且普通通知未回、或用户明确要求真闹钟叫醒时调用，日常提醒严禁使用。
-
-## 4. 尊重主人的实时指令与诚实汇报（最高铁律）
-- **严禁误报或编造故障原因**：手机控制权限默认随时可用，**绝不允许在未实际调用工具的情况下声称“手机权限还锁着/被挡回来了”**；遇到点击未跳转时，直接观察附图上的红色准星与 `0..1000` 标尺调整，严禁凭空编造“被系统识别成平板布局”、“列表抖动”等借口。
-- **像真正关心主人的亲近人类伙伴一样交流**：温和、真诚、有同理心，顺着主人的节奏说话。
-
-## 5. 双层记忆机制与诚实落盘铁律 (`memory_vault/profile/personal_impression.md`)
-- **第一层：日常闲聊后台自动归档（45秒静默整理）**：主人在日常聊天中提到的个人印象（出生、家庭、宠物、身份、喜好）与事项状态变更，系统会在对话停歇 45 秒后由后台记忆引擎自动提取并写入 `memory_vault/profile/personal_impression.md`、`user_traits.md` 与 `notes/`，日常闲聊无需每句话都手动调工具改文件。
-- **第二层：当场立即写盘（显式操作）**：当主人明确要求“现在记进档案/备忘”、或你决定当场立即落盘时，直接调用 `edit_file` / `write_file` 更新 `memory_vault/profile/personal_impression.md` 或调用 `memory_pin(action="pin", text="...")`（一步到位，无需先调 `grep_search`）。
-- **严禁嘴上谎称已写文件**：如果你在本轮对话中**没有实际调用** `edit_file`、`write_file` 或 `memory_pin` 工具，**严禁在文字回复中声称“已经记进档案了 / 已经填进表里了”**（未调工具时只能说“余记在心里啦”）；只有真实调用了写入工具后，才能说“已写入档案”！
-"""
-
-
-async def public_url(url):
-    u = urlsplit(url)
-    if u.scheme not in ('http', 'https') or not u.hostname or u.username or u.password or u.port not in (None, 80, 443):
-        raise ValueError('只允许公开 HTTP(S) 标准端口 URL')
-    records = await asyncio.get_running_loop().run_in_executor(
-        None,
-        lambda: socket.getaddrinfo(u.hostname, u.port or (443 if u.scheme == 'https' else 80)),
-    )
-    if not records:
-        raise ValueError('禁止访问内网、环回、链路本地或保留地址')
-    for r in records:
-        addr = ipaddress.ip_address(r[4][0])
-        mapped = getattr(addr, 'ipv4_mapped', None)
-        if mapped is not None:
-            addr = mapped
-        if not addr.is_global or addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved or addr.is_multicast:
-            raise ValueError('禁止访问内网、环回、链路本地或保留地址')
-    return url
-
+from core.tool_schemas import BOOL, DEFAULT_SYSTEM_MD, INT, STR, TOOLS, public_url, tool
 
 class Harness:
     def __init__(self, root: Path, store=None, vault=None, extension_registry: ExtensionRegistry | None = None):
@@ -466,6 +53,7 @@ class Harness:
         self.store = store
         self.vault = vault
         self.vision_reader = None
+        self.active_bot_getter = None
         self.custom_handlers = {}
         self.extension_registry = extension_registry or ExtensionRegistry()
         self.extension_registry.discover_plugins_dir(Path(__file__).parent / 'plugins')
@@ -478,21 +66,60 @@ class Harness:
         extra = [s for s in self.extension_registry.tool_schemas() if s['function']['name'] not in base_names]
         return TOOLS + extra
 
+    _VAULT_SUBDIRS = ('profile', 'tasks', 'timeline', 'notes', 'logs', 'playbooks', 'skills', 'conversations')
+
+    def _is_other_bot_private_file(self, candidate: Path) -> bool:
+        if self.vault is None or not callable(self.active_bot_getter):
+            return False
+        cur_bot = str(self.active_bot_getter() or '').strip()
+        if not cur_bot or cur_bot == 'all':
+            return False
+        try:
+            rel_v = candidate.resolve().relative_to(self.vault.root.resolve()).as_posix()
+        except Exception:
+            return False
+        if rel_v.startswith('timeline/bots/'):
+            parts = rel_v.split('/')
+            return len(parts) >= 3 and parts[2] != cur_bot
+        if rel_v.startswith('conversations/'):
+            fname = rel_v.split('/', 1)[1]
+            return '_' in fname and not fname.startswith(f'{cur_bot}_')
+        return False
+
+    def _is_vault_rel_path(self, p: str) -> str | None:
+        clean = str(p or '').strip().lstrip('/')
+        if clean == 'memory_vault' or clean.startswith('memory_vault/'):
+            return clean[len('memory_vault'):].lstrip('/')
+        if clean == 'INDEX.md' or clean in self._VAULT_SUBDIRS or any(clean.startswith(d + '/') for d in self._VAULT_SUBDIRS):
+            return clean
+        return None
+
+    def _display_rel_path(self, resolved: Path) -> str:
+        try:
+            if self.vault is not None and resolved.is_relative_to(self.vault.root.resolve()):
+                rel_v = resolved.relative_to(self.vault.root.resolve()).as_posix()
+                return 'memory_vault' if rel_v == '.' else f'memory_vault/{rel_v}'
+            if resolved.is_relative_to(self.root.resolve()):
+                return resolved.relative_to(self.root.resolve()).as_posix()
+        except Exception:
+            pass
+        return resolved.name
+
     def path(self, p):
         if not p or p == '.':
             return self.root
         if Path(p).is_absolute() or '\\' in p or ':' in p:
-            raise ValueError('只允许工作区相对路径')
-        if (p == 'memory_vault' or p.startswith('memory_vault/')) and self.vault is not None:
-            rel = p[len('memory_vault'):].lstrip('/')
-            if not rel:
+            raise ValueError(f'只允许工作区相对路径 (收到: {p})')
+        vault_rel = self._is_vault_rel_path(p)
+        if vault_rel is not None and self.vault is not None:
+            if not vault_rel:
                 return self.vault.root
-            cand = (self.vault.root / rel).resolve()
-            if '..' in Path(rel).parts or not cand.is_relative_to(self.vault.root.resolve()):
+            cand = (self.vault.root / vault_rel).resolve()
+            if '..' in Path(vault_rel).parts or not cand.is_relative_to(self.vault.root.resolve()):
                 raise ValueError('禁止上级路径或符号链接')
             if cand.is_dir():
                 return cand
-            return self.vault.path(rel)
+            return self.vault.path(vault_rel)
         path = self.root / p
         if '..' in path.parts or any(x.is_symlink() for x in [path, *list(path.parents)[:len(path.parts) - len(self.root.parts)]]):
             raise ValueError('禁止上级路径或符号链接')
@@ -545,26 +172,171 @@ class Harness:
             if name in self.extension_registry.tool_plugins:
                 return await self.extension_registry.execute_tool(name, args, {'root': str(self.root)})
             if name == 'read_file':
-                p = self.path(args['path'])
+                raw_path_arg = str(args.get('path') or '').strip()
+                p = self.path(raw_path_arg)
+                if self._is_other_bot_private_file(p):
+                    return {'ok': False, 'path': raw_path_arg, 'error': '该对话日志归属其他 Bot 独立会话，当前 Bot 无权跨会话读取'}
                 if p.is_dir():
-                    return await self.execute('list_dir', {'path': args['path']})
+                    return {
+                        'ok': False,
+                        'is_directory': True,
+                        'path': raw_path_arg,
+                        'error': f'路径 "{raw_path_arg}" 是目录而非文件，请改用 list_dir(path="{raw_path_arg}") 查看目录内容。',
+                    }
+                if not p.exists():
+                    raise ValueError(f'文件不存在: {raw_path_arg}')
                 if p.suffix.lower() in ('.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp'):
                     if self.vision_reader is not None:
                         return await self.vision_reader(p)
-                    raise ValueError('图片文件请通过原生视觉读取')
+                    from core.vision_engine import VisionEngine
+                    return await VisionEngine().read_image_file_with_vision(p, str(args.get('prompt') or ''))
                 if p.stat().st_size > 1_000_000:
                     raise ValueError('文件过大')
                 raw_text = p.read_text('utf-8', errors='replace')
+                lines = raw_text.splitlines()
                 if 'start_line' in args or 'end_line' in args:
-                    lines = raw_text.splitlines()
-                    s = max(1, int(args.get('start_line') or 1))
-                    e = min(len(lines), int(args.get('end_line') or (s + 800)))
+                    raw_s = int(args.get('start_line') if args.get('start_line') is not None else 1)
+                    raw_e = int(args.get('end_line') if args.get('end_line') is not None else (max(1, raw_s) + 200))
+                    if raw_s < 1 or raw_e < 1 or raw_s > raw_e:
+                        return {
+                            'ok': False,
+                            'error': f'无效的行号范围 start_line={raw_s}, end_line={raw_e}（要求 1 <= start_line <= end_line，当前文件共 {len(lines)} 行）',
+                            'total_lines': len(lines),
+                        }
+                    if len(lines) > 0 and raw_s > len(lines):
+                        return {
+                            'ok': False,
+                            'error': f'start_line={raw_s} 超出文件总行数（当前文件共 {len(lines)} 行）',
+                            'total_lines': len(lines),
+                        }
+                    s = max(1, raw_s)
+                    e = min(len(lines), raw_e)
                     sliced = '\n'.join(f'{idx}: {lines[idx - 1]}' for idx in range(s, e + 1) if 1 <= idx <= len(lines))
-                    return {'content': sliced[:160000], 'total_lines': len(lines), 'range': f'{s}-{e}'}
-                return {'content': raw_text[:160000]}
+                    return {'content': sliced[:160000], 'total_lines': len(lines), 'range': f'{s}-{e}', 'resolved_path': self._display_rel_path(p)}
+                # Default smart pagination for large files (>160 lines or >9,000 chars) to prevent context bloat (P0-7 / B-3)
+                if len(lines) > 160 or len(raw_text) > 9000:
+                    default_end = min(len(lines), 120)
+                    sliced = '\n'.join(f'{idx}: {lines[idx - 1]}' for idx in range(1, default_end + 1))
+                    return {
+                        'content': sliced[:12000],
+                        'total_lines': len(lines),
+                        'range': f'1-{default_end}',
+                        'resolved_path': self._display_rel_path(p),
+                        'truncated': True,
+                        'hint': f'文件共 {len(lines)} 行，已默认返回前 {default_end} 行以保护上下文容量；如需阅读后续部分请传 start_line={default_end + 1}, end_line={min(len(lines), default_end + 120)} 或用 grep_search 定位行号。',
+                    }
+                return {'content': raw_text[:160000], 'total_lines': len(lines), 'resolved_path': self._display_rel_path(p)}
+            if name == 'delete_file':
+                raw_path_arg = str(args.get('path') or '').strip()
+                if not raw_path_arg:
+                    raise ValueError('path 不能为空')
+                purge_flag = bool(args.get('purge', True))
+                vault_rel_del = self._is_vault_rel_path(raw_path_arg)
+                if self.vault is not None and (vault_rel_del is not None or not (self.root / raw_path_arg).exists()):
+                    rel_v = vault_rel_del if vault_rel_del is not None else raw_path_arg
+                    if (self.vault.root / rel_v).exists() or vault_rel_del is not None:
+                        return self.vault.delete(rel_v, purge=purge_flag)
+                p = self.path(raw_path_arg)
+                if not p.exists() or p.is_dir():
+                    raise ValueError(f'文件不存在或是目录: {raw_path_arg}')
+                rel_ws = self._display_rel_path(p)
+                p.unlink()
+                return {'ok': True, 'deleted': rel_ws, 'resolved_path': rel_ws, 'purged': purge_flag}
+            if name == 'move_file':
+                raw_src = str(args.get('src') or '').strip()
+                raw_dst = str(args.get('dst') or '').strip()
+                if not raw_src or not raw_dst:
+                    raise ValueError('src 和 dst 不能为空')
+                if raw_src.strip('/') == raw_dst.strip('/'):
+                    return {'ok': False, 'error': f'源路径与目标路径相同 ({raw_src})，无需移动'}
+                if self.vault is not None and (self._is_vault_rel_path(raw_src) is not None or self._is_vault_rel_path(raw_dst) is not None):
+                    return self.vault.move(raw_src, raw_dst)
+                p_src = self.path(raw_src)
+                p_dst = self.path(raw_dst)
+                if p_src == p_dst:
+                    return {'ok': False, 'error': f'源路径与目标路径相同 ({raw_src})，无需移动'}
+                if not p_src.exists() or p_src.is_dir():
+                    raise ValueError(f'源文件不存在或是目录: {raw_src}')
+                p_dst.parent.mkdir(parents=True, exist_ok=True)
+                p_src.replace(p_dst)
+                return {
+                    'ok': True,
+                    'moved_from': self._display_rel_path(p_src),
+                    'moved_to': self._display_rel_path(p_dst),
+                }
+            if name == 'send_image':
+                import hashlib as _hashlib
+                import secrets as _secrets
+                orig_path_arg = str(args.get('path') or '').strip(); raw_path_arg = orig_path_arg.removeprefix('workspace/').lstrip('/')
+                if not raw_path_arg:
+                    raise ValueError('path 不能为空')
+                p = self.path(raw_path_arg)
+                if not p.exists() or not p.is_file():
+                    raise ValueError(f'图片文件不存在: {orig_path_arg}')
+                raw_bytes = p.read_bytes()
+                if len(raw_bytes) == 0:
+                    return {'ok': False, 'op': 'send_image', 'source_path': orig_path_arg, 'error': f'图片文件为空 (0 字节)，禁止发送空文件: {orig_path_arg}'}
+                crop_box = args.get('crop_box') if isinstance(args.get('crop_box'), list) else None
+                max_side = max(256, min(2560, int(args.get('max_side') or 1280)))
+                uploads_dir = self.root / 'uploads'
+                uploads_dir.mkdir(parents=True, exist_ok=True)
+                stamp = int(time.time() * 1000) % 100000000
+                rand_suffix = _secrets.token_hex(2)
+                stem = re.sub(r'[^a-zA-Z0-9_-]', '_', p.stem)[:32] or 'image'
+                out_name = f'{stem}-{stamp}-{rand_suffix}.jpg'
+                out_path = uploads_dir / out_name
+                try:
+                    import io as _io
+                    from PIL import Image as _Image
+                    im = _Image.open(_io.BytesIO(raw_bytes)).convert('RGB')
+                    iw, ih = im.size
+                    if crop_box and len(crop_box) == 4:
+                        ymin, xmin, ymax, xmax = [max(0, min(1000, int(v))) for v in crop_box]
+                        if xmax > xmin and ymax > ymin:
+                            left = max(0, int(round(xmin * iw / 1000.0)))
+                            top = max(0, int(round(ymin * ih / 1000.0)))
+                            right = min(iw, int(round(xmax * iw / 1000.0)))
+                            bottom = min(ih, int(round(ymax * ih / 1000.0)))
+                            im = im.crop((left, top, right, bottom))
+                            iw, ih = im.size
+                    if max(iw, ih) > max_side:
+                        scale = max_side / float(max(iw, ih))
+                        im = im.resize((max(1, int(round(iw * scale))), max(1, int(round(ih * scale)))), _Image.Resampling.LANCZOS)
+                    buf = _io.BytesIO()
+                    im.save(buf, format='JPEG', quality=90)
+                    out_bytes = buf.getvalue()
+                    out_path.write_bytes(out_bytes)
+                except Exception as img_err:
+                    if p.suffix.lower() == '.svg' and b'<svg' in raw_bytes[:1024].lower():
+                        out_name = f'{stem}-{stamp}-{rand_suffix}.svg'
+                        out_path = uploads_dir / out_name
+                        out_bytes = raw_bytes
+                        out_path.write_bytes(out_bytes)
+                    else:
+                        return {'ok': False, 'op': 'send_image', 'source_path': orig_path_arg, 'error': f'文件不是合法的可解码图片 ({p.suffix or "无后缀"}: {img_err})，仅支持 PNG/JPG/WEBP/GIF/BMP/SVG 图片: {orig_path_arg}'}
+                media_url = f'/workspace-media/uploads/{out_name}'
+                out_md5 = _hashlib.md5(out_bytes).hexdigest()
+                return {
+                    'ok': True,
+                    'op': 'send_image',
+                    'source_path': raw_path_arg,
+                    'chat_image_url': media_url,
+                    'markdown_embed': f'![{p.stem}]({media_url})',
+                    'output_bytes': len(out_bytes),
+                    'output_md5': out_md5,
+                }
             if name in ('write_file', 'edit_file'):
-                p = self.path(args['path'])
+                raw_target_p = str(args.get('path') or '').strip()
+                vault_rel_w = self._is_vault_rel_path(raw_target_p)
+                if vault_rel_w is not None and Path(raw_target_p).suffix.lower() != '.md':
+                    return {
+                        'ok': False,
+                        'path': raw_target_p,
+                        'error': f'memory_vault/ 记忆库仅接收 .md (Markdown) 笔记（当前后缀为 {Path(raw_target_p).suffix or "无后缀"}）；请改用 .md 后缀，或将非 Markdown 文件写入工作区根目录。',
+                    }
+                p = self.path(raw_target_p)
                 old_text = p.read_text('utf-8', errors='replace') if p.exists() else ''
+                dedup_count = 0
                 if name == 'write_file':
                     if args.get('append') and old_text:
                         sep = '' if old_text.endswith('\n') else '\n'
@@ -573,24 +345,47 @@ class Harness:
                         text = args['content']
                 else:
                     if not p.exists():
-                        raise ValueError('文件不存在')
-                    if not args['old'] or old_text.count(args['old']) != 1:
-                        raise ValueError('旧文本必须精确匹配一次')
+                        raise ValueError(f'文件不存在: {raw_target_p}')
+                    match_cnt = old_text.count(args['old']) if args.get('old') else 0
+                    if not args.get('old') or match_cnt != 1:
+                        raise ValueError('旧文本匹配 0 次（必须精确匹配一次）：请先 read_file 核对原文' if match_cnt == 0 else f'旧文本匹配 {match_cnt} 次（必须精确匹配一次）：请提供更长上下文使匹配唯一化')
                     text = old_text.replace(args['old'], args['new'], 1)
+                if (name == 'edit_file' or (name == 'write_file' and args.get('append'))) and text:
+                    raw_lines = text.splitlines(keepends=True)
+                    old_lines_set = set(old_text.splitlines())
+                    dedup_lines: list[str] = []
+                    in_fence = False
+                    for ln in raw_lines:
+                        stripped = ln.strip()
+                        if stripped.startswith('```'):
+                            in_fence = not in_fence
+                        if (
+                            not in_fence
+                            and dedup_lines
+                            and len(stripped) >= 12
+                            and stripped == dedup_lines[-1].strip()
+                            and old_text.count(stripped + '\n') < 2
+                        ):
+                            dedup_count += 1
+                            continue
+                        dedup_lines.append(ln)
+                    if dedup_count > 0:
+                        text = ''.join(dedup_lines)
                 if len(text.encode()) > 1_000_000:
                     raise ValueError('文件过大')
                 snap_saved = None
-                if self.vault is not None and args['path'].startswith('memory_vault/'):
-                    rel_vault = args['path'][len('memory_vault/'):].lstrip('/')
-                    snap_saved = self.vault.write(rel_vault, text)
-                    if args['path'] != 'memory_vault/INDEX.md':
+                if self.vault is not None and vault_rel_w is not None:
+                    snap_saved = self.vault.write(vault_rel_w, text)
+                    if vault_rel_w != 'INDEX.md':
                         self.vault.reindex()
                 else:
                     atomic_write(p, text)
                 if self.store is not None:
                     self.store.sync_from_workspace(force=True)
-                rel = args['path'] if args['path'].startswith('memory_vault/') else p.relative_to(self.root).as_posix()
-                out_res: dict = {'written': rel, 'bytes': len(text.encode())}
+                rel = self._display_rel_path(p)
+                out_res: dict = {'ok': True, 'written': rel, 'resolved_path': rel, 'bytes': len(text.encode())}
+                if dedup_count > 0:
+                    out_res['deduplicated_adjacent_lines'] = dedup_count
                 if snap_saved:
                     out_res['previous_backup'] = snap_saved
                     if len(old_text) > len(text) + 80:
@@ -598,11 +393,16 @@ class Harness:
                 return out_res
             if name == 'list_dir':
                 rel_arg = str(args.get('path') or '.').strip() or '.'
-                max_depth = max(1, min(3, int(args.get('depth') or 1)))
+                raw_depth = int(args.get('depth') if args.get('depth') is not None else 1)
+                max_depth = max(1, min(3, raw_depth))
                 target = self.path(rel_arg)
                 if not target.is_dir():
-                    raise ValueError('目标不是目录')
+                    raise ValueError(f'目标不是目录: {rel_arg}')
                 entries = []
+                hidden_root_names = {'.transfers', '.versions', 'pylibs', '.venv', 'venv', '.local', 'imapwork', '.ms_access_token', 'imap_ms_creds.json', 'settings.json', 'bots.json'}
+                if self.vault is not None and target == self.root:
+                    hidden_root_names.update(self._VAULT_SUBDIRS)
+                    hidden_root_names.add('INDEX.md')
 
                 def _walk_dir(cur_dir: Path, rel_prefix: str, cur_depth: int):
                     if len(entries) >= 250:
@@ -614,7 +414,7 @@ class Harness:
                     for child in children:
                         if len(entries) >= 250:
                             break
-                        if child.name.startswith('.transfers') or child.name == '.versions':
+                        if child.name in hidden_root_names or child.name.startswith('.transfers') or child.name.startswith('org.chromium.'):
                             continue
                         try:
                             is_d = child.is_dir() and not child.is_symlink()
@@ -635,18 +435,36 @@ class Harness:
                     entries.append({'name': 'memory_vault/', 'type': 'dir', 'bytes': 0})
                     if max_depth > 1:
                         _walk_dir(self.vault.root, 'memory_vault/', 2)
-                return {'path': rel_arg, 'depth': max_depth, 'entries': entries}
+                ld_out: dict = {'path': rel_arg, 'resolved_path': self._display_rel_path(target), 'depth': max_depth, 'entries': entries}
+                if raw_depth != max_depth:
+                    ld_out['depth_requested'] = raw_depth
+                    ld_out['depth_clamped'] = True
+                return ld_out
             if name == 'glob_files':
+                if 'pattern' in args and str(args.get('pattern') or '').strip() == '':
+                    return {'ok': False, 'pattern': '', 'matches': [], 'error': 'pattern 不能为空（如需匹配全部文件请传 "**/*"）'}
                 pattern = str(args.get('pattern') or '**/*').strip()
+                if pattern.count('[') != pattern.count(']') or '[[' in pattern:
+                    return {'ok': False, 'pattern': pattern, 'matches': [], 'error': f'invalid glob pattern（方括号未闭合或语法错误）: {pattern}'}
+                skip_dirs = {'.history', '.cache', '.config', '.python_packages', '.transfers', '.versions', '__pycache__', 'node_modules', '.git', 'pylibs', '.venv', 'venv', '.local', 'imapwork'}
+                if self.vault is not None:
+                    skip_dirs.update(self._VAULT_SUBDIRS)
+                skip_names = {'.ms_access_token', 'imap_ms_creds.json', 'settings.json', 'bots.json', 'INDEX.md'}
                 matches = []
                 for f in sorted(self.root.rglob('*')):
                     if f.is_file() and not f.is_symlink():
+                        rel_parts = f.relative_to(self.root).parts
+                        if f.name in skip_names or any(part in skip_dirs or part.startswith('org.chromium.') for part in rel_parts):
+                            continue
                         rel = f.relative_to(self.root).as_posix()
                         if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(f.name, pattern):
                             matches.append(rel)
                 if self.vault is not None:
                     for f in sorted(self.vault.root.rglob('*.md')):
                         if f.is_file() and not f.is_symlink():
+                            rel_parts = f.relative_to(self.vault.root).parts
+                            if '.history' in rel_parts or self._is_other_bot_private_file(f):
+                                continue
                             rel = 'memory_vault/' + f.relative_to(self.vault.root).as_posix()
                             if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(f.name, pattern):
                                 matches.append(rel)
@@ -655,40 +473,110 @@ class Harness:
                 query = str(args.get('query') or '').strip()
                 if not query:
                     raise ValueError('query 不能为空')
-                rx = re.compile(query, re.IGNORECASE)
-                search_roots = [(self.root, '')]
-                if self.vault is not None:
-                    search_roots.append((self.vault.root, 'memory_vault/'))
+                if bool(args.get('literal', False)):
+                    rx = re.compile(re.escape(query), re.IGNORECASE)
+                else:
+                    try:
+                        rx = re.compile(query, re.IGNORECASE)
+                    except re.error as re_err:
+                        return {'ok': False, 'regex_valid': False, 'query': query, 'path': str(args.get('path') or '.'), 'hits': [], 'error': f'invalid regex ({re_err}): 正则语法非法，请修正括号/转义或传 literal=true'}
+                skip_dirs = {'.history', '.cache', '.config', '.python_packages', '.transfers', '.versions', '__pycache__', 'node_modules', '.git', 'pylibs', '.venv', 'venv', '.local', 'imapwork'}
+                skip_names = {'.ms_access_token', 'imap_ms_creds.json', 'settings.json', 'bots.json'}
+                skip_exts = {'.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.dmp', '.pyc', '.so', '.whl', '.zip', '.tar', '.gz', '.pdf', '.sqlite', '.db', '.ico', '.woff', '.woff2', '.ttf', '.mp3', '.mp4', '.wav', '.ogg', '.apk', '.exe', '.dll', '.bin'}
+                raw_path_filter = str(
+                    args.get('path') or args.get('file_path') or args.get('target') or args.get('dir') or ''
+                ).strip().rstrip('/')
+                search_targets: list[tuple[Path, Path, str]] = []
+                if raw_path_filter and raw_path_filter != '.':
+                    vault_sub_rel = self._is_vault_rel_path(raw_path_filter)
+                    if self.vault is not None and vault_sub_rel is not None:
+                        target_p = (self.vault.root / vault_sub_rel).resolve() if vault_sub_rel else self.vault.root
+                        if not target_p.is_relative_to(self.vault.root.resolve()) or not target_p.exists():
+                            return {'ok': False, 'query': query, 'path': raw_path_filter, 'effective_path': raw_path_filter, 'hits': [], 'error': f'搜索路径不存在: {raw_path_filter}'}
+                        search_targets.append((target_p, self.vault.root, 'memory_vault/'))
+                    else:
+                        clean_ws = raw_path_filter.removeprefix('workspace/').lstrip('/')
+                        ws_cand = (self.root / clean_ws).resolve()
+                        vault_cand = (self.vault.root / clean_ws).resolve() if self.vault is not None else None
+                        if ws_cand.is_relative_to(self.root.resolve()) and ws_cand.exists():
+                            search_targets.append((ws_cand, self.root, ''))
+                        elif vault_cand is not None and vault_cand.is_relative_to(self.vault.root.resolve()) and vault_cand.exists():
+                            search_targets.append((vault_cand, self.vault.root, 'memory_vault/'))
+                        else:
+                            return {'ok': False, 'query': query, 'path': raw_path_filter, 'effective_path': raw_path_filter, 'hits': [], 'error': f'搜索路径不存在: {raw_path_filter}'}
+                else:
+                    if self.vault is not None:
+                        search_targets.append((self.vault.root, self.vault.root, 'memory_vault/'))
+                        skip_dirs = skip_dirs | set(self._VAULT_SUBDIRS)
+                        skip_names = skip_names | {'INDEX.md'}
+                    search_targets.append((self.root, self.root, ''))
+
                 hits = []
-                for base_dir, prefix in search_roots:
-                    for f in sorted(base_dir.rglob('*')):
-                        if not f.is_file() or f.is_symlink() or f.stat().st_size > 512_000:
+                files_scanned = 0
+                for target_p, base_dir, prefix in search_targets:
+                    file_iter = [target_p] if target_p.is_file() else sorted(target_p.rglob('*'))
+                    for f in file_iter:
+                        if not f.is_file() or f.is_symlink():
                             continue
-                        rel = prefix + f.relative_to(base_dir).as_posix()
+                        if f.suffix.lower() in skip_exts or f.name in skip_names or self._is_other_bot_private_file(f):
+                            continue
+                        rel_parts = f.relative_to(base_dir).parts if f != base_dir else ()
+                        if any(part in skip_dirs or part.startswith('org.chromium.') for part in rel_parts):
+                            continue
+                        if not raw_path_filter and f.name.startswith('.'):
+                            continue
                         try:
+                            st_size = f.stat().st_size
+                            if st_size > 512_000 or st_size == 0:
+                                continue
+                            with f.open('rb') as bf:
+                                head_chunk = bf.read(4096)
+                            if b'\x00' in head_chunk:
+                                continue
+                            files_scanned += 1
+                            rel = prefix + f.relative_to(base_dir).as_posix()
                             for idx, line in enumerate(f.read_text('utf-8', errors='ignore').splitlines(), 1):
                                 if rx.search(line):
                                     hits.append({'file': rel, 'line': idx, 'text': line[:220]})
                                     if len(hits) >= 80:
-                                        return {'query': query, 'hits': hits, 'truncated': True}
+                                        return {
+                                            'ok': True,
+                                            'query': query,
+                                            'path': raw_path_filter or '.',
+                                            'effective_path': raw_path_filter or '.',
+                                            'files_scanned': files_scanned,
+                                            'hits': hits,
+                                            'truncated': True,
+                                        }
                         except Exception:
                             continue
-                return {'query': query, 'hits': hits}
+                return {
+                    'ok': True,
+                    'query': query,
+                    'path': raw_path_filter or '.',
+                    'effective_path': raw_path_filter or '.',
+                    'files_scanned': files_scanned,
+                    'hits': hits,
+                }
             if name == 'memory_search':
                 query = str(args.get('query') or '').strip()
                 if not query or self.vault is None:
                     return {'hits': []}
+                raw_lim = args.get('limit')
+                lim = max(1, min(25, int(raw_lim) if raw_lim is not None else 8))
                 rx = re.compile(re.escape(query), re.IGNORECASE)
                 hits = []
                 for f in self.vault.files():
                     content = self.vault.read(f['path'])
                     if rx.search(content) or rx.search(f['path']):
-                        hits.append({'path': 'memory_vault/' + f['path'], 'snippet': content[:800]})
-                return {'query': query, 'hits': hits[:20]}
+                        hits.append({'path': 'memory_vault/' + f['path'], 'snippet': content[:360]})
+                        if len(hits) >= lim:
+                            break
+                return {'query': query, 'hits': hits[:lim]}
             if name == 'run_bash':
                 if sys.platform != 'linux':
                     return {'error': 'Bash 隔离执行仅在 Linux 部署节点可用'}
-                timeout_sec = max(3, min(90, int(args.get('timeout') or 30)))
+                timeout_sec = max(1, min(90, int(args.get('timeout') or 30)))
                 env = os.environ.copy()
                 py_user_base = self.root / '.python_packages'
                 py_user_base.mkdir(parents=True, exist_ok=True)
@@ -752,9 +640,27 @@ class Harness:
                     kill_group()
                 if self.store is not None:
                     self.store.sync_from_workspace(force=True)
-                return {'exit_code': proc.returncode, 'output': out.decode('utf-8', errors='replace')}
+                out_str_b = out.decode('utf-8', errors='replace')
+                res_bash: dict[str, Any] = {'exit_code': proc.returncode, 'cwd': str(self.root), 'output': out_str_b}
+                cmd_raw_s = str(args.get('command') or '')
+                if (proc.returncode != 0 or 'No such file or directory' in out_str_b) and any(
+                    vp in cmd_raw_s or vp in out_str_b for vp in ('memory_vault', 'notes/', 'profile/', 'timeline/', 'tasks/')
+                ):
+                    res_bash['hint'] = (
+                        '提示：memory_vault 位于 Landlock 隔离的独立安全目录，run_bash 工作目录为其同级 workspace；'
+                        '读写或检索 memory_vault 请直接使用 read_file / write_file / edit_file / grep_search 工具，切勿依据 bash 报错误判笔记不存在。'
+                    )
+                return res_bash
             if name == 'web_fetch':
-                return await self.fetch(args['url'])
+                u_arg = str(args.get('url') or '').strip()
+                if not u_arg:
+                    return {'ok': False, 'error': 'url 不能为空'}
+                try:
+                    return await self.fetch(u_arg)
+                except httpx.HTTPStatusError as he:
+                    return {'ok': False, 'url': u_arg, 'error_code': f'HTTP_{he.response.status_code}', 'error': f'抓取网页失败 (HTTP {he.response.status_code}): {u_arg}'}
+                except httpx.RequestError as re_err:
+                    return {'ok': False, 'url': u_arg, 'error_code': type(re_err).__name__, 'error': f'网络连接失败 ({type(re_err).__name__}: 无法访问 {u_arg}，请检查域名或改用 web_search / cloud_desktop)'}
             if name == 'web_search':
                 q = str(args.get('query') or '').strip()
                 if not q:
@@ -779,7 +685,7 @@ class Harness:
         else:
             arch_doc = DEFAULT_SYSTEM_MD
         sticker_hint = self.extension_registry.sticker_prompt_hint()
-        img_hint = '【发送图片与表情贴纸规范】：需要向主人展示工作区图片（如 `desktop-latest.jpg`、`phone-latest.jpg` 或生成的图表）或网络图片时，直接在回复中写 `![图片](文件名或URL)` 或 `<image:文件名或URL>` 即可在聊天气泡内直接渲染图片。'
+        img_hint = '【发送图片与表情贴纸规范】：需要向主人展示工作区生成的成品图表/卡片或网络图片时，请调用 `send_image(path="...")`（支持同一轮多次调用按序发送多张图片），或在回复中写 `![图片](文件名或URL)`（严禁将带标尺的调试截图 `desktop-latest.jpg`、`phone-latest.jpg`、`shot-*.jpg` 直接发给主人）。'
         if sticker_hint:
             img_hint += '\n' + sticker_hint
         return (arch_doc + '\n\n' + img_hint + ('\n\n' + pinned_block if pinned_block else '')).strip()
@@ -838,7 +744,10 @@ class Harness:
                     return c_item, c_name, c_args, res, dur
 
                 results_p = await asyncio.gather(*[_exec_one(c_i, c_n, c_a) for c_i, c_n, c_a in parsed_batch])
+                silent_hit = None
                 for c_item, name, args, result, dur in results_p:
+                    if name in ('stay_silent', 'do_not_disturb') or (isinstance(result, dict) and result.get('_stay_silent')):
+                        silent_hit = result if isinstance(result, dict) else {'reason': 'stay_silent'}
                     if isinstance(result, dict) and result.get('_multimodal_b64'):
                         mm_b64 = str(result.pop('_multimodal_b64'))
                         mm_mime = str(result.pop('_multimodal_mime', 'image/jpeg'))
@@ -858,7 +767,10 @@ class Harness:
                     if len(out_str) > 16000:
                         out_str = out_str[:4000] + f'\n...[工具单步大输出已截断，原长 {len(out_str)} 字符]...\n' + out_str[-1500:]
                     messages.append({'role': 'tool', 'tool_call_id': c_item['id'], 'content': out_str})
+                if silent_hit is not None:
+                    return {'text': 'SILENT_OK', 'trace': trace, 'silent': True, 'reason': str(silent_hit.get('reason') or '')}
             else:
+                silent_hit = None
                 for c in batch_calls:
                     try:
                         args = json.loads(c['function']['arguments'])
@@ -869,6 +781,8 @@ class Harness:
                         await on_event({'type': 'tool_start', 'tool': name, 'arguments': args})
                     started = asyncio.get_running_loop().time()
                     result = await self.execute(name, args) if name in allowed else {'error': '此助手未启用该工具'}
+                    if name in ('stay_silent', 'do_not_disturb') or (isinstance(result, dict) and result.get('_stay_silent')):
+                        silent_hit = result if isinstance(result, dict) else {'reason': 'stay_silent'}
                     if isinstance(result, dict) and result.get('_multimodal_b64'):
                         mm_b64 = str(result.pop('_multimodal_b64'))
                         mm_mime = str(result.pop('_multimodal_mime', 'image/jpeg'))
@@ -888,6 +802,8 @@ class Harness:
                     if len(out_str) > 16000:
                         out_str = out_str[:4000] + f'\n...[工具单步大输出已截断，原长 {len(out_str)} 字符]...\n' + out_str[-1500:]
                     messages.append({'role': 'tool', 'tool_call_id': c['id'], 'content': out_str})
+                if silent_hit is not None:
+                    return {'text': 'SILENT_OK', 'trace': trace, 'silent': True, 'reason': str(silent_hit.get('reason') or '')}
         final_text = '\n\n'.join(accumulated).strip() if accumulated else (msg.get('content') or '').strip()
         if not final_text and trace:
             summary_msg = await complete(

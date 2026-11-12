@@ -14,7 +14,13 @@ import javax.crypto.spec.GCMParameterSpec;
 
 final class SecurePrefs {
     private static final String ALIAS="pulse.settings.v1";
+    private static volatile SecretKey cachedSecretKey;
+    private static volatile String cachedEncryptedRaw;
+    private static volatile String cachedJsonStr;
+
     private static SecretKey key() throws Exception {
+        SecretKey existing=cachedSecretKey;
+        if(existing!=null)return existing;
         KeyStore store=KeyStore.getInstance("AndroidKeyStore");store.load(null);
         if(!store.containsAlias(ALIAS)) {
             KeyGenerator gen=KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES,"AndroidKeyStore");
@@ -22,10 +28,26 @@ final class SecurePrefs {
                 .setBlockModes(KeyProperties.BLOCK_MODE_GCM).setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE).build());
             gen.generateKey();
         }
-        return (SecretKey)store.getKey(ALIAS,null);
+        SecretKey loaded=(SecretKey)store.getKey(ALIAS,null);
+        cachedSecretKey=loaded;
+        return loaded;
     }
+
+    public static JSONObject readFast(Context context) throws Exception {
+        String raw=context.getSharedPreferences("pulse",0).getString("encrypted","");
+        String lastRaw=cachedEncryptedRaw;
+        String lastJson=cachedJsonStr;
+        if(lastRaw!=null && lastJson!=null && raw.equals(lastRaw)){
+            return new JSONObject(lastJson);
+        }
+        return read(context);
+    }
+
     static synchronized JSONObject read(Context context) throws Exception {
         String raw=context.getSharedPreferences("pulse",0).getString("encrypted","");
+        if(cachedEncryptedRaw!=null && cachedJsonStr!=null && raw.equals(cachedEncryptedRaw)){
+            return new JSONObject(cachedJsonStr);
+        }
         JSONObject result;
         if(raw.isEmpty()){
             result=new JSONObject().put("serverUrl",SecureTransport.DEFAULT_SERVER)
@@ -39,12 +61,23 @@ final class SecurePrefs {
             if(result.optString("serverUrl","").trim().isEmpty()) result.put("serverUrl",SecureTransport.DEFAULT_SERVER);
             if(result.optString("deviceToken","").trim().isEmpty()) result.put("deviceToken",SecureTransport.defaultToken());
         }
+        cachedEncryptedRaw=raw;
+        cachedJsonStr=result.toString();
         return result;
     }
+
+    static synchronized void write(Context context,JSONObject settings) throws Exception {
+        save(context,settings);
+    }
+
     static synchronized void save(Context context,JSONObject settings) throws Exception {
+        String jsonStr=settings.toString();
         Cipher cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.ENCRYPT_MODE,key());
         JSONObject packet=new JSONObject().put("iv",Base64.encodeToString(cipher.getIV(),Base64.NO_WRAP))
-            .put("data",Base64.encodeToString(cipher.doFinal(settings.toString().getBytes(StandardCharsets.UTF_8)),Base64.NO_WRAP));
-        if(!context.getSharedPreferences("pulse",0).edit().putString("encrypted",packet.toString()).commit())throw new Exception("本地加密保存失败");
+            .put("data",Base64.encodeToString(cipher.doFinal(jsonStr.getBytes(StandardCharsets.UTF_8)),Base64.NO_WRAP));
+        String rawPacket=packet.toString();
+        if(!context.getSharedPreferences("pulse",0).edit().putString("encrypted",rawPacket).commit())throw new Exception("本地加密保存失败");
+        cachedEncryptedRaw=rawPacket;
+        cachedJsonStr=jsonStr;
     }
 }

@@ -1,0 +1,40 @@
+{
+  "name": "dsh-deepseek-claw",
+  "version": "3.0.0",
+  "description": "DSB 跨端智能助手与桌面工作台",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "assets",
+    "cua",
+    "cua-bridge.mjs",
+    "sentinel.mjs",
+    "setup.mjs",
+    "lib-sentinel-net.mjs",
+    "lib-chat-cache.mjs",
+    "lib-dsh-sessions.mjs"
+  ],
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}

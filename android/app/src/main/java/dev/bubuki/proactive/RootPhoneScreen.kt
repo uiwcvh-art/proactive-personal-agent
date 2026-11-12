@@ -167,7 +167,7 @@ import kotlin.math.min
                         })
                     }
                     Text(if (state.phase == "running") "助手正在执行。停止后可手动点按工作区。" else "点按或滑动画面即可操作独立屏。", color = colors.ink2, fontSize = 11.sp)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { OutlinedButton(onClick = { act("capture") }, enabled = !busy) { Text("刷新") }; OutlinedButton(onClick = { act("key", JSONObject().put("key", "back")) }, enabled = manual) { Text("返回") }; OutlinedButton(onClick = { act("release") }, enabled = manual && !state.active) { Text("释放") } }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { OutlinedButton(onClick = { act("capture") }, enabled = !busy) { Text("刷新") }; OutlinedButton(onClick = { act("key", JSONObject().put("key", "back")) }, enabled = manual) { Text("返回") }; OutlinedButton(onClick = { act("release", JSONObject().put("destroy", true).put("user_close", true)) }, enabled = manual && !state.active) { Text("销毁虚拟屏", color = MaterialTheme.colorScheme.error) } }
                     OutlinedTextField(input, { input = it.take(4000) }, label = { Text("输入到工作区") }, modifier = Modifier.fillMaxWidth(), enabled = manual, maxLines = 3)
                     OutlinedButton(onClick = { scope.launch { if (command("text", JSONObject().put("text", input))) input = "" } }, enabled = manual && input.isNotEmpty(), modifier = Modifier.fillMaxWidth()) { Text("发送文字") }
                 }

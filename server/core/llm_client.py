@@ -17,6 +17,12 @@ import re
 import secrets
 import time
 import httpx
+from core.xml_tool_parser import (
+    KNOWN_XML_TOOLS as _PARSER_KNOWN_XML_TOOLS,
+    coerce_xml_param,
+    extract_inline_tool_calls,
+    strip_inline_tool_markup,
+)
 
 
 class LLMClient:
@@ -42,58 +48,20 @@ class LLMClient:
             pass
         self._models_cache: tuple[float, str, list[str]] | None = None
 
-    KNOWN_XML_TOOLS = (
-        'cloud_desktop', 'phone_workspace', 'read_file', 'write_file', 'edit_file',
-        'list_dir', 'glob_files', 'grep_search', 'run_bash', 'run_command',
-        'bg_task', 'watchdog_task', 'conversation_search', 'ctx_search',
-        'present_choices', 'memory_pin', 'blackboard', 'custom_tool',
-        'phone_macro', 'send_message', 'manage_bot', 'list_models',
-        'schedule_task', 'memory_search', 'notify_user', 'emergency_alarm',
-        'web_fetch', 'web_search', 'integration_hub',
-    )
+    KNOWN_XML_TOOLS = _PARSER_KNOWN_XML_TOOLS
     _KNOWN_XML_TOOLS_ALT = '|'.join(KNOWN_XML_TOOLS)
-    _STRING_ONLY_PARAMS = {
-        'text', 'content', 'old', 'new', 'path', 'url', 'uri', 'query', 'goal',
-        'target', 'ref', 'app', 'package', 'command', 'script', 'code', 'key',
-        'name', 'title', 'body', 'reason', 'prompt', 'at_time', 'daily_time',
-        'weekdays', 'task_id', 'bot_id', 'to_bot_id', 'ctx_id', 'pin_id',
-        'label', 'direction', 'engine', 'source',
-    }
 
     @classmethod
     def _coerce_xml_param(cls, p_name: str, raw_val: str, is_str_flag: str = ''):
-        if is_str_flag == 'true':
-            return raw_val
-        if p_name in cls._STRING_ONLY_PARAMS and not raw_val.startswith(('[', '{')):
-            return raw_val
-        if (
-            is_str_flag == 'false'
-            or raw_val.startswith(('[', '{'))
-            or raw_val in ('true', 'false', 'null')
-            or re.fullmatch(r'-?\d+(?:\.\d+)?', raw_val)
-        ):
-            try:
-                return json.loads(raw_val)
-            except Exception:
-                pass
-        return raw_val
+        return coerce_xml_param(p_name, raw_val, is_str_flag)
 
     @classmethod
-    def _parse_xml_kv_and_children(cls, attrs_str: str, body_str: str) -> dict:
-        args_dict: dict = {}
-        if attrs_str:
-            for m_attr in re.finditer(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(?:"([^"]*)"|\'([^\']*)\')', attrs_str):
-                k = m_attr.group(1).strip()
-                v = m_attr.group(2) if m_attr.group(2) is not None else (m_attr.group(3) or '')
-                if k:
-                    args_dict[k] = cls._coerce_xml_param(k, v.strip())
-        if body_str:
-            for m_child in re.finditer(r'<([a-zA-Z_][a-zA-Z0-9_]*)[^>]*>([\s\S]*?)</\s*\1\s*>', body_str):
-                k = m_child.group(1).strip()
-                v = (m_child.group(2) or '').strip()
-                if k:
-                    args_dict[k] = cls._coerce_xml_param(k, v)
-        return args_dict
+    def _extract_dsml_tool_calls(cls, text: str) -> list[dict]:
+        return extract_inline_tool_calls(text)
+
+    @classmethod
+    def _strip_dsml(cls, text: str) -> str:
+        return strip_inline_tool_markup(text)
 
     @classmethod
     def strip_streaming_dsml_tail(cls, text: str) -> str:
@@ -101,7 +69,7 @@ class LLMClient:
         if not text:
             return ''
         m = re.search(
-            r'(?<!`)<(?:[|｜]{1,2}\s*DSML[|｜\s]*(?:function_calls|calls|invoke)\b|function_calls\b|antml:function_calls\b|invoke\s+name=)',
+            r'(?<!`)<(?:[|｜]{1,2}\s*DSML[|｜\s]*(?:function_calls|calls|invoke)\b|function_calls\b|functions_tool_call\b|functions\b|tool_call\b|call\b|function(?:=|\s+name=)|antml:function_calls\b|invoke\s+name=)',
             text,
             flags=re.IGNORECASE,
         )
@@ -114,7 +82,6 @@ class LLMClient:
         )
         if m_pseudo:
             return text[:m_pseudo.start()].rstrip()
-        # Also hide trailing partial opening tag like `<｜` or `<｜｜` at the very end of stream
         m_tail = re.search(r'(?<!`)<[|｜]{1,2}(?:DSML[|｜\s]*)?[A-Za-z_]*$', text)
         if m_tail:
             return text[:m_tail.start()].rstrip()
@@ -123,172 +90,18 @@ class LLMClient:
     @classmethod
     def parse_and_strip_dsml_calls(cls, text: str) -> tuple[str, list[dict]]:
         """
-        Parses leaked DeepSeek native DSML tool calls (`<｜DSML｜...>` or `<｜｜DSML｜｜ calls>`)
-        AND pseudo-XML tool calls (`<cloud_desktop op="..."/>` or `<cloud_desktop">\\n<op>...</op>\\n</cloud_desktop>`)
-        into standard OpenAI `tool_calls` dicts and strips the raw tags (and any post-tag hallucinated steps) from `content`.
+        Parses all 5 inline tool call formats (DeepSeek DSML, <function=...>, <functions_tool_call>,
+        <tool_call>, <call>, <functions>, and direct tool tags) via `xml_tool_parser` and strips markup.
         """
         if not text:
             return text, []
-        has_dsml = ('DSML' in text or '<function_calls>' in text or '<invoke' in text)
-        has_pseudo = bool(re.search(rf'(?<!`)<(?:{cls._KNOWN_XML_TOOLS_ALT})(?:\s|["\'>/]|$)', text, flags=re.IGNORECASE))
-        if not has_dsml and not has_pseudo:
-            return text, []
-
-        extracted_calls: list[dict] = []
-        first_tag_pos: int | None = None
-
-        def _mark_pos(pos: int):
-            nonlocal first_tag_pos
-            if first_tag_pos is None or pos < first_tag_pos:
-                first_tag_pos = pos
-
-        if has_dsml:
-            m_outer = re.search(
-                r'(?<!`)<(?:[|｜\s]*DSML[|｜\s]*(?:function_calls|calls|invoke)\b|function_calls\b|invoke\s+name=)',
-                text,
-                flags=re.IGNORECASE,
-            )
-            if m_outer:
-                _mark_pos(m_outer.start())
-            inv_pattern = re.compile(
-                r'<[|｜\s]*(?:DSML[|｜\s]*)?invoke\s+name=["\']([^"\']+)["\'][^>]*>([\s\S]*?)</[|｜\s]*(?:DSML[|｜\s]*)?invoke\s*>',
-                flags=re.IGNORECASE,
-            )
-            param_pattern = re.compile(
-                r'<[|｜\s]*(?:DSML[|｜\s]*)?parameter\s+name=["\']([^"\']+)["\'](?:\s+string=["\']([^"\']+)["\'])?[^>]*>([\s\S]*?)</[|｜\s]*(?:DSML[|｜\s]*)?parameter\s*>',
-                flags=re.IGNORECASE,
-            )
-            for idx, m_inv in enumerate(inv_pattern.finditer(text)):
-                _mark_pos(m_inv.start())
-                fn_name = (m_inv.group(1) or '').strip()
-                body = m_inv.group(2) or ''
-                if not fn_name:
-                    continue
-                args_dict: dict = {}
-                for m_p in param_pattern.finditer(body):
-                    p_name = (m_p.group(1) or '').strip()
-                    is_str_flag = (m_p.group(2) or '').strip().lower()
-                    raw_val = (m_p.group(3) or '').strip()
-                    if not p_name:
-                        continue
-                    args_dict[p_name] = cls._coerce_xml_param(p_name, raw_val, is_str_flag)
-                extracted_calls.append({
-                    'id': f'call_dsml_{idx}_{secrets.token_hex(4)}',
-                    'type': 'function',
-                    'function': {
-                        'name': fn_name,
-                        'arguments': json.dumps(args_dict, ensure_ascii=False),
-                    },
-                })
-
-        if has_pseudo:
-            # 1. Paired block tags: <cloud_desktop ...>...</cloud_desktop> or <cloud_desktop">\n<op>...</op>\n</cloud_desktop>
-            paired_rx = re.compile(
-                rf'(?<!`)<(?P<tname>{cls._KNOWN_XML_TOOLS_ALT})(?P<attrs>(?:\s+[^>]*?|["\'][^>]*?))?>(?P<body>[\s\S]*?)</\s*(?P=tname)\s*>',
-                flags=re.IGNORECASE,
-            )
-            paired_spans: list[tuple[int, int]] = []
-            for m_pair in paired_rx.finditer(text):
-                paired_spans.append((m_pair.start(), m_pair.end()))
-                t_name = m_pair.group('tname').lower()
-                attrs_s = m_pair.group('attrs') or ''
-                body_s = m_pair.group('body') or ''
-                args_d = cls._parse_xml_kv_and_children(attrs_s, body_s)
-                if args_d or t_name == 'list_models':
-                    _mark_pos(m_pair.start())
-                    extracted_calls.append({
-                        'id': f'call_xml_{len(extracted_calls)}_{secrets.token_hex(4)}',
-                        'type': 'function',
-                        'function': {
-                            'name': t_name,
-                            'arguments': json.dumps(args_d, ensure_ascii=False),
-                        },
-                    })
-
-            # 2. Self-closing tags: <cloud_desktop op="type" ... /> or <phone_workspace op="open" target="Outlook"/>
-            self_close_rx = re.compile(
-                rf'(?<!`)<(?P<tname>{cls._KNOWN_XML_TOOLS_ALT})(?P<attrs>\s+[^>]+?)/\s*>',
-                flags=re.IGNORECASE,
-            )
-            for m_sc in self_close_rx.finditer(text):
-                if any(s <= m_sc.start() < e for s, e in paired_spans):
-                    continue
-                t_name = m_sc.group('tname').lower()
-                attrs_s = m_sc.group('attrs') or ''
-                args_d = cls._parse_xml_kv_and_children(attrs_s, '')
-                if args_d or t_name == 'list_models':
-                    _mark_pos(m_sc.start())
-                    extracted_calls.append({
-                        'id': f'call_xml_{len(extracted_calls)}_{secrets.token_hex(4)}',
-                        'type': 'function',
-                        'function': {
-                            'name': t_name,
-                            'arguments': json.dumps(args_d, ensure_ascii=False),
-                        },
-                    })
-
-            # 3. Unclosed trailing pseudo-XML tag at end of text (e.g. `<cloud_desktop">` or truncated `<cloud_desktop">\n<op>tap</op>`)
-            unclosed_rx = re.compile(
-                rf'(?<!`)<(?P<tname>{cls._KNOWN_XML_TOOLS_ALT})(?P<attrs>(?:\s+[^>]*?|["\'][^>]*?))?>(?P<body>[\s\S]*)$',
-                flags=re.IGNORECASE,
-            )
-            m_unc = unclosed_rx.search(text)
-            if m_unc and not any(s <= m_unc.start() < e for s, e in paired_spans):
-                t_name = m_unc.group('tname').lower()
-                attrs_s = (m_unc.group('attrs') or '').rstrip('/')
-                body_s = m_unc.group('body') or ''
-                args_d = cls._parse_xml_kv_and_children(attrs_s, body_s)
-                if args_d and not extracted_calls:
-                    _mark_pos(m_unc.start())
-                    extracted_calls.append({
-                        'id': f'call_xml_{len(extracted_calls)}_{secrets.token_hex(4)}',
-                        'type': 'function',
-                        'function': {
-                            'name': t_name,
-                            'arguments': json.dumps(args_d, ensure_ascii=False),
-                        },
-                    })
-
-        if not extracted_calls and first_tag_pos is None:
-            return text, []
-
-        # Truncate any post-tag hallucinated steps written after an inline tool call tag!
-        if first_tag_pos is not None and text[:first_tag_pos].strip():
-            cleaned = text[:first_tag_pos].strip()
+        extracted = extract_inline_tool_calls(text)
+        if extracted:
+            pre_text = cls.strip_streaming_dsml_tail(text)
+            cleaned = strip_inline_tool_markup(pre_text) if pre_text.strip() else strip_inline_tool_markup(text)
         else:
-            cleaned = re.sub(
-                r'(?<!`)<[|｜\s]*DSML[|｜\s]*(?:function_calls|calls)\s*>[\s\S]*?</[|｜\s]*DSML[|｜\s]*(?:function_calls|calls)\s*>',
-                '',
-                text,
-                flags=re.IGNORECASE,
-            )
-            cleaned = re.sub(
-                r'(?<!`)<[|｜\s]*DSML[|｜\s]*(?:function_calls|calls|invoke)\b[\s\S]*$',
-                '',
-                cleaned,
-                flags=re.IGNORECASE,
-            )
-            cleaned = re.sub(r'(?<!`)<function_calls>[\s\S]*?</function_calls>', '', cleaned, flags=re.IGNORECASE)
-            cleaned = re.sub(
-                rf'(?<!`)<(?P<tname>{cls._KNOWN_XML_TOOLS_ALT})(?:\s+[^>]*?|["\'][^>]*?)?>[\s\S]*?</\s*(?P=tname)\s*>',
-                '',
-                cleaned,
-                flags=re.IGNORECASE,
-            )
-            cleaned = re.sub(
-                rf'(?<!`)<(?:{cls._KNOWN_XML_TOOLS_ALT})\s+[^>]+?/\s*>',
-                '',
-                cleaned,
-                flags=re.IGNORECASE,
-            )
-            cleaned = re.sub(
-                rf'(?<!`)<(?:{cls._KNOWN_XML_TOOLS_ALT})(?:\s+[^>]*?|["\'][^>]*?)?>?[\s\S]*$',
-                '',
-                cleaned,
-                flags=re.IGNORECASE,
-            )
-        cleaned = re.sub(r'\n*\[系统(?:真实记录|最后修正|修正|注):[^\]]*\]', '', cleaned).strip()
-        return cleaned.strip(), extracted_calls
+            cleaned = strip_inline_tool_markup(text)
+        return cleaned, extracted
 
     @staticmethod
     def _estimate_text_tokens(text: str) -> int:
@@ -326,9 +139,12 @@ class LLMClient:
         usage: dict | None,
         is_foreground: bool = True,
         fallback_tokens: int = 0,
+        source: str = 'phone',
     ) -> tuple[bool, int, int, int]:
         if not bot_id:
             return False, 0, 0, 0
+        norm_src = 'pc' if str(source or '').strip().lower() in ('pc', 'desktop', 'computer', 'dsh') else 'phone'
+        nb_key = f'{norm_src}:{bot_id}'
         pt = 0
         cached = 0
         comp = 0
@@ -343,8 +159,8 @@ class LLMClient:
                 or usage.get('cached_tokens')
                 or 0
             )
+        prev_pt = int(self.last_prompt_tokens.get(nb_key, self.last_prompt_tokens.get(bot_id, 0) if norm_src == 'phone' else 0) or 0)
         if pt <= 0 and is_foreground and fallback_tokens > 0:
-            prev_pt = int(self.last_prompt_tokens.get(bot_id, 0) or 0)
             pt = fallback_tokens
             # Even when `fallback_tokens < prev_pt` (because the previous turn had temporary tool loop outputs
             # that were not persisted into `state['messages']`), the shared base prefix `min(fallback_tokens, prev_pt)`
@@ -356,15 +172,22 @@ class LLMClient:
             return False, 0, 0, comp
         eff_cached = max(0, min(pt, cached))
         # Never let a small background vision/consolidation call overwrite the foreground conversation's real token count!
-        if is_foreground or pt > int(self.last_prompt_tokens.get(bot_id, 0) or 0):
-            self.last_prompt_tokens[bot_id] = pt
+        if is_foreground or pt > prev_pt:
+            self.last_prompt_tokens[nb_key] = pt
+            if norm_src == 'phone':
+                self.last_prompt_tokens[bot_id] = pt
             if eff_cached > 0 or is_foreground:
-                self.last_cached_tokens[bot_id] = eff_cached
+                self.last_cached_tokens[nb_key] = eff_cached
+                if norm_src == 'phone':
+                    self.last_cached_tokens[bot_id] = eff_cached
             try:
                 st_pt = self.store.state.setdefault('last_prompt_tokens', {})
                 st_ct = self.store.state.setdefault('last_cached_tokens', {})
-                st_pt[bot_id] = pt
-                st_ct[bot_id] = self.last_cached_tokens.get(bot_id, 0)
+                st_pt[nb_key] = pt
+                st_ct[nb_key] = self.last_cached_tokens.get(nb_key, 0)
+                if norm_src == 'phone':
+                    st_pt[bot_id] = pt
+                    st_ct[bot_id] = self.last_cached_tokens.get(bot_id, 0)
             except Exception:
                 pass
             return True, pt, eff_cached, comp
@@ -380,11 +203,16 @@ class LLMClient:
         completion_tokens: int,
         model: str = '',
         is_foreground: bool = True,
+        source: str = 'phone',
     ) -> dict:
+        norm_src = 'pc' if str(source or '').strip().lower() in ('pc', 'desktop', 'computer', 'dsh') else 'phone'
+        nb_key = f'{norm_src}:{bot_id}'
         gen_ms = max(60, total_ms - max(0, ttft_ms)) if ttft_ms > 0 and total_ms > ttft_ms else max(100, total_ms)
         tps = round((completion_tokens * 1000.0) / gen_ms, 1) if completion_tokens > 0 else 0.0
-        eff_pt = prompt_tokens or int(self.last_prompt_tokens.get(bot_id, 0) or 0)
-        eff_ct = cached_tokens if prompt_tokens > 0 else int(self.last_cached_tokens.get(bot_id, 0) or 0)
+        fallback_pt = int(self.last_prompt_tokens.get(nb_key, self.last_prompt_tokens.get(bot_id, 0) if norm_src == 'phone' else 0) or 0)
+        fallback_ct = int(self.last_cached_tokens.get(nb_key, self.last_cached_tokens.get(bot_id, 0) if norm_src == 'phone' else 0) or 0)
+        eff_pt = prompt_tokens or fallback_pt
+        eff_ct = cached_tokens if prompt_tokens > 0 else fallback_ct
         eff_ct = max(0, min(eff_pt, eff_ct))
         hit_pct = int(round((eff_ct * 100.0) / max(1, eff_pt))) if eff_pt > 0 else 0
         m_obj = {
@@ -399,10 +227,14 @@ class LLMClient:
             'updated_at': round(time.time(), 2),
         }
         if is_foreground and bot_id:
-            self.last_metrics[bot_id] = m_obj
+            self.last_metrics[nb_key] = m_obj
+            if norm_src == 'phone':
+                self.last_metrics[bot_id] = m_obj
             try:
                 st_m = self.store.state.setdefault('last_metrics', {})
-                st_m[bot_id] = m_obj
+                st_m[nb_key] = m_obj
+                if norm_src == 'phone':
+                    st_m[bot_id] = m_obj
             except Exception:
                 pass
         return m_obj
@@ -492,6 +324,30 @@ class LLMClient:
         return ''
 
     @staticmethod
+    def _sanitize_tools(tools: list[dict] | None) -> list[dict] | None:
+        if not tools:
+            return None
+        import hashlib
+        sanitized: list[dict] = []
+        for t in tools:
+            if not isinstance(t, dict) or not isinstance(t.get('function'), dict):
+                continue
+            fn = dict(t['function'])
+            raw_name = str(fn.get('name') or '').strip()
+            if not raw_name:
+                continue
+            if not re.fullmatch(r'[a-zA-Z0-9_-]{1,64}', raw_name):
+                ascii_part = re.sub(r'[^a-zA-Z0-9_-]', '', raw_name)[:32].strip('_-')
+                digest = hashlib.md5(raw_name.encode('utf-8')).hexdigest()[:8]
+                safe_name = f'custom_{ascii_part}_{digest}' if ascii_part else f'custom_tool_{digest}'
+                desc = str(fn.get('description') or '')
+                if raw_name not in desc:
+                    fn['description'] = f'[{raw_name}] {desc}'.strip()
+                fn['name'] = safe_name
+            sanitized.append({**t, 'function': fn})
+        return sanitized or None
+
+    @staticmethod
     def _normalize_messages(messages: list[dict]) -> list[dict]:
         normalized: list[dict] = []
         for m in messages:
@@ -521,10 +377,11 @@ class LLMClient:
             raise ValueError('请先在设置中配置 API Key 和 Model')
         base_url, api_key, model = candidates[0]
         norm_msgs = self._normalize_messages(messages)
+        clean_tools = self._sanitize_tools(tools)
         payload: dict = {'model': model, 'messages': norm_msgs, 'stream': False}
-        if tools:
+        if clean_tools:
             eff_choice = tool_choice or 'auto'
-            payload.update(tools=tools, tool_choice=eff_choice, parallel_tool_calls=True)
+            payload.update(tools=clean_tools, tool_choice=eff_choice, parallel_tool_calls=True)
         if max_tokens:
             payload['max_tokens'] = max_tokens
 
@@ -589,6 +446,8 @@ class LLMClient:
         stream_prefix: str = '',
         on_stream: callable | None = None,
         tool_choice: str | dict | None = None,
+        source: str = 'phone',
+        is_foreground: bool = True,
     ) -> dict:
         """Foreground streaming LLM call with real-time token & tool-call delta callbacks and transient retry."""
         candidates = self._resolve_endpoint_candidates(bot_id, bot_model, big=big)
@@ -596,16 +455,17 @@ class LLMClient:
             raise ValueError('请先在设置中配置 API Key 和 Model')
         base_url, api_key, model = candidates[0]
         norm_msgs = self._normalize_messages(messages)
-        est_payload_tokens = self._estimate_payload_tokens(norm_msgs, tools)
+        clean_tools = self._sanitize_tools(tools)
+        est_payload_tokens = self._estimate_payload_tokens(norm_msgs, clean_tools)
         payload: dict = {
             'model': model,
             'messages': norm_msgs,
             'stream': True,
             'stream_options': {'include_usage': True},
         }
-        if tools:
+        if clean_tools:
             eff_choice = tool_choice or 'auto'
-            payload.update(tools=tools, tool_choice=eff_choice, parallel_tool_calls=True)
+            payload.update(tools=clean_tools, tool_choice=eff_choice, parallel_tool_calls=True)
 
         for attempt in range(3):
             if attempt > 0 and len(candidates) > 1:
@@ -652,14 +512,14 @@ class LLMClient:
                             total_ms = int(round((time.perf_counter() - t_req) * 1000))
                             body = json.loads(raw_bytes.decode('utf-8', errors='replace'))
                             usage = body.get('usage') or {}
-                            _, pt, ct, comp = self._record_usage(bot_id, usage, is_foreground=True, fallback_tokens=est_payload_tokens)
+                            _, pt, ct, comp = self._record_usage(bot_id, usage, is_foreground=is_foreground, fallback_tokens=est_payload_tokens, source=source)
                             msg = body['choices'][0]['message']
                             raw_c = str(msg.get('content') or '')
                             clean_c, dsml_calls = self.parse_and_strip_dsml_calls(raw_c)
                             merged_calls = list(msg.get('tool_calls') or []) + dsml_calls
                             if comp <= 0:
                                 comp = self._estimate_text_tokens(raw_c)
-                            metrics = self._record_perf_metrics(bot_id, total_ms, total_ms, pt, ct, comp, model=model, is_foreground=True)
+                            metrics = self._record_perf_metrics(bot_id, total_ms, total_ms, pt, ct, comp, model=model, is_foreground=is_foreground, source=source)
                             if clean_c and on_stream:
                                 await on_stream(text=clean_c)
                             out_msg: dict = {'role': 'assistant', 'content': clean_c, '_metrics': metrics}
@@ -671,8 +531,13 @@ class LLMClient:
                         reasoning_parts: list[str] = []
                         tool_calls_map: dict[int, dict] = {}
                         last_emit = 0.0
+                        first_thought_emitted = False
+                        first_content_emitted = False
+                        first_tc_emitted = False
                         next_auto_idx = 0
                         saw_usage = False
+                        saw_done = False
+                        last_finish_reason = ''
                         rep_pt, rep_ct, rep_comp = 0, 0, 0
                         unflushed_content = False
                         async for line in r.aiter_lines():
@@ -681,6 +546,7 @@ class LLMClient:
                                 continue
                             data_str = line[5:].strip()
                             if data_str == '[DONE]':
+                                saw_done = True
                                 break
                             try:
                                 chunk = json.loads(data_str)
@@ -688,7 +554,7 @@ class LLMClient:
                                 continue
                             usage = chunk.get('usage') or {}
                             if usage:
-                                ok_u, u_pt, u_ct, u_comp = self._record_usage(bot_id, usage, is_foreground=True)
+                                ok_u, u_pt, u_ct, u_comp = self._record_usage(bot_id, usage, is_foreground=is_foreground, source=source)
                                 if ok_u:
                                     saw_usage = True
                                     rep_pt, rep_ct, rep_comp = u_pt, u_ct, u_comp
@@ -696,6 +562,8 @@ class LLMClient:
                             if not choices:
                                 continue
                             choice0 = choices[0]
+                            if choice0.get('finish_reason'):
+                                last_finish_reason = str(choice0['finish_reason'])
                             # CRITICAL FIX: Never use `choice0.get('delta') or choice0.get('message')`!
                             # An empty dict `{}` in `delta` on the final finish_reason chunk is falsy in Python
                             # and would fall back to `message`, duplicating the entire response!
@@ -716,29 +584,33 @@ class LLMClient:
                                 reasoning_parts.append(r_delta)
                                 if not content_parts and on_stream:
                                     now = time.time()
-                                    if now - last_emit >= 0.08:
+                                    if (not first_thought_emitted) or (now - last_emit >= 0.05):
+                                        first_thought_emitted = True
                                         last_emit = now
-                                        tail_thought = ''.join(reasoning_parts).strip()[-360:]
+                                        tail_thought = ''.join(reasoning_parts).strip()[-1200:]
                                         await on_stream(text=stream_prefix or '正在思考…', thought=tail_thought)
                             if c_delta:
                                 content_parts.append(c_delta)
                                 unflushed_content = True
                                 if on_stream:
                                     now = time.time()
-                                    if now - last_emit >= 0.035:
+                                    if (not first_content_emitted) or (now - last_emit >= 0.035):
+                                        first_content_emitted = True
                                         last_emit = now
                                         unflushed_content = False
                                         active_tc = tool_calls_map[max(tool_calls_map.keys())]['function'].get('name') if tool_calls_map else None
+                                        r_tail = ''.join(reasoning_parts).strip()[-1200:] if reasoning_parts else None
                                         safe_live_txt = self.strip_streaming_dsml_tail(''.join(content_parts))
                                         if safe_live_txt or not stream_prefix:
-                                            await on_stream(text=safe_live_txt or stream_prefix or '正在思考…', tool=active_tc or None, thought=None)
+                                            await on_stream(text=safe_live_txt or stream_prefix or '正在思考…', tool=active_tc or None, thought=r_tail)
                             if tc_deltas and unflushed_content and on_stream and content_parts:
                                 # Flush any short sentence spoken right before tool calls immediately so the user sees it BEFORE the tool starts!
                                 unflushed_content = False
                                 last_emit = time.time()
+                                r_tail = ''.join(reasoning_parts).strip()[-1200:] if reasoning_parts else None
                                 safe_live_txt = self.strip_streaming_dsml_tail(''.join(content_parts))
                                 if safe_live_txt:
-                                    await on_stream(text=safe_live_txt, tool=None, thought=None)
+                                    await on_stream(text=safe_live_txt, tool=None, thought=r_tail)
                             for tc in tc_deltas:
                                 raw_idx = tc.get('index')
                                 tc_id = tc.get('id')
@@ -763,11 +635,13 @@ class LLMClient:
                                     entry['function']['arguments'] += fn['arguments']
                                 if on_stream:
                                     now = time.time()
-                                    if now - last_emit >= 0.08:
+                                    if (not first_tc_emitted and entry['function'].get('name')) or (now - last_emit >= 0.06):
+                                        if entry['function'].get('name'):
+                                            first_tc_emitted = True
                                         last_emit = now
                                         cur_fn = entry['function']
                                         t_name = cur_fn.get('name') or 'tool'
-                                        r_tail = ''.join(reasoning_parts).strip()[-360:] if reasoning_parts else None
+                                        r_tail = ''.join(reasoning_parts).strip()[-1200:] if reasoning_parts else None
                                         safe_live_txt = self.strip_streaming_dsml_tail(''.join(content_parts)).strip()
                                         cur_text = safe_live_txt or stream_prefix or f'正在调用 {t_name}…'
                                         await on_stream(text=cur_text, tool=t_name, thought=r_tail)
@@ -776,7 +650,7 @@ class LLMClient:
                         if ttft_ms == 0:
                             ttft_ms = total_ms
                         if not saw_usage:
-                            _, rep_pt, rep_ct, rep_comp = self._record_usage(bot_id, None, is_foreground=True, fallback_tokens=est_payload_tokens)
+                            _, rep_pt, rep_ct, rep_comp = self._record_usage(bot_id, None, is_foreground=is_foreground, fallback_tokens=est_payload_tokens, source=source)
                         raw_full_content = ''.join(content_parts)
                         full_content, dsml_calls = self.parse_and_strip_dsml_calls(raw_full_content)
                         for d_idx, d_call in enumerate(dsml_calls):
@@ -784,7 +658,7 @@ class LLMClient:
                         if rep_comp <= 0:
                             tc_str = json.dumps([tool_calls_map[k] for k in sorted(tool_calls_map.keys())], ensure_ascii=False) if tool_calls_map else ''
                             rep_comp = max(1, self._estimate_text_tokens(raw_full_content + ''.join(reasoning_parts) + tc_str))
-                        metrics = self._record_perf_metrics(bot_id, ttft_ms, total_ms, rep_pt, rep_ct, rep_comp, model=model, is_foreground=True)
+                        metrics = self._record_perf_metrics(bot_id, ttft_ms, total_ms, rep_pt, rep_ct, rep_comp, model=model, is_foreground=is_foreground, source=source)
 
                         r_full = ''.join(reasoning_parts).strip() or None
                         if full_content and on_stream and not tool_calls_map:
@@ -794,7 +668,13 @@ class LLMClient:
                             t_name = last_fn.get('name') or 'tool'
                             cur_text = full_content.strip() or stream_prefix or f'正在调用 {t_name}…'
                             await on_stream(text=cur_text, tool=t_name, thought=r_full)
-                        result_msg: dict = {'role': 'assistant', 'content': full_content or '', '_metrics': metrics}
+                        result_msg: dict = {
+                            'role': 'assistant',
+                            'content': full_content or '',
+                            '_metrics': metrics,
+                            '_finish_reason': last_finish_reason,
+                            '_stream_incomplete': bool(not saw_done and not last_finish_reason and (reasoning_parts or content_parts)),
+                        }
                         if reasoning_parts:
                             result_msg['thought'] = ''.join(reasoning_parts).strip()
                         if tool_calls_map:
@@ -806,3 +686,43 @@ class LLMClient:
                     continue
                 raise
         raise ValueError('complete_stream 请求失败')
+
+    async def stream_with_tools(
+        self,
+        messages: list[dict],
+        system_prompt: str = '',
+        on_delta: callable | None = None,
+        tools: list[dict] | None = None,
+        bot_id: str = 'companion',
+        big: bool = False,
+        source: str = 'phone',
+        is_foreground: bool = False,
+    ) -> dict:
+        full_msgs = list(messages or [])
+        if system_prompt and (not full_msgs or full_msgs[0].get('role') != 'system'):
+            full_msgs = [{'role': 'system', 'content': system_prompt}, *full_msgs]
+
+        async def _bridge(text: str = '', tool: str | None = None, thought: str | None = None):
+            if on_delta is not None:
+                res = on_delta(text, thought or '')
+                if asyncio.iscoroutine(res):
+                    await res
+
+        try:
+            return await self.complete_stream(
+                messages=full_msgs,
+                bot_id=bot_id,
+                tools=tools or None,
+                big=big,
+                on_stream=_bridge if on_delta else None,
+                source=source,
+                is_foreground=is_foreground,
+            )
+        except Exception:
+            return await self.complete_silent(
+                messages=full_msgs,
+                tools=tools or None,
+                big=big,
+                bot_id=bot_id,
+            )
+
