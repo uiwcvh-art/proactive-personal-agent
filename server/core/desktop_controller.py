@@ -746,7 +746,7 @@ class DesktopControllerMixin:
         if cur_node_src in ('phone', 'phone2') and op not in ('status', 'send_message'):
             return {
                 'ok': False,
-                'error': '你当前位于「安卓一」，不能直接调用电脑端的 dsh_workspace 工具操控电脑本机！请调用 send_message(to_bot_id="Windows一", text="...") 直接发消息让「Windows一」自己执行并回复你。',
+                'error': '你当前位于「安卓一」，不能直接调用电脑端的 dsh_workspace 工具操控电脑本机！请调用 blackboard(action="post", content="@Windows一 ...", mentions=["Windows一"]) 发布任务让「Windows一」接手执行。',
             }
 
         if op == 'cua_desktop':
@@ -866,7 +866,7 @@ class DesktopControllerMixin:
                     lines.append(f"  {idx}. [{d.get('time', '')}] ({d.get('session_title') or d.get('bot_name') or 'PC'}) 用户: {str(d.get('user', ''))[:120]} -> AI: {str(d.get('assistant', ''))[:160]}")
             else:
                 lines.append("  (暂无最近对话)")
-            lines.append("提示: 如需给任意端 Bot 发消息，直接调用 send_message(to_bot_id='安卓一:companion' | 'Windows一:研究助手' | '会话:<工作区会话名>', text='...')。")
+            lines.append("提示: 如需跨端协同或提醒其他 Bot 接手，请调用 blackboard(action='post', content='...', mentions=['Windows一']) 或 peek_bots(target='all')。")
             compact_sessions = [
                 {'title': s.get('title'), 'short_id': s.get('short_id'), 'status': s.get('status', 'idle')}
                 for s in sessions[:10]

@@ -296,8 +296,23 @@ class LLMClient:
             self._models_cache = (now, cache_key, collected)
         return collected
 
-    def _resolve_endpoint_candidates(self, bot_id: str = '', bot_model: str = '', big: bool = False) -> list[tuple[str, str, str]]:
-        resolved_bot_model = self._resolve_bot_model(bot_id, bot_model)
+    @staticmethod
+    def _clean_error_detail(raw_text: str, limit: int = 240) -> str:
+        s = str(raw_text or '').strip()
+        if not s:
+            return ''
+        low = s.lower()
+        if '<html' in low or '<!doctype' in low or '<title>' in low:
+            title_m = re.search(r'<title>(.*?)</title>', s, flags=re.I | re.S)
+            title = re.sub(r'\s+', ' ', title_m.group(1)).strip() if title_m else ''
+            stripped = re.sub(r'<[^>]+>', ' ', s)
+            stripped = re.sub(r'\s+', ' ', stripped).strip()
+            msg = f'{title} | {stripped}' if title and title not in stripped else (title or stripped)
+            return msg[:limit]
+        return re.sub(r'\s+', ' ', s)[:limit]
+
+    def _resolve_endpoint_candidates(self, bot_id: str = '', bot_model: str = '', big: bool = False, source: str = 'phone') -> list[tuple[str, str, str]]:
+        resolved_bot_model = self._resolve_bot_model(bot_id, bot_model, source=source)
         base_url = self.store.config.effective_base_url().rstrip('/')
         api_key = self.store.config.effective_api_key(big=big) or self.store.config.effective_api_key(big=not big)
         model = self.store.config.effective_model(bot_model=resolved_bot_model, big=big) or self.store.config.effective_model(bot_model=resolved_bot_model, big=not big)
@@ -312,12 +327,15 @@ class LLMClient:
                     candidates.append(fb_tuple)
         return candidates
 
-    def _resolve_bot_model(self, bot_id: str = '', bot_model: str = '') -> str:
+    def _resolve_bot_model(self, bot_id: str = '', bot_model: str = '', source: str = 'phone') -> str:
         if bot_model:
             return bot_model
         if bot_id and self.get_assistant_fn:
             try:
-                bot = self.get_assistant_fn(self.store, bot_id)
+                try:
+                    bot = self.get_assistant_fn(self.store, bot_id, source=source)
+                except TypeError:
+                    bot = self.get_assistant_fn(self.store, bot_id)
                 return str(bot.get('model') or '')
             except Exception:
                 return ''
@@ -385,6 +403,7 @@ class LLMClient:
         if max_tokens:
             payload['max_tokens'] = max_tokens
 
+        _TRANSIENT_CODES = (408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524)
         last_err: Exception | None = None
         for attempt in range(3):
             if attempt > 0 and len(candidates) > 1:
@@ -407,11 +426,11 @@ class LLMClient:
                     continue
                 if r.status_code >= 400 and attempt == 0 and len(candidates) > 1:
                     continue
-                if r.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                if r.status_code in _TRANSIENT_CODES and attempt < 2:
                     await asyncio.sleep(1.2 * (attempt + 1))
                     continue
                 if r.status_code >= 400:
-                    detail = r.text[:300].strip()
+                    detail = self._clean_error_detail(r.text, limit=240)
                     raise ValueError(f'HTTP {r.status_code}: {detail}')
                 total_ms = int(round((time.perf_counter() - t_req) * 1000))
                 body = r.json()
@@ -450,7 +469,7 @@ class LLMClient:
         is_foreground: bool = True,
     ) -> dict:
         """Foreground streaming LLM call with real-time token & tool-call delta callbacks and transient retry."""
-        candidates = self._resolve_endpoint_candidates(bot_id, bot_model, big=big)
+        candidates = self._resolve_endpoint_candidates(bot_id, bot_model, big=big, source=source)
         if not candidates:
             raise ValueError('请先在设置中配置 API Key 和 Model')
         base_url, api_key, model = candidates[0]
@@ -498,13 +517,13 @@ class LLMClient:
                         if r.status_code >= 400 and attempt == 0 and len(candidates) > 1:
                             await r.aread()
                             continue
-                        if r.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                        if r.status_code in (408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524) and attempt < 2:
                             await r.aread()
                             await asyncio.sleep(1.2 * (attempt + 1))
                             continue
                         if r.status_code >= 400:
                             err_bytes = await r.aread()
-                            detail = err_bytes.decode('utf-8', errors='replace')[:400].strip()
+                            detail = self._clean_error_detail(err_bytes.decode('utf-8', errors='replace'), limit=280)
                             raise ValueError(f'模型网关返回 HTTP {r.status_code} (model={model})：{detail or "请检查 Base URL、Key、Model 或额度"}')
                         ctype = r.headers.get('content-type', '')
                         if 'text/event-stream' not in ctype:

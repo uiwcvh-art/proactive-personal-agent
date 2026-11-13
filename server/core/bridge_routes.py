@@ -514,7 +514,7 @@ def register_bridge_routes(app, auth, store, vault, brain, hub: dict[str, Any] |
             brain.dsh_bridge_info['online']=_is_dsh_online()
             if sender:
                 sender.cancel()
-                with contextlib.suppress(asyncio.CancelledError): await sender
+                with contextlib.suppress(asyncio.CancelledError, WebSocketDisconnect, RuntimeError, Exception): await sender
             with contextlib.suppress(Exception):
                 await publish({'type':'dsh_bridge_state','online':_is_dsh_online(),'dsh_online':_is_dsh_online(),'dsh_peers':_get_dsh_peers(),'last_seen':brain.dsh_bridge_info['last_seen']})
 

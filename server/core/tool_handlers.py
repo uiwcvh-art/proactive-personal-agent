@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from assistants import get_assistant
+from core.scheduler_engine import SchedulerEngine
 from storage import normalize_node_source
 from vault_manager import TZ, now_iso
 
@@ -62,67 +63,17 @@ class ToolHandlersMixin:
 
     @staticmethod
     def _validate_daily_time_slots(daily_raw: str) -> list[tuple[int, int, int]]:
-        s = (daily_raw or '').strip()
-        if not s:
-            return []
-        slots: list[tuple[int, int, int]] = []
-        for part in s.split(','):
-            p = part.strip()
-            if not p:
-                continue
-            m = re.fullmatch(r'(\d{1,2}):(\d{2})(?::(\d{2}))?', p)
-            if not m:
-                raise ValueError(f'daily_time 格式非法: {p}（请使用 HH:MM，如 08:30 或 08:30,21:00）')
-            hh, mm, ss = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
-            if hh == 24 and mm == 0 and ss == 0:
-                hh = 0
-            if not (0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59):
-                raise ValueError(f'daily_time 时间超出有效范围: {p}（小时须为 00-23，分钟/秒须为 00-59）')
-            slots.append((hh, mm, ss))
-        if not slots:
-            raise ValueError(f'daily_time 格式非法: {daily_raw}')
-        return slots
+        return SchedulerEngine.validate_daily_time_slots(daily_raw)
 
     @classmethod
     def _extract_clock_from_goal(cls, goal: str) -> str:
         return ''
 
-    @classmethod
-    def _compute_next_routine_run(cls, r: dict, now_ts: float | None = None) -> float:
-        base_ts = now_ts if now_ts is not None else time.time()
-        daily_raw = str(r.get('daily_time') or '').strip()
-        if not daily_raw:
-            inferred = cls._extract_clock_from_goal(str(r.get('goal') or ''))
-            if inferred:
-                daily_raw = inferred
-                r['daily_time'] = inferred
-        if daily_raw:
-            try:
-                slots = cls._validate_daily_time_slots(daily_raw)
-            except ValueError:
-                slots = []
-            if slots:
-                wk_raw = str(r.get('weekdays') or '').strip().lower()
-                allowed_days = set(range(1, 8))
-                if wk_raw and wk_raw not in ('all', '*', 'everyday', '每天'):
-                    parsed_days = {int(x) for x in re.findall(r'[1-7]', wk_raw)}
-                    if parsed_days:
-                        allowed_days = parsed_days
-                now_dt = datetime.fromtimestamp(base_ts, TZ)
-                candidates = []
-                for day_offset in range(0, 9):
-                    day_dt = now_dt + timedelta(days=day_offset)
-                    if day_dt.isoweekday() not in allowed_days:
-                        continue
-                    for hh, mm, ss in slots:
-                        cand = day_dt.replace(hour=hh, minute=mm, second=ss, microsecond=0)
-                        if cand.timestamp() > base_ts + 1:
-                            candidates.append(cand.timestamp())
-                if candidates:
-                    return min(candidates)
-        last_run = float(r.get('last_run') or base_ts)
-        hours = max(0.05, float(r.get('interval_hours') or 24))
-        return last_run + hours * 3600
+    def _compute_next_routine_run(self, r: dict, now_ts: float | None = None) -> float:
+        eng = getattr(self, 'scheduler_engine', None)
+        if eng is not None:
+            return eng.compute_next_routine_run(r, now_ts)
+        return SchedulerEngine._compute_next_routine_ts(r, now_ts)
 
     def _decorate_schedule_view(self) -> dict:
         return self.scheduler_engine.decorate_schedule_view()

@@ -34,7 +34,11 @@ class BrainProactiveMixin:
         except (ValueError, TypeError):
             snooze_min = 0
         now_ts = time.time()
-        self.store.state['last_curiosity'] = max(float(self.store.state.get('last_curiosity', 0) or 0), now_ts + snooze_min * 60)
+        if self.activity == 'curiosity':
+            cur_min = max(1, int(getattr(self.store.config, 'curiosity_interval_minutes', 30) or 30))
+            delay_min = snooze_min if snooze_min > 0 else cur_min
+            self.store.state['last_curiosity'] = now_ts
+            self.store.state['curiosity_next_run'] = now_ts + delay_min * 60
         self.store.save()
         if self.vault is not None:
             try:
@@ -48,6 +52,9 @@ class BrainProactiveMixin:
             'reason': reason,
             'snooze_minutes': snooze_min,
         }
+
+    def _finish_curiosity_cycle(self, status: str, bot_id: str, detail: str = '', snooze_min: int | None = None) -> None:
+        self.scheduler_engine.record_curiosity_cycle(status, bot_id, detail=detail, snooze_min=snooze_min)
 
     async def curiosity(self, manual=False, bot_id=None, source: str = 'phone'):
         if not manual and (self.store.state['snooze_until'] > time.time() or not self.store.config.enabled or self.is_any_bot_busy()):
@@ -64,8 +71,7 @@ class BrainProactiveMixin:
                 bot_history = [m for m in self.store.state['messages'] if m.get('bot_id', 'companion') == target_id and normalize_node_source(m.get('source')) == src]
                 if bot_history and bot_history[-1].get('role') == 'assistant' and bot_history[-1].get('kind') in ('curiosity', 'routine', 'deadline'):
                     # Unanswered backoff: only back off when the last message in the room was already an unanswered proactive nudge!
-                    self.store.state['last_curiosity'] = time.time()
-                    self.store.save()
+                    self._finish_curiosity_cycle('unanswered_backoff', target_id, '上条主动消息尚未收到主人回复，自动顺延下个周期')
                     return {'suppressed': True, 'reason': 'unanswered_backoff'}
             marker = self.bot_context.set(target_id)
             room_marker = self.room_context.set(target_id)
@@ -80,6 +86,9 @@ class BrainProactiveMixin:
                 api_key = self.store.config.effective_api_key(big=False) or self.store.config.effective_api_key(big=True)
                 model = self.store.config.effective_model(bot_model=bot.get('model',''), big=False) or self.store.config.effective_model(bot_model=bot.get('model',''), big=True)
                 if not manual and api_key and api_key != 'fixture' and (time.time() - float(self.store.state.get('last_user', 0) or 0) < 300):
+                    last_u = float(self.store.state.get('last_user', 0) or 0)
+                    self.store.state['curiosity_next_run'] = max(float(self.store.state.get('curiosity_next_run') or 0), last_u + 300.0)
+                    self.store.save()
                     return {'suppressed': True, 'reason': 'user_recently_active'}
                 trace = []
                 if api_key and model:
@@ -118,7 +127,7 @@ class BrainProactiveMixin:
                         '- 请先快速审视下方的「手机通知栏积攒摘要」、「课表」、「待确认截止事项」与「最近对话摘要」。\n'
                         '- 如果发现有漏网的 VPN/加速器/常驻垃圾通知，请先调用 `phone_workspace(op="notifications", action="add_filter", filter_app="...", filter_keyword="...", reason="...")` 自动将其拉黑屏蔽（禁止在主动搭话中打开或操控任何手机 App 界面）。\n'
                         + (
-                            '- 【核心判断】：如果当前没有任何重要新通知、没有临近的紧急截止事项或课程提醒、或者主人刚刚聊完天/正在休息/专注，没有真正有价值的事情需要打扰主人，请**立即调用 `stay_silent(reason="当前无重要事项，保持安静不打扰主人", snooze_minutes=30)`** 静默结束本轮，绝不要为了凑话而强行发消息打扰主人！\n'
+                            '- 【核心判断】：如果当前没有任何重要新通知、没有临近的紧急截止事项或课程提醒、或者主人刚刚聊完天/正在休息/专注，没有真正有价值的事情需要打扰主人，请**立即调用 `stay_silent(reason="当前无重要事项，保持安静不打扰主人", snooze_minutes=0)`** 静默结束本轮（`snooze_minutes=0` 表示按正常配置间隔等待下次巡检），绝不要为了凑话而强行发消息打扰主人！\n'
                             if not manual
                             else ''
                         )
@@ -191,8 +200,7 @@ class BrainProactiveMixin:
                             trace.append({'tool': name, 'arguments': args, 'result': result, 'duration_ms': dur})
                             messages.append({'role': 'tool', 'tool_call_id': c_item['id'], 'content': json.dumps(result, ensure_ascii=False)})
                         if silent_res is not None:
-                            self.store.state['last_curiosity'] = max(float(self.store.state.get('last_curiosity', 0) or 0), time.time())
-                            self.store.save()
+                            self._finish_curiosity_cycle('silent', target_id, str(silent_res.get('reason') or ''), snooze_min=int(silent_res.get('snooze_minutes') or 0) or None)
                             return {'status': 'silent', 'ok': True, 'silent': True, 'bot_id': target_id, 'reason': str(silent_res.get('reason') or '')}
                         if all(c['function']['name'] == 'present_choices' for c in batch_c) and cur_accumulated:
                             break
@@ -201,8 +209,7 @@ class BrainProactiveMixin:
                         cur_accumulated.append(choice_prompt)
                     text = self._clean_and_filter_dot_text('\n\n'.join(cur_accumulated))
                     if text and is_silent_proactive_output(text):
-                        self.store.state['last_curiosity'] = time.time()
-                        self.store.save()
+                        self._finish_curiosity_cycle('silent', target_id, text[:120])
                         return {'status': 'silent', 'ok': True, 'silent': True, 'bot_id': target_id}
                     if not text and (trace or self.choices_var.get()):
                         api_calls += 1
@@ -215,8 +222,7 @@ class BrainProactiveMixin:
                         )
                         text = self._clean_and_filter_dot_text(summary.get('content') or '')
                         if text and is_silent_proactive_output(text):
-                            self.store.state['last_curiosity'] = time.time()
-                            self.store.save()
+                            self._finish_curiosity_cycle('silent', target_id, text[:120])
                             return {'status': 'silent', 'ok': True, 'silent': True, 'bot_id': target_id}
                     text = text or '主人这会儿在忙什么呢？有什么好玩的事跟余聊聊吗？'
                     mode = 'small_brain'
@@ -224,8 +230,8 @@ class BrainProactiveMixin:
                     text = '这会儿在忙什么呢？挑一件有点卡住的小事告诉我，余先陪你把第一步捋清。'
                     mode = 'local_prompt'
                     api_calls = 0
-                self.store.state['last_curiosity'] = time.time()
-                self.store.save()
+                cur_min = max(1, int(getattr(self.store.config, 'curiosity_interval_minutes', 30) or 30))
+                self._finish_curiosity_cycle('emitted', target_id, text[:120], snooze_min=cur_min)
                 extra = {'trace': trace, 'api_calls': api_calls, 'from_bot_id': target_id, 'from_bot_name': bot['name']} if trace else {'api_calls': api_calls, 'from_bot_id': target_id, 'from_bot_name': bot['name']}
                 emitted = await self.emit(text, 'curiosity', engine=mode, **extra)
                 if bot.get('notify', True):
@@ -562,8 +568,6 @@ class BrainProactiveMixin:
                             )
                             messages.append({'role': 'tool', 'tool_call_id': c_item['id'], 'content': tool_content_str})
                         if silent_sched_res is not None:
-                            self.store.state['last_curiosity'] = time.time()
-                            self.store.save()
                             return {
                                 'status': 'silent',
                                 'ok': True,
@@ -590,8 +594,6 @@ class BrainProactiveMixin:
                         if sum_txt:
                             raw_sched_text = sum_txt
                     short_goal = goal.split('：')[0].split(':')[0][:60].strip()
-                    self.store.state['last_curiosity'] = time.time()
-                    self.store.save()
                     if is_silent_routine or (raw_sched_text and is_silent_proactive_output(raw_sched_text)):
                         clean_silent = raw_sched_text.replace('SILENT_OK', '').strip()
                         self.vault.append_work_log(f'[静默巡检] {short_goal} · {clean_silent[:180]}')
@@ -606,6 +608,8 @@ class BrainProactiveMixin:
                             'api_calls': api_calls,
                         }
                     final_text = raw_sched_text or f'⏰ {goal}'
+                    self.store.state['curiosity_next_run'] = max(float(self.store.state.get('curiosity_next_run') or 0), time.time() + 180.0)
+                    self.store.save()
                     self.vault.log(f'完成{label}：{short_goal}', bot_id=target_id)
                     emitted = await self.emit(
                         final_text, 'curiosity', track=False,
@@ -752,7 +756,7 @@ class BrainProactiveMixin:
                             self.store.save()
                         self.wake.set()
                         break
-                # 2. Fire due routines per-bot with 4h missed-run catch-up, unconditional next_run advancement, and zero silent drops!
+                # 2. Fire due routines per-bot with 4h missed-run catch-up, quiet-hour deferral, exponential skip backoff & circuit breaker!
                 if not self.lock.locked():
                     now = time.time()
                     for r in s['routines']:
@@ -762,38 +766,59 @@ class BrainProactiveMixin:
                             r['next_run'] = self._compute_next_routine_run(r, now)
                             r['next_run_bj'] = self._fmt_bj(r['next_run'])
                             self.store.save()
+                        cb_until = float(r.get('circuit_broken_until') or 0)
+                        if cb_until > now:
+                            continue
                         is_clock_routine = bool(r.get('daily_time'))
-                        if not is_clock_routine and self.quiet():
+                        r_bot = r.get('bot_id', 'companion')
+                        if not is_clock_routine and not r.get('allow_quiet') and not r.get('quiet_ok') and self.quiet():
+                            deferred_ts, _ = self.scheduler_engine.defer_out_of_quiet_hours(now)
+                            if float(r.get('next_run') or 0) <= now:
+                                r['next_run'] = deferred_ts
+                                r['next_run_bj'] = self._fmt_bj(deferred_ts)
+                                r['deferred_reason'] = 'quiet_hours'
+                                r['last_status'] = 'quiet_deferred'
+                                TurnLedgerManager.append_run_log(
+                                    self.store,
+                                    {'kind': 'routine', 'task_id': r.get('id', ''), 'bot_id': r_bot, 'goal': str(r.get('goal') or '')[:120], 'status': 'quiet_deferred', 'next_run_bj': r['next_run_bj'], 'ts': now_iso()},
+                                )
+                                self.store.save()
                             continue
                         due_ts = float(r['next_run'])
                         if now < due_ts:
                             continue
-                        r_bot = r.get('bot_id', 'companion')
                         overdue_sec = max(0.0, now - due_ts)
                         is_wakeup_goal = any(k in str(r.get('goal') or '') for k in ('叫醒', '起床'))
                         max_catchup_sec = 1500.0 if is_wakeup_goal else 14400.0
-                        # If overdue is still within catch-up window and target bot is busy with a user turn, keep queued until free!
                         if overdue_sec <= max_catchup_sec and self.is_node_bot_busy(r_bot, 'phone'):
                             continue
+                        r.pop('deferred_reason', None)
                         orig_due_bj = self._fmt_bj(due_ts)
-                        r['next_run'] = self._compute_next_routine_run(r, now + 2)
-                        r['next_run_bj'] = self._fmt_bj(r['next_run'])
                         if overdue_sec > max_catchup_sec:
+                            skips = int(r.get('consecutive_skips') or 0) + 1
+                            r['consecutive_skips'] = skips
+                            backoff_s = min(3600.0, 30.0 * (2 ** min(6, skips - 1)))
+                            cand_next = max(self._compute_next_routine_run(r, now + 2), now + backoff_s)
+                            if skips >= 5:
+                                r['circuit_broken_until'] = now + 1800.0
+                            r['next_run'] = cand_next
+                            r['next_run_bj'] = self._fmt_bj(cand_next)
                             r['last_status'] = 'expired_skip'
                             r['last_late_seconds'] = int(overdue_sec)
                             TurnLedgerManager.append_run_log(
                                 self.store,
-                                {
-                                    'kind': 'routine', 'task_id': r.get('id', ''), 'bot_id': r_bot,
-                                    'goal': str(r.get('goal') or '')[:120], 'status': 'expired_skip',
-                                    'late_seconds': int(overdue_sec), 'ts': now_iso(),
-                                },
+                                {'kind': 'routine', 'task_id': r.get('id', ''), 'bot_id': r_bot, 'goal': str(r.get('goal') or '')[:120], 'status': 'expired_skip', 'late_seconds': int(overdue_sec), 'next_run_bj': r['next_run_bj'], 'ts': now_iso()},
                             )
-                            self.vault.append_work_log(f"[定时例行过期顺延] {r.get('id')} 原定 {orig_due_bj}（已超窗 {int(overdue_sec // 60)} 分钟），已推进 next_run -> {r['next_run_bj']}")
+                            if skips <= 2 or skips % 5 == 0:
+                                self.vault.append_work_log(f"[定时例行过期顺延 x{skips}] {r.get('id')} 原定 {orig_due_bj}（已超窗 {int(overdue_sec // 60)} 分钟），已推进 next_run -> {r['next_run_bj']}")
                             self.store.save()
                             continue
                         is_late = overdue_sec >= 120.0
                         r['last_run'] = now
+                        r['consecutive_skips'] = 0
+                        r.pop('circuit_broken_until', None)
+                        r['next_run'] = self._compute_next_routine_run(r, now + 2)
+                        r['next_run_bj'] = self._fmt_bj(r['next_run'])
                         r['last_late_seconds'] = int(overdue_sec)
                         self.store.save()
                         if has_api:
@@ -850,15 +875,30 @@ class BrainProactiveMixin:
                     await self._sleep_time_consolidate()
                 # 4. Background curiosity & idle research respect quiet hours (00:00 - 08:00) and active chat sessions
                 if self.quiet() or self.is_any_bot_busy(): continue
-                if len(s['pending']) < 3 and now - s['last_curiosity'] >= c.curiosity_interval_minutes * 60:
-                    curiosity_targets = []
-                    for node_k in ('phone', 'phone2'):
-                        for b in s.get('assistants', []):
-                            if resolve_bot_for_source(b, node_k).get('curiosity_enabled'):
-                                curiosity_targets.append((b['id'], node_k))
-                    if curiosity_targets:
-                        target_bot_id, target_src = curiosity_targets[0]
-                        await self.curiosity(bot_id=target_bot_id, source=target_src)
+                cur_interval_s = max(1, int(getattr(c, 'curiosity_interval_minutes', 30) or 30)) * 60
+                cur_due = float(s.get('curiosity_next_run') or 0) or (float(s.get('last_curiosity') or 0) + cur_interval_s)
+                last_u_ts = float(s.get('last_user') or 0)
+                if len(s['pending']) < 3 and now >= cur_due:
+                    if last_u_ts > 0 and (now - last_u_ts) < 300:
+                        s['curiosity_next_run'] = max(cur_due, last_u_ts + 300.0)
+                        self.store.save()
+                    else:
+                        curiosity_targets = []
+                        for node_k in ('phone', 'phone2'):
+                            for b in s.get('assistants', []):
+                                if resolve_bot_for_source(b, node_k).get('curiosity_enabled'):
+                                    curiosity_targets.append((b['id'], node_k))
+                        if curiosity_targets:
+                            target_bot_id, target_src = curiosity_targets[0]
+                            cur_res = await self.curiosity(bot_id=target_bot_id, source=target_src)
+                            if isinstance(cur_res, dict) and cur_res.get('suppressed'):
+                                sup_reason = str(cur_res.get('reason') or '')
+                                delay_s = 120.0 if sup_reason == 'bot_busy' else float(cur_interval_s)
+                                s['curiosity_next_run'] = max(float(s.get('curiosity_next_run') or 0), now + delay_s)
+                                self.store.save()
+                        else:
+                            s['curiosity_next_run'] = now + cur_interval_s
+                            self.store.save()
                 ready = next((x for x in s['opportunities'] if x['ready'] and not x['done']), None)
                 if ready and has_api and now - s['last_user'] >= c.idle_research_minutes * 60:
                     await self.research()
@@ -926,8 +966,5 @@ class BrainProactiveMixin:
                 'phone_online': bool(self.is_phone_online()),
                 'pc_online': bool(self.is_dsh_online()) if hasattr(self, 'is_dsh_online') else False,
             },
-            'observability': {
-                'turn_ledger': (self.store.state.get('turn_ledgers') or {}).get(f'{cur_src}:{bot_id}'),
-                'recent_task_runs': list(self.store.state.get('task_run_logs') or [])[-12:],
-            },
+            **self.scheduler_engine.build_system_status_extras(cur_src, bot_id, last_pt, last_ct, hit_pct),
         }

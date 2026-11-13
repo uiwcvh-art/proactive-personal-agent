@@ -79,18 +79,16 @@ class BrainPromptMixin:
         ]
         static_comm_guide = (
             '\n\n【多端通信与工作区操控铁律（100% 静态头部，严禁为查在线状态去调 run_bash / glob_files / read_file 找配置文件！）】：\n'
-            '- 常驻节点：`Windows一`（电脑端 DeepSeek Harness）、`安卓一`（手机端）；所有端共用常驻 Bot：主助理 (`companion`)、研究助手 (`research`)、杠精 (`contrarian`)、鲸鱼娘 (`whalechan`)。\n'
+            '- 常驻节点：`Windows一`（电脑端 DeepSeek Harness）、`安卓一`（手机端）。\n'
             '- 各端实时在线状态与电脑端底部「默认工作区」会话列表，请直接查看对话尾部的 `[System Memory Delta / 最新记忆与状态同步]`（或调 1 次 `dsh_workspace(op="status")`）。\n'
-            '- 跨端/同端发消息只需 1 步调用 `send_message`：\n'
-            '  · 发给同端其他 Bot：`send_message(to_bot_id="研究助手", text="...")`\n'
-            '  · 发给手机端某 Bot：`send_message(to_bot_id="安卓一:companion", text="...")` 或 `send_message(to_bot_id="安卓一:研究助手", text="...")`\n'
-            '  · 发给电脑端某 Bot：`send_message(to_bot_id="Windows一:companion", text="...")`\n'
-            '  · 发给电脑端底部工作区会话：`send_message(to_bot_id="会话:<会话标题或ID>", text="...")`'
+            '- 需要让其他 Bot / 其他端接手或查看进展时，请使用公共事件黑板与透视工具：\n'
+            '  · 发布并唤醒指定同事/节点：`blackboard(action="post", content="...", mentions=["研究助手"])` 或 `mentions=["Windows一"]` / `mentions=["@everyone"]`\n'
+            '  · 快速查看其它 Bot 最新进展与聊天摘要：`peek_bots(target="all", limit=5)`'
         )
         return (
             base_inst
             + static_comm_guide
-            + '\n\n当前团队 Bot 列表（可用 send_message 给同端或跨端任意 Bot 发消息，或用 manage_bot 创建/修改 Bot）：\n'
+            + '\n\n当前团队 Bot 列表（可用 `blackboard` / `peek_bots` 协同，或用 `manage_bot` 创建/修改 Bot）：\n'
             + '\n'.join(roster)
         )
 

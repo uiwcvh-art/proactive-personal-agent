@@ -11,8 +11,8 @@ android {
         applicationId 'dev.bubuki.proactive'
         minSdk 31
         targetSdk 35
-        versionCode 83
-        versionName '3.6.4'
+        versionCode 84
+        versionName '3.6.5'
         def defaultDeviceToken = System.getenv('DEFAULT_DEVICE_TOKEN') ?: ''
         buildConfigField 'String', 'DEFAULT_DEVICE_TOKEN', '"' + defaultDeviceToken.replace('\\', '\\\\').replace('"', '\\"') + '"'
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'

@@ -141,6 +141,24 @@ def create_app(data_dir=None, scheduler=True):
     brain=Brain(store,vault,harness,publish,escalation)
     brain.dsh_dispatch=dispatch_dsh
     brain.phone_online_checker=lambda: len(clients)>0
+    def _on_store_config_changed(public_cfg:dict,source_tag:str,changed_keys:list[str])->None:
+        if str(source_tag).startswith('api:'):
+            return
+        brain.wake.set()
+        with contextlib.suppress(RuntimeError):
+            loop=asyncio.get_running_loop()
+            loop.create_task(publish({
+                'type':'config_updated',
+                'activity':brain.ready_state(),
+                'source':source_tag,
+                'changed_keys':changed_keys,
+                'auto_compact_tokens':store.config.auto_compact_tokens,
+                'curiosity_interval_minutes':store.config.curiosity_interval_minutes,
+                'idle_research_minutes':store.config.idle_research_minutes,
+                'quiet_start_hour':store.config.quiet_start_hour,
+                'quiet_end_hour':store.config.quiet_end_hour,
+            }))
+    store.on_config_changed=_on_store_config_changed
     computer=ComputerCoordinator(store,brain,publish)
     brain.computer=computer
     internal_client_holder:dict[str,httpx.AsyncClient]={}
@@ -350,7 +368,7 @@ def create_app(data_dir=None, scheduler=True):
                 'big_ready':bool(store.config.big_brain.api_key and store.config.big_brain.model) or (has_key and has_model),'last_error':s['last_error'],
                 'stage':max([p['stage'] for p in src_pending.values()] or [0]),'execution':cur_exec,'stream':cur_stream,
                 'executions_by_bot':slim_execs,'streams_by_bot':filtered_streams,
-                'context_by_bot':brain.memory_engine.get_all_bots_context_stats(source=req_src),'auto_compact_tokens':store.config.auto_compact_tokens,
+                'context_by_bot':brain.memory_engine.get_all_bots_context_stats(source=req_src),'auto_compact_tokens':store.config.auto_compact_tokens,'curiosity_interval_minutes':store.config.curiosity_interval_minutes,
                 'last_completed_stream':last_done,'recent_tail':recent_tail,'epoch_reset':epoch_reset,'messages_epoch':cur_epoch,
                 **({'messages':recent_tail} if epoch_reset else {}),
                 'bots':resolve_bots_for_source(s['assistants'],req_src),'primary_bot_id':primary_bot_id_for_source(store,req_src),
@@ -424,10 +442,11 @@ def create_app(data_dir=None, scheduler=True):
     async def config(update:dict[str,Any],source:str|None=None):
         from pydantic import ValidationError
         req_src=normalize_node_source(source)
-        prev_window=int(getattr(store.config,'auto_compact_tokens',120000) or 120000)
-        try: result=store.update_config(update)
+        store.sync_from_workspace()
+        prev_window=int(getattr(store.config,'auto_compact_tokens',200000) or 200000)
+        try: result=store.update_config(update,source_tag=f'api:{req_src}')
         except ValidationError: raise HTTPException(422,'配置格式无效；请检查 URL、SMTP 端口与时间范围')
-        new_window=int(getattr(store.config,'auto_compact_tokens',120000) or 120000)
+        new_window=int(getattr(store.config,'auto_compact_tokens',200000) or 200000)
         compacted_bots:list[str]=[]
         if 'auto_compact_tokens' in update and new_window!=prev_window:
             for src_node in ('phone','pc'):
@@ -459,6 +478,10 @@ def create_app(data_dir=None, scheduler=True):
             'type':'config_updated',
             'activity':brain.activity,
             'auto_compact_tokens':store.config.auto_compact_tokens,
+            'curiosity_interval_minutes':store.config.curiosity_interval_minutes,
+            'idle_research_minutes':store.config.idle_research_minutes,
+            'quiet_start_hour':store.config.quiet_start_hour,
+            'quiet_end_hour':store.config.quiet_end_hour,
             'context_by_bot':ctx_by_bot,
             'compacted_bots':compacted_bots,
         })
@@ -553,10 +576,10 @@ def create_app(data_dir=None, scheduler=True):
         body=payload or {}
         target_bot=str(body.get('bot_id') or store.state.get('primary_bot_id') or 'companion').strip()
         src=normalize_node_source(body.get('source') or 'phone')
-        if body.get('auto_compact_tokens'):
+        if body.get('persist_threshold') and body.get('auto_compact_tokens'):
             try:
                 val=max(8000,min(1000000,int(body['auto_compact_tokens'])))
-                store.update_config({'auto_compact_tokens':val})
+                store.update_config({'auto_compact_tokens':val},source_tag=f'compact_explicit:{src}')
             except Exception:
                 pass
         src_tok=brain.source_context.set(src)
@@ -879,7 +902,7 @@ def create_app(data_dir=None, scheduler=True):
             clients.pop(client_id,None)
             if sender:
                 sender.cancel()
-                with contextlib.suppress(asyncio.CancelledError): await sender
+                with contextlib.suppress(asyncio.CancelledError, WebSocketDisconnect, RuntimeError, Exception): await sender
 
     register_bridge_routes(app, auth, store, vault, brain, {
         'harness': harness, 'crypto': crypto, 'token': token,

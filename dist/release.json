@@ -1,15 +1,15 @@
 {
-  "version": "3.6.4",
-  "version_name": "3.6.4",
-  "versionName": "3.6.4",
-  "tag_name": "v3.6.4",
-  "version_code": 83,
-  "versionCode": 83,
-  "build": 83,
-  "published_at": "2026-11-13T02:38:58.456332+08:00",
-  "apk_sha256": "5bcf1779da9855b8bc52acd2a5c0fe8fe9f27a2acc5443d5f5773ed639f10f15",
-  "apk_size": 21154652,
+  "version": "3.6.5",
+  "version_name": "3.6.5",
+  "versionName": "3.6.5",
+  "tag_name": "v3.6.5",
+  "version_code": 84,
+  "versionCode": 84,
+  "build": 84,
+  "published_at": "2026-11-13T15:02:37.847567+08:00",
+  "apk_sha256": "1accc29d2713b2e3fe4501424b888de9441d7869c833989fce6f97bf37877a5c",
+  "apk_size": 21164188,
   "download_url": "/proactive-agent/download/proactive-agent.apk",
-  "notes": "v3.6.4 (Build 83): 1) 手机虚拟屏 CUA 大修：放开第三方应用 .MainActivity/.LauncherActivity 限制，仅拦截本客户端主界面；2) 修复悬窗点击红色关闭后在后台轮次中被重新拉起反复弹窗及误触销毁；3) 强制 tap/swipe/capture 刷新 fresh=true 画面帧并对齐真实 dpi/swDp，彻底消除点击前后画面错位；4) 黑板机制修复：@司工 不再回显至主助理聊天栏",
-  "body": "v3.6.4 (Build 83): 1) 手机虚拟屏 CUA 大修：放开第三方应用 .MainActivity/.LauncherActivity 限制，仅拦截本客户端主界面；2) 修复悬窗点击红色关闭后在后台轮次中被重新拉起反复弹窗及误触销毁；3) 强制 tap/swipe/capture 刷新 fresh=true 画面帧并对齐真实 dpi/swDp，彻底消除点击前后画面错位；4) 黑板机制修复：@司工 不再回显至主助理聊天栏"
+  "notes": "v3.6.5 (Build 84): 1) 调度器静默期顺延与过期防刷屏：间隔例行任务自动避开静默时段并支持指数退避/熔断与日志折叠；2) 好奇心巡检独立化：消除例行任务对 last_curiosity 的覆盖饥饿，新增 curiosity_poll 调度视图；3) 配置防覆盖与双端同步：手动压缩不再篡改 200K 阈值，落盘回读校验与 config_audit 审计闭环；4) 新增 KV-Cache 诊断说明与网关 520 自动重试",
+  "body": "v3.6.5 (Build 84): 1) 调度器静默期顺延与过期防刷屏：间隔例行任务自动避开静默时段并支持指数退避/熔断与日志折叠；2) 好奇心巡检独立化：消除例行任务对 last_curiosity 的覆盖饥饿，新增 curiosity_poll 调度视图；3) 配置防覆盖与双端同步：手动压缩不再篡改 200K 阈值，落盘回读校验与 config_audit 审计闭环；4) 新增 KV-Cache 诊断说明与网关 520 自动重试"
 }

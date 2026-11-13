@@ -333,9 +333,19 @@ internal fun NativePulseModel.onRealtimeEvent(event: JSONObject) {
             "bots_changed" -> { val botsArr = event.optJSONArray("bots"); val primaryId = event.optString("primary_bot_id", ui.primary).ifBlank { "companion" }; if (botsArr != null && botsArr.length() > 0) { val nextBots = botsArr.objects().mapNotNull { runCatching { PulseBot.from(it, mySource) }.getOrNull() }; if (nextBots.isNotEmpty()) { revision++; val deletedId = event.optString("deleted_bot_id", ""); val needCloseChat = (deletedId.isNotBlank() && ui.botId == deletedId) || nextBots.none { it.id == ui.botId }; ui = ui.copy(bots = nextBots, primary = primaryId, botId = if (needCloseChat) primaryId else ui.botId, chatOpen = if (needCloseChat) false else ui.chatOpen); cacheRoster(nextBots, primaryId); loadAvatars(); return@launch } }; launch { refresh(force = true) } }
             "config_updated" -> {
                 val remoteThresh = event.optInt("auto_compact_tokens", 0)
+                val remoteCurMin = event.optInt("curiosity_interval_minutes", 0)
                 val (ctxTokensMap, ctxMsgsMap, ctxCachedMap) = parseContextByBot(event.optJSONObject("context_by_bot"))
+                if (remoteThresh >= 8000 || remoteCurMin >= 1) {
+                    launch(Dispatchers.IO) {
+                        syncLocalConfigPrefs(
+                            autoCompact = remoteThresh.takeIf { it >= 8000 },
+                            curiosityMin = remoteCurMin.takeIf { it >= 1 }
+                        )
+                    }
+                }
                 ui = ui.copy(
                     autoCompactTokens = if (remoteThresh >= 8000) remoteThresh.toString() else ui.autoCompactTokens,
+                    curiosityMinutes = if (remoteCurMin >= 1) remoteCurMin.toString() else ui.curiosityMinutes,
                     contextTokensByBot = if (ctxTokensMap.isNotEmpty()) ctxTokensMap else ui.contextTokensByBot,
                     contextCachedByBot = if (ctxCachedMap.isNotEmpty()) ctxCachedMap else ui.contextCachedByBot,
                     contextMsgsByBot = if (ctxMsgsMap.isNotEmpty()) ctxMsgsMap else ui.contextMsgsByBot
@@ -730,6 +740,16 @@ internal suspend fun NativePulseModel.refresh(force: Boolean = false) {
             val routinesCount = (status.optInt("routine_count", -1)).let { if (it >= 0) it else ui.routineCount }
             val (ctxTokensMap, ctxMsgsMap, ctxCachedMap) = parseContextByBot(status.optJSONObject("context_by_bot"))
             val remoteCompactThresh = status.optInt("auto_compact_tokens", remoteCfg?.optInt("auto_compact_tokens", 0) ?: 0)
+            val remoteCuriosityMin = status.optInt("curiosity_interval_minutes", remoteCfg?.optInt("curiosity_interval_minutes", 0) ?: 0)
+            if (remoteCompactThresh >= 8000 || remoteCuriosityMin >= 1 || defM.isNotBlank()) {
+                withContext(Dispatchers.IO) {
+                    syncLocalConfigPrefs(
+                        autoCompact = remoteCompactThresh.takeIf { it >= 8000 },
+                        curiosityMin = remoteCuriosityMin.takeIf { it >= 1 },
+                        defaultModel = defM.takeIf { it.isNotBlank() }
+                    )
+                }
+            }
             val myNodeSource = SecureTransport.getNodeSource(activity)
             ui = ui.copy(
                 bots = if (before == revision) roster.getJSONArray("bots").objects().map { PulseBot.from(it, myNodeSource) } else ui.bots,
@@ -754,6 +774,7 @@ internal suspend fun NativePulseModel.refresh(force: Boolean = false) {
                 contextCachedByBot = if (ctxCachedMap.isNotEmpty()) ctxCachedMap else ui.contextCachedByBot,
                 contextMsgsByBot = if (ctxMsgsMap.isNotEmpty()) ctxMsgsMap else ui.contextMsgsByBot,
                 autoCompactTokens = if (remoteCompactThresh >= 8000 && ui.activePanel !in listOf("settings", "bot_edit")) remoteCompactThresh.toString() else ui.autoCompactTokens,
+                curiosityMinutes = if (remoteCuriosityMin >= 1 && ui.activePanel !in listOf("settings", "bot_edit")) remoteCuriosityMin.toString() else ui.curiosityMinutes,
                 snoozed = status.optDouble("snooze_until", 0.0) * 1000 > System.currentTimeMillis(),
                 smallReady = status.optBoolean("small_ready"), bigReady = status.optBoolean("big_ready"),
                 defaultModel = defM, hasApiKey = hasKey
@@ -851,6 +872,15 @@ internal suspend fun NativePulseModel.refreshStreamOnly() {
             val startedMs = if (startedSec > 0) (startedSec * 1000).toLong() else if (effectiveSBot != null || effectiveWorking != null) (ui.streamStartedAt.takeIf { it > 0L } ?: System.currentTimeMillis()) else 0L
             val (ctxTokensMap, ctxMsgsMap, ctxCachedMap) = parseContextByBot(status.optJSONObject("context_by_bot"))
             val remoteCompactThresh = status.optInt("auto_compact_tokens", 0)
+            val remoteCuriosityMin = status.optInt("curiosity_interval_minutes", 0)
+            if (remoteCompactThresh >= 8000 || remoteCuriosityMin >= 1) {
+                withContext(Dispatchers.IO) {
+                    syncLocalConfigPrefs(
+                        autoCompact = remoteCompactThresh.takeIf { it >= 8000 },
+                        curiosityMin = remoteCuriosityMin.takeIf { it >= 1 }
+                    )
+                }
+            }
             ui = ui.copy(
                 online = true,
                 latency = rtt,
@@ -872,6 +902,7 @@ internal suspend fun NativePulseModel.refreshStreamOnly() {
                 contextCachedByBot = if (ctxCachedMap.isNotEmpty()) ctxCachedMap else ui.contextCachedByBot,
                 contextMsgsByBot = if (ctxMsgsMap.isNotEmpty()) ctxMsgsMap else ui.contextMsgsByBot,
                 autoCompactTokens = if (remoteCompactThresh >= 8000 && ui.activePanel !in listOf("settings", "bot_edit")) remoteCompactThresh.toString() else ui.autoCompactTokens,
+                curiosityMinutes = if (remoteCuriosityMin >= 1 && ui.activePanel !in listOf("settings", "bot_edit")) remoteCuriosityMin.toString() else ui.curiosityMinutes,
                 cloudDesktopLiveBotId = if (usesCloudDesktop) (effectiveSBot ?: effectiveWorking) else ui.cloudDesktopLiveBotId
             )
             if (ui.activePanel == "cloud_desktop") refreshCloudDesktopFrame()

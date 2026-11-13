@@ -192,9 +192,53 @@ class TurnLedgerManager:
     @staticmethod
     def append_run_log(store, entry: dict[str, Any]) -> None:
         logs: list[dict] = store.state.setdefault('task_run_logs', [])
-        logs.append(entry)
+        new_entry = dict(entry)
+        task_id = str(new_entry.get('task_id', '') or '')
+        status = str(new_entry.get('status', '') or '')
+        foldable_statuses = {'expired_skip', 'quiet_deferred', 'quiet_skip', 'error_backoff'}
+        if logs and task_id and status in foldable_statuses:
+            prev = logs[-1]
+            if str(prev.get('task_id', '') or '') == task_id and str(prev.get('status', '') or '') == status:
+                prev['repeat_count'] = int(prev.get('repeat_count', 1) or 1) + 1
+                prev['last_ts'] = new_entry.get('ts', prev.get('last_ts') or prev.get('ts') or '')
+                if new_entry.get('ts_bj'):
+                    prev['last_ts_bj'] = new_entry['ts_bj']
+                if new_entry.get('detail'):
+                    prev['detail'] = new_entry['detail']
+                if new_entry.get('next_run_bj'):
+                    prev['next_run_bj'] = new_entry['next_run_bj']
+                return
+        new_entry.setdefault('repeat_count', 1)
+        logs.append(new_entry)
         if len(logs) > MAX_TASK_RUN_LOGS:
             del logs[:-MAX_TASK_RUN_LOGS]
+
+    @staticmethod
+    def get_folded_recent_runs(store, limit: int = 16) -> list[dict[str, Any]]:
+        """Return recent task run logs with consecutive identical statuses folded."""
+        logs = list(store.state.get('task_run_logs') or [])
+        folded: list[dict[str, Any]] = []
+        for item in logs:
+            if not isinstance(item, dict):
+                continue
+            cur = dict(item)
+            cur.setdefault('repeat_count', 1)
+            if (
+                folded
+                and str(folded[-1].get('task_id', '') or '') == str(cur.get('task_id', '') or '')
+                and str(folded[-1].get('status', '') or '') == str(cur.get('status', '') or '')
+                and str(cur.get('status', '') or '') in {'expired_skip', 'quiet_deferred', 'quiet_skip', 'error_backoff'}
+            ):
+                prev = folded[-1]
+                prev['repeat_count'] = int(prev.get('repeat_count', 1) or 1) + int(cur.get('repeat_count', 1) or 1)
+                prev['last_ts'] = cur.get('last_ts') or cur.get('ts') or prev.get('last_ts') or prev.get('ts') or ''
+                if cur.get('last_ts_bj') or cur.get('ts_bj'):
+                    prev['last_ts_bj'] = cur.get('last_ts_bj') or cur.get('ts_bj')
+                if cur.get('detail'):
+                    prev['detail'] = cur['detail']
+            else:
+                folded.append(cur)
+        return folded[-limit:]
 
     @staticmethod
     def format_interrupted_turn_hint(prev_ledger: dict | None) -> str:

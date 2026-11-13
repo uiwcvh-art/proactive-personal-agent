@@ -26,6 +26,40 @@ import java.util.Locale
  * - `NativePulseModel.parseContextByBot(...)`, `contextPerfFor(...)`, `contextStatsFor(...)`, `contextCacheFor(...)`, `formatTokenCount(...)`, `compactBotContext(...)`
  */
 
+internal fun NativePulseModel.syncLocalConfigPrefs(
+    autoCompact: Int? = null,
+    curiosityMin: Int? = null,
+    defaultModel: String? = null,
+    apiBaseUrl: String? = null,
+) {
+    runCatching {
+        val s = SecurePrefs.read(activity)
+        val localCfg = s.optJSONObject("config") ?: JSONObject()
+        var dirty = false
+        if (autoCompact != null && autoCompact in 8000..1000000 && localCfg.optInt("auto_compact_tokens", 0) != autoCompact) {
+            localCfg.put("auto_compact_tokens", autoCompact)
+            dirty = true
+        }
+        if (curiosityMin != null && curiosityMin in 1..1440 && localCfg.optInt("curiosity_interval_minutes", 0) != curiosityMin) {
+            localCfg.put("curiosity_interval_minutes", curiosityMin)
+            dirty = true
+        }
+        if (!defaultModel.isNullOrBlank() && localCfg.optString("default_model") != defaultModel) {
+            localCfg.put("default_model", defaultModel)
+            dirty = true
+        }
+        if (!apiBaseUrl.isNullOrBlank() && localCfg.optString("api_base_url") != apiBaseUrl) {
+            localCfg.put("api_base_url", apiBaseUrl)
+            dirty = true
+        }
+        if (dirty) {
+            s.put("config", localCfg)
+            SecurePrefs.save(activity, s)
+            prefs = s
+        }
+    }
+}
+
 internal fun NativePulseModel.closePanel() {
     cloudStreamJob?.cancel()
     ui = ui.copy(activePanel = null)
@@ -54,6 +88,7 @@ internal fun NativePulseModel.openSettings() {
     val storedFbModel = localCfg.optString("fallback_model", "")
     val savedApp = saved.optString("appearance", "dark").let { if (it == "light") "light" else "dark" }
     val savedCompact = localCfg.optInt("auto_compact_tokens", 0).takeIf { it >= 8000 }?.toString() ?: ui.autoCompactTokens
+    val savedCurMin = localCfg.optInt("curiosity_interval_minutes", 0).takeIf { it >= 1 }?.toString() ?: ui.curiosityMinutes
     ui = ui.copy(
         activePanel = "settings",
         serverUrl = saved.optString("serverUrl", SecureTransport.DEFAULT_SERVER),
@@ -64,6 +99,7 @@ internal fun NativePulseModel.openSettings() {
         fallbackBaseUrl = storedFbUrl.ifBlank { ui.fallbackBaseUrl },
         fallbackApiKeyInput = storedFbKey,
         fallbackModel = storedFbModel.ifBlank { ui.fallbackModel },
+        curiosityMinutes = savedCurMin,
         autoCompactTokens = savedCompact,
         backgroundService = saved.optBoolean("background", true),
         appearance = savedApp,
@@ -77,7 +113,11 @@ internal fun NativePulseModel.openSettings() {
         val rFbEnabled = remote.optBoolean("fallback_enabled", false)
         val rFbUrl = remote.optString("fallback_base_url", "")
         val rFbModel = remote.optString("fallback_model", "")
-        val rCompact = remote.optInt("auto_compact_tokens", 120000).coerceIn(8000, 1000000)
+        val rCompact = remote.optInt("auto_compact_tokens", 200000).coerceIn(8000, 1000000)
+        val rCurMin = remote.optInt("curiosity_interval_minutes", 30).coerceIn(1, 1440)
+        withContext(Dispatchers.IO) {
+            syncLocalConfigPrefs(autoCompact = rCompact, curiosityMin = rCurMin, defaultModel = rModel, apiBaseUrl = rUrl)
+        }
         ui = ui.copy(
             apiBaseUrl = if (ui.apiBaseUrl == "https://api.openai.com/v1" && rUrl.isNotBlank()) rUrl else ui.apiBaseUrl,
             defaultModel = ui.defaultModel.ifBlank { rModel },
@@ -87,7 +127,7 @@ internal fun NativePulseModel.openSettings() {
             fallbackModel = rFbModel.ifBlank { ui.fallbackModel },
             hasFallbackApiKey = remote.optBoolean("has_fallback_api_key", storedFbKey.isNotBlank()),
             curiosityEnabledGlobal = remote.optBoolean("enabled", true),
-            curiosityMinutes = remote.optInt("curiosity_interval_minutes", 90).toString(),
+            curiosityMinutes = rCurMin.toString(),
             autoCompactTokens = rCompact.toString()
         )
     }
@@ -306,8 +346,8 @@ internal fun NativePulseModel.saveSettings() {
     val cleanFbBase = ui.fallbackBaseUrl.trim().trimEnd('/')
     val cleanFbKey = ui.fallbackApiKeyInput.trim()
     val cleanFbModel = ui.fallbackModel.trim()
-    val minutes = (ui.curiosityMinutes.toIntOrNull() ?: 90).coerceIn(5, 1440)
-    val compactTokens = (ui.autoCompactTokens.toIntOrNull() ?: 120000).coerceIn(8000, 1000000)
+    val minutes = (ui.curiosityMinutes.toIntOrNull() ?: 30).coerceIn(1, 1440)
+    val compactTokens = (ui.autoCompactTokens.toIntOrNull() ?: 200000).coerceIn(8000, 1000000)
     ui = ui.copy(savingSettings = true, autoCompactTokens = compactTokens.toString())
     perform {
         try {
@@ -322,6 +362,7 @@ internal fun NativePulseModel.saveSettings() {
                 val localCfg = s.optJSONObject("config") ?: JSONObject()
                 localCfg.put("api_base_url", cleanBase)
                 localCfg.put("auto_compact_tokens", compactTokens)
+                localCfg.put("curiosity_interval_minutes", minutes)
                 if (cleanKey.isNotBlank()) localCfg.put("api_key", cleanKey)
                 if (cleanModel.isNotBlank()) localCfg.put("default_model", cleanModel)
                 localCfg.put("fallback_enabled", ui.fallbackEnabled)
@@ -643,7 +684,7 @@ internal fun NativePulseModel.estimateLocalTextTokens(text: String): Int {
 }
 
 internal fun NativePulseModel.contextStatsFor(botId: String = ui.botId): Triple<Int, Int, Int> {
-    val thresh = (ui.autoCompactTokens.toIntOrNull() ?: 120000).coerceIn(8000, 1000000)
+    val thresh = (ui.autoCompactTokens.toIntOrNull() ?: 200000).coerceIn(8000, 1000000)
     val localMsgs = ui.messages.filter { it.botId == botId }
     val localEst = 14800 + localMsgs.sumOf { estimateLocalTextTokens(it.text) + 12 }
     val serverTok = ui.contextTokensByBot[botId] ?: 0
@@ -731,7 +772,6 @@ internal fun NativePulseModel.compactBotContext(botId: String = ui.botId) {
         try {
             val payload = JSONObject()
                 .put("bot_id", botId)
-                .put("auto_compact_tokens", thresh)
             val res = request("POST", "/api/context/compact", payload)
             val (ctxTokensMap, ctxMsgsMap, ctxCachedMap) = parseContextByBot(res.optJSONObject("context_by_bot"))
             if (ctxTokensMap.isNotEmpty()) {

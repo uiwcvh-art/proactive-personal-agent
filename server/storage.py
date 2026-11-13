@@ -2,7 +2,7 @@ from __future__ import annotations
 import copy, json, secrets, threading, time
 from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from vault_manager import atomic_write
+from vault_manager import TZ, atomic_write, now_iso
 
 class BrainConfig(BaseModel):
     model_config = ConfigDict(extra='forbid')
@@ -318,8 +318,14 @@ class Store:
                         self.bots_ws_path.stat().st_mtime_ns != getattr(self, '_bots_mtime', 0)
                         or ((time.time() - getattr(self, '_bots_write_ts', 0.0)) < 1.0 and self.bots_ws_path.read_text('utf-8') != getattr(self, '_bots_raw_text', ''))
                     ))
-                    or (self.settings_ws_path.exists() and getattr(self, '_settings_mtime', 0) > 0 and self.settings_ws_path.stat().st_mtime_ns != getattr(self, '_settings_mtime', 0))
-                    or (self.routines_ws_path.exists() and getattr(self, '_routines_mtime', 0) > 0 and self.routines_ws_path.stat().st_mtime_ns != getattr(self, '_routines_mtime', 0))
+                    or (self.settings_ws_path.exists() and getattr(self, '_settings_mtime', 0) > 0 and (
+                        self.settings_ws_path.stat().st_mtime_ns != getattr(self, '_settings_mtime', 0)
+                        or ((time.time() - getattr(self, '_settings_write_ts', 0.0)) < 1.0 and self.settings_ws_path.read_text('utf-8') != getattr(self, '_settings_raw_text', ''))
+                    ))
+                    or (self.routines_ws_path.exists() and getattr(self, '_routines_mtime', 0) > 0 and (
+                        self.routines_ws_path.stat().st_mtime_ns != getattr(self, '_routines_mtime', 0)
+                        or ((time.time() - getattr(self, '_routines_write_ts', 0.0)) < 1.0 and self.routines_ws_path.read_text('utf-8') != getattr(self, '_routines_raw_text', ''))
+                    ))
                 )
                 if ws_modified:
                     self.sync_from_workspace(force=True, _skip_ws_write=True)
@@ -352,7 +358,10 @@ class Store:
                 'quiet_end_hour': self.config.quiet_end_hour,
                 'auto_compact_tokens': self.config.auto_compact_tokens,
             }
-            atomic_write(self.settings_ws_path, json.dumps(settings_payload, ensure_ascii=False, indent=2))
+            settings_json_str = json.dumps(settings_payload, ensure_ascii=False, indent=2)
+            atomic_write(self.settings_ws_path, settings_json_str)
+            self._settings_raw_text = settings_json_str
+            self._settings_write_ts = time.time()
             self._settings_mtime = self.settings_ws_path.stat().st_mtime_ns if self.settings_ws_path.exists() else 0
             if 'assistants' in self.state:
                 ws_bots = [{k: v for k, v in b.items() if k != 'node_settings'} for b in self.state['assistants'] if isinstance(b, dict)]
@@ -362,18 +371,26 @@ class Store:
                 self._bots_write_ts = time.time()
                 self._bots_mtime = self.bots_ws_path.stat().st_mtime_ns if self.bots_ws_path.exists() else 0
             if 'routines' in self.state:
-                atomic_write(self.routines_ws_path, json.dumps(self.state['routines'], ensure_ascii=False, indent=2))
+                routines_json_str = json.dumps(self.state['routines'], ensure_ascii=False, indent=2)
+                atomic_write(self.routines_ws_path, routines_json_str)
+                self._routines_raw_text = routines_json_str
+                self._routines_write_ts = time.time()
                 self._routines_mtime = self.routines_ws_path.stat().st_mtime_ns if self.routines_ws_path.exists() else 0
 
     def sync_from_workspace(self, force: bool = False, _skip_ws_write: bool = False) -> bool:
-        """If a Bot edited workspace/settings.json or workspace/bots.json via tools/bash, apply changes."""
+        """If a Bot edited workspace/settings.json, bots.json, or routines.json via tools/bash, apply changes."""
         now_ts = time.time()
-        recent_ws_write = (now_ts - getattr(self, '_bots_write_ts', 0.0)) < 1.0
+        recent_ws_write = (
+            (now_ts - getattr(self, '_bots_write_ts', 0.0)) < 1.0
+            or (now_ts - getattr(self, '_settings_write_ts', 0.0)) < 1.0
+            or (now_ts - getattr(self, '_routines_write_ts', 0.0)) < 1.0
+        )
         if not force and not recent_ws_write and (now_ts - getattr(self, '_last_ws_sync_ts', 0.0)) < 0.2:
             return False
         self._last_ws_sync_ts = now_ts
         changed = False
         pending_config_update = None
+        bot_curiosity_interval: int | None = None
         with self.lock:
             try:
                 if self.bots_ws_path.exists():
@@ -417,6 +434,10 @@ class Store:
                                                     phone_ns = item['node_settings'].get('phone')
                                                     if isinstance(phone_ns, dict) and phone_ns.get(root_k) != prev_b.get(root_k):
                                                         item[root_k] = phone_ns.get(root_k)
+                                        if isinstance(item.get('curiosity_interval_minutes'), (int, float)):
+                                            c_int = max(1, min(1440, int(item.pop('curiosity_interval_minutes'))))
+                                            if c_int != int(getattr(self.config, 'curiosity_interval_minutes', 30) or 30):
+                                                bot_curiosity_interval = c_int
                                         valid_bots.append(item)
                                 if valid_bots and valid_bots != self.state.get('assistants'):
                                     self.state['assistants'] = valid_bots
@@ -426,62 +447,71 @@ class Store:
             try:
                 if self.routines_ws_path.exists():
                     mtime = self.routines_ws_path.stat().st_mtime_ns
-                    if force or mtime != getattr(self, '_routines_mtime', 0):
-                        self._routines_mtime = mtime
-                        raw = json.loads(self.routines_ws_path.read_text('utf-8'))
-                        if isinstance(raw, list):
-                            valid_routines = []
-                            for r in raw[:50]:
-                                if isinstance(r, dict) and r.get('goal'):
-                                    r.setdefault('id', secrets.token_hex(8))
-                                    r.setdefault('bot_id', self.state.get('primary_bot_id', 'companion'))
-                                    r.setdefault('interval_hours', 24)
-                                    r.setdefault('enabled', True)
-                                    r.setdefault('last_run', time.time())
-                                    r.setdefault('created_at', time.time())
-                                    valid_routines.append(r)
-                            if valid_routines != self.state.get('routines'):
-                                self.state['routines'] = valid_routines
-                                changed = True
+                    if force or recent_ws_write or mtime != getattr(self, '_routines_mtime', 0):
+                        raw_rt_text = self.routines_ws_path.read_text('utf-8')
+                        if force or raw_rt_text != getattr(self, '_routines_raw_text', ''):
+                            self._routines_mtime = mtime
+                            self._routines_raw_text = raw_rt_text
+                            raw = json.loads(raw_rt_text)
+                            if isinstance(raw, list):
+                                valid_routines = []
+                                for r in raw[:50]:
+                                    if isinstance(r, dict) and r.get('goal'):
+                                        r.setdefault('id', secrets.token_hex(8))
+                                        r.setdefault('bot_id', self.state.get('primary_bot_id', 'companion'))
+                                        r.setdefault('interval_hours', 24)
+                                        r.setdefault('enabled', True)
+                                        r.setdefault('last_run', time.time())
+                                        r.setdefault('created_at', time.time())
+                                        valid_routines.append(r)
+                                if valid_routines != self.state.get('routines'):
+                                    self.state['routines'] = valid_routines
+                                    changed = True
             except Exception:
                 pass
             try:
                 if self.settings_ws_path.exists():
                     mtime = self.settings_ws_path.stat().st_mtime_ns
-                    if force or mtime != getattr(self, '_settings_mtime', 0):
-                        self._settings_mtime = mtime
-                        raw = json.loads(self.settings_ws_path.read_text('utf-8'))
-                        if isinstance(raw, dict):
-                            update = {}
-                            cur_dump = self.config.model_dump()
-                            for k in ('api_base_url', 'api_key', 'default_model',
-                                      'fallback_enabled', 'fallback_base_url', 'fallback_api_key', 'fallback_model',
-                                      'enabled', 'curiosity_interval_minutes', 'idle_research_minutes',
-                                      'quiet_start_hour', 'quiet_end_hour', 'auto_compact_tokens'):
-                                if k in raw:
-                                    if k in ('api_key', 'fallback_api_key') and not str(raw[k] or '').strip():
-                                        continue
-                                    if raw[k] != cur_dump.get(k):
-                                        update[k] = raw[k]
-                            for brain_k in ('small_brain', 'big_brain'):
-                                if isinstance(raw.get(brain_k), dict):
-                                    b_in = raw[brain_k]
-                                    b_cur = cur_dump.get(brain_k) or {}
-                                    b_up = {}
-                                    for sub_k in ('base_url', 'model', 'api_key'):
-                                        if sub_k in b_in:
-                                            if sub_k == 'api_key' and not str(b_in[sub_k] or '').strip():
-                                                continue
-                                            if b_in[sub_k] != b_cur.get(sub_k):
-                                                b_up[sub_k] = b_in[sub_k]
-                                    if b_up:
-                                        update[brain_k] = b_up
-                            if update:
-                                pending_config_update = update
+                    if force or recent_ws_write or mtime != getattr(self, '_settings_mtime', 0):
+                        raw_cfg_text = self.settings_ws_path.read_text('utf-8')
+                        if force or raw_cfg_text != getattr(self, '_settings_raw_text', ''):
+                            self._settings_mtime = mtime
+                            self._settings_raw_text = raw_cfg_text
+                            raw = json.loads(raw_cfg_text)
+                            if isinstance(raw, dict):
+                                update = {}
+                                cur_dump = self.config.model_dump()
+                                for k in ('api_base_url', 'api_key', 'default_model',
+                                          'fallback_enabled', 'fallback_base_url', 'fallback_api_key', 'fallback_model',
+                                          'enabled', 'curiosity_interval_minutes', 'idle_research_minutes',
+                                          'quiet_start_hour', 'quiet_end_hour', 'auto_compact_tokens'):
+                                    if k in raw:
+                                        if k in ('api_key', 'fallback_api_key') and not str(raw[k] or '').strip():
+                                            continue
+                                        if raw[k] != cur_dump.get(k):
+                                            update[k] = raw[k]
+                                for brain_k in ('small_brain', 'big_brain'):
+                                    if isinstance(raw.get(brain_k), dict):
+                                        b_in = raw[brain_k]
+                                        b_cur = cur_dump.get(brain_k) or {}
+                                        b_up = {}
+                                        for sub_k in ('base_url', 'model', 'api_key'):
+                                            if sub_k in b_in:
+                                                if sub_k == 'api_key' and not str(b_in[sub_k] or '').strip():
+                                                    continue
+                                                if b_in[sub_k] != b_cur.get(sub_k):
+                                                    b_up[sub_k] = b_in[sub_k]
+                                        if b_up:
+                                            update[brain_k] = b_up
+                                if update:
+                                    pending_config_update = update
             except Exception:
                 pass
+            if bot_curiosity_interval is not None:
+                pending_config_update = dict(pending_config_update or {})
+                pending_config_update.setdefault('curiosity_interval_minutes', bot_curiosity_interval)
             if pending_config_update:
-                self.update_config(pending_config_update)
+                self.update_config(pending_config_update, source_tag='workspace_sync')
                 changed = True
             elif changed and not _skip_ws_write:
                 self.save()
@@ -495,9 +525,12 @@ class Store:
                 self._last_saved_state_json = serialized
             self._sync_to_workspace()
 
-    def update_config(self, update: dict):
+    def update_config(self, update: dict, source_tag: str = 'api'):
+        changed_summary: dict[str, tuple[Any, Any]] = {}
+        public_cfg: dict = {}
         with self.lock:
-            data = self.config.model_dump()
+            prev_dump = self.config.model_dump()
+            data = copy.deepcopy(prev_dump)
             # Synchronize top-level unified API config with small_brain & big_brain only when not explicitly overridden
             unified_url = update.get('api_base_url')
             unified_key = update.get('api_key')
@@ -533,10 +566,43 @@ class Store:
                     data['big_brain']['model'] = unified_model
 
             config = Config.model_validate(data)
+            new_dump = config.model_dump()
             atomic_write(self.config_path, config.model_dump_json(indent=2))
+            disk_cfg = json.loads(self.config_path.read_text('utf-8'))
+            for vk in ('auto_compact_tokens', 'curiosity_interval_minutes', 'idle_research_minutes', 'quiet_start_hour', 'quiet_end_hour', 'default_model'):
+                if disk_cfg.get(vk) != new_dump.get(vk):
+                    raise RuntimeError(f'config.json readback verification mismatch on {vk}: expected={new_dump.get(vk)!r}, got={disk_cfg.get(vk)!r}')
             self.config = config
             self._sync_to_workspace(_from_sync=True)
-            return config.public()
+            for k, new_v in new_dump.items():
+                old_v = prev_dump.get(k)
+                if new_v != old_v:
+                    if 'key' in k or 'password' in k or 'token' in k and k != 'auto_compact_tokens':
+                        changed_summary[k] = ('***', '***')
+                    else:
+                        changed_summary[k] = (old_v, new_v)
+            if changed_summary:
+                try:
+                    audit_p = self.settings_ws_path.parent / 'logs' / 'config_audit.md'
+                    audit_p.parent.mkdir(parents=True, exist_ok=True)
+                    ts_s = now_iso() if 'now_iso' in globals() else datetime.now(TZ).isoformat(timespec='seconds')
+                    diff_parts = [f'{k}: {old_v!r} -> {new_v!r}' for k, (old_v, new_v) in changed_summary.items()]
+                    line = f'- `{ts_s}` [{source_tag}] ' + '; '.join(diff_parts) + '\n'
+                    if not audit_p.exists():
+                        atomic_write(audit_p, '# 配置变更审计日志 (Config Audit Log)\n\n' + line)
+                    else:
+                        with audit_p.open('a', encoding='utf-8') as f:
+                            f.write(line)
+                except Exception:
+                    pass
+            public_cfg = config.public()
+        cb = getattr(self, 'on_config_changed', None)
+        if changed_summary and callable(cb):
+            try:
+                cb(public_cfg, source_tag, list(changed_summary.keys()))
+            except Exception:
+                pass
+        return public_cfg
 
     def message(self, role, text, kind='chat', **extra):
         now_ts = time.time()

@@ -360,9 +360,9 @@ internal fun NativeSettingsPanel(model: NativePulseModel, modifier: Modifier) {
                         PulseInputField(
                             label = "好奇心间隔（分钟，5-1440）",
                             value = s.curiosityMinutes,
-                            placeholder = "90",
+                            placeholder = "30",
                             onChange = { model.updateSettingsField(curiosityMinutes = it.filter { ch -> ch.isDigit() }) })
-                        val curSettingCompact = (s.autoCompactTokens.toIntOrNull() ?: 120000).coerceIn(8000, 1000000)
+                        val curSettingCompact = (s.autoCompactTokens.toIntOrNull() ?: 200000).coerceIn(8000, 1000000)
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                             Text("上下文窗口上限 / 自动压缩阈值", color = c.ink, fontSize = 14.sp, fontWeight = FontWeight.Medium)
                             Text(
@@ -380,7 +380,7 @@ internal fun NativeSettingsPanel(model: NativePulseModel, modifier: Modifier) {
                                 model.updateSettingsField(autoCompactTokens = stepped.toString())
                             },
                             onValueChangeFinished = {
-                                val finalTok = (s.autoCompactTokens.toIntOrNull() ?: 120000).coerceIn(8000, 1000000)
+                                val finalTok = (s.autoCompactTokens.toIntOrNull() ?: 200000).coerceIn(8000, 1000000)
                                 model.applyContextWindowTokens(finalTok)
                             },
                             valueRange = 16000f..200000f,
@@ -411,7 +411,7 @@ internal fun NativeSettingsPanel(model: NativePulseModel, modifier: Modifier) {
                         PulseInputField(
                             label = "自定义上下文窗口（Tokens，8000-1000000）",
                             value = s.autoCompactTokens,
-                            placeholder = "120000",
+                            placeholder = "200000",
                             onChange = { model.updateSettingsField(autoCompactTokens = it.filter { ch -> ch.isDigit() }) })
                         HorizontalDivider(color = c.line.copy(alpha = 0.55f), thickness = 0.5.dp)
                         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -764,7 +764,7 @@ internal fun NativeBotEditorPanel(model: NativePulseModel, modifier: Modifier) {
                             model.updateSettingsField(autoCompactTokens = stepped.toString())
                         },
                         onValueChangeFinished = {
-                            val finalTok = (s.autoCompactTokens.toIntOrNull() ?: 120000).coerceIn(8000, 1000000)
+                            val finalTok = (s.autoCompactTokens.toIntOrNull() ?: 200000).coerceIn(8000, 1000000)
                             model.applyContextWindowTokens(finalTok, targetBotId)
                         },
                         valueRange = 16000f..200000f,

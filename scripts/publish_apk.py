@@ -11,7 +11,7 @@ digest=hashlib.sha256(apk.read_bytes()).hexdigest()
 gradle_txt=(ROOT/'android/app/build.gradle').read_text('utf-8')
 ver_name=re.search(r"versionName\s+'([^']+)'",gradle_txt).group(1)
 ver_code=int(re.search(r"versionCode\s+(\d+)",gradle_txt).group(1))
-notes=f"v{ver_name} (Build {ver_code}): 1) 手机虚拟屏 CUA 大修：放开第三方应用 .MainActivity/.LauncherActivity 限制，仅拦截本客户端主界面；2) 修复悬窗点击红色关闭后在后台轮次中被重新拉起反复弹窗及误触销毁；3) 强制 tap/swipe/capture 刷新 fresh=true 画面帧并对齐真实 dpi/swDp，彻底消除点击前后画面错位；4) 黑板机制修复：@司工 不再回显至主助理聊天栏"
+notes=f"v{ver_name} (Build {ver_code}): 1) 调度器静默期顺延与过期防刷屏：间隔例行任务自动避开静默时段并支持指数退避/熔断与日志折叠；2) 好奇心巡检独立化：消除例行任务对 last_curiosity 的覆盖饥饿，新增 curiosity_poll 调度视图；3) 配置防覆盖与双端同步：手动压缩不再篡改 200K 阈值，落盘回读校验与 config_audit 审计闭环；4) 新增 KV-Cache 诊断说明与网关 520 自动重试"
 release_meta={
     'version':ver_name,
     'version_name':ver_name,
